@@ -626,10 +626,34 @@ function addCrosswalkLayer() {
 
 function addDrawLayers() {
   // Always remove + re-add so they survive basemap switches
-  ['draw-vertices', 'draw-outline', 'draw-fill'].forEach(id => {
+  ['draw-vertices', 'draw-outline', 'draw-fill',
+   'selection-hl-point', 'selection-hl-line'].forEach(id => {
     if (map.getLayer(id)) map.removeLayer(id);
   });
-  if (map.getSource('draw-selection')) map.removeSource('draw-selection');
+  if (map.getSource('draw-selection'))    map.removeSource('draw-selection');
+  if (map.getSource('selection-highlight')) map.removeSource('selection-highlight');
+
+  // Selection highlight source — restore after basemap switch
+  const hlData = G_selectionData
+    ? { type: 'FeatureCollection', features: G_selectionData.features }
+    : { type: 'FeatureCollection', features: [] };
+  map.addSource('selection-highlight', { type: 'geojson', data: hlData });
+
+  map.addLayer({
+    id: 'selection-hl-line', type: 'line', source: 'selection-highlight',
+    filter: ['==', ['geometry-type'], 'LineString'],
+    paint: { 'line-color': '#38bdf8', 'line-width': 5, 'line-opacity': 0.75 },
+  });
+  map.addLayer({
+    id: 'selection-hl-point', type: 'circle', source: 'selection-highlight',
+    filter: ['==', ['geometry-type'], 'Point'],
+    paint: {
+      'circle-radius':       ['interpolate', ['linear'], ['zoom'], 10, 7, 16, 12],
+      'circle-color':        'transparent',
+      'circle-stroke-width': 3,
+      'circle-stroke-color': '#38bdf8',
+    },
+  });
 
   const initData = G_drawShape
     ? { type: 'FeatureCollection', features: [G_drawShape] }
@@ -752,9 +776,7 @@ function startDrawPoly() {
 
 function cancelDraw() {
   _endDraw();
-  clearDrawSelection();
-  document.getElementById('selection-result').classList.add('hidden');
-  G_selectionData = null;
+  clearSelection();
 }
 
 function _endDraw() {
@@ -777,6 +799,37 @@ function clearDrawSelection() {
   G_drawShape = null;
   const src = map.getSource('draw-selection');
   if (src) src.setData({ type: 'FeatureCollection', features: [] });
+}
+
+function _updateHighlight() {
+  const src = map.getSource('selection-highlight');
+  if (!src) return;
+  const features = G_selectionData ? G_selectionData.features : [];
+  src.setData({ type: 'FeatureCollection', features });
+  document.getElementById('sel-count').textContent = features.length.toLocaleString();
+  if (features.length > 0) {
+    document.getElementById('selection-result').classList.remove('hidden');
+  }
+}
+
+function _applyClickSelection(feat, append) {
+  if (!feat) return;
+  if (append && G_selectionData) {
+    const existingIds = new Set(G_selectionData.features.map(f => f.properties.id));
+    if (!existingIds.has(feat.properties.id)) {
+      G_selectionData.features.push(feat);
+    }
+  } else {
+    G_selectionData = { type: 'FeatureCollection', features: [feat] };
+  }
+  _updateHighlight();
+}
+
+function clearSelection() {
+  clearDrawSelection();
+  G_selectionData = null;
+  _updateHighlight();
+  document.getElementById('selection-result').classList.add('hidden');
 }
 
 function _makeRect(sw, ne) {
@@ -858,8 +911,7 @@ function finalizeSelection(ring) {
   }
 
   G_selectionData = { type: 'FeatureCollection', features };
-  document.getElementById('sel-count').textContent = features.length.toLocaleString();
-  document.getElementById('selection-result').classList.remove('hidden');
+  _updateHighlight();
 }
 
 function _pointInRing([px, py], ring) {
@@ -1073,14 +1125,16 @@ function setupPopups() {
 
   // New OSM layers also need popups
   const OSM_LABEL_EXT = Object.assign({}, OSM_LABEL, {
+    'roads-layer':      'Road',
     'footway-layer':    'Sidewalk / Footway',
     'calming-layer':    'Traffic Calming',
     'streetlamp-layer': 'Street Lamp',
   });
 
   ['signals-layer', 'crossings-layer', 'bus-layer', 'bike-layer',
-   'footway-layer', 'calming-layer', 'streetlamp-layer'].forEach(layerId => {
+   'roads-layer', 'footway-layer', 'calming-layer', 'streetlamp-layer'].forEach(layerId => {
     map.on('click', layerId, e => {
+      if (G_drawActive) return;
       // MapLibre may truncate properties in e.features — look up full feature from OSM_FEATURE_MAP
       const renderedId = String(e.features[0].properties.id ?? '');
       const fullFeature = OSM_FEATURE_MAP.get(renderedId);
@@ -1098,6 +1152,9 @@ function setupPopups() {
           <div class="popup-row" style="opacity:0.45;font-size:0.65rem;margin-top:4px"><span class="popup-key">OSM ID</span><span>${_esc(String(p.id))}</span></div>
         </div>
       `).addTo(map);
+      // Click to select — Cmd/Ctrl+click appends, plain click replaces
+      const selFeat = fullFeature || { type: 'Feature', geometry: e.features[0].geometry, properties: p };
+      _applyClickSelection(selFeat, e.originalEvent.metaKey || e.originalEvent.ctrlKey);
     });
     map.on('mouseenter', layerId, () => { map.getCanvas().style.cursor = 'pointer'; });
     map.on('mouseleave', layerId, () => { map.getCanvas().style.cursor = ''; });
@@ -1122,6 +1179,7 @@ function setupPopups() {
   ]);
 
   map.on('click', 'crashes-layer', e => {
+    if (G_drawActive) return;
     // MapLibre only preserves properties used in paint/filter expressions.
     // Resolve each rendered feature to its full record from CRASH_FEATURE_MAP.
     const feats = e.features.map(f => {
@@ -1170,6 +1228,11 @@ function setupPopups() {
       </div>
       <div class="popup-scroll">${rows}</div>
     `).addTo(map);
+
+    // Click to select — Cmd/Ctrl+click appends, plain click replaces
+    const append = e.originalEvent.metaKey || e.originalEvent.ctrlKey;
+    if (!append) G_selectionData = { type: 'FeatureCollection', features: [] };
+    feats.forEach(f => _applyClickSelection(f, true));
   });
   map.on('mouseenter', 'crashes-layer', () => { map.getCanvas().style.cursor = 'pointer'; });
   map.on('mouseleave', 'crashes-layer', () => { map.getCanvas().style.cursor = ''; });
