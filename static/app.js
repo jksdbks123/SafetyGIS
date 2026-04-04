@@ -80,6 +80,7 @@ const LAYER_VISIBILITY = {
   crossings:          true,
   bus:                true,
   bike:               true,
+  roads:              false,
   footway:            true,
   calming:            false,
   streetlamp:         false,
@@ -97,6 +98,7 @@ const LAYER_IDS = {
   crossings:          ['crossings-layer'],
   bus:                ['bus-layer'],
   bike:               ['bike-layer'],
+  roads:              ['roads-layer'],
   footway:            ['footway-layer'],
   calming:            ['calming-layer'],
   streetlamp:         ['streetlamp-layer'],
@@ -111,7 +113,7 @@ const LAYER_IDS = {
 // source id → owned layer IDs (must remove layers before source)
 const SOURCE_LAYERS = {
   osm:              ['signals-layer', 'crossings-layer', 'bus-layer', 'bike-layer',
-                     'footway-layer', 'calming-layer', 'streetlamp-layer'],
+                     'roads-layer', 'footway-layer', 'calming-layer', 'streetlamp-layer'],
   crashes:          ['heatmap-layer', 'crashes-layer'],
   'mly-signs-vt':   ['asset-regulatory-layer', 'asset-warning-layer', 'asset-info-layer'],
   'mly-objects-vt': ['asset-crosswalks-layer'],
@@ -423,14 +425,58 @@ function addOsmLayers() {
     },
   });
 
-  // Sidewalks / footways / pedestrian paths
+  // Road network classified by highway type
+  map.addLayer({
+    id: 'roads-layer', type: 'line', source: 'osm',
+    minzoom: 11,
+    filter: ['in', ['get', 'type'], ['literal', [
+      'motorway','motorway_link','trunk','trunk_link',
+      'primary','primary_link','secondary','secondary_link',
+      'tertiary','tertiary_link','residential','unclassified','living_street',
+    ]]],
+    paint: {
+      'line-color': ['match', ['get', 'type'],
+        'motorway',       '#e82727',
+        'motorway_link',  '#e82727',
+        'trunk',          '#f97316',
+        'trunk_link',     '#f97316',
+        'primary',        '#f59e0b',
+        'primary_link',   '#f59e0b',
+        'secondary',      '#84cc16',
+        'secondary_link', '#84cc16',
+        'tertiary',       '#94a3b8',
+        'tertiary_link',  '#94a3b8',
+        'residential',    '#cbd5e1',
+        'unclassified',   '#cbd5e1',
+        'living_street',  '#e2e8f0',
+        '#6b7280'
+      ],
+      'line-width': ['interpolate', ['linear'], ['zoom'],
+        11, ['match', ['get', 'type'],
+          ['motorway','trunk'], 2,
+          ['primary','secondary'], 1.5,
+          1
+        ],
+        16, ['match', ['get', 'type'],
+          ['motorway','trunk'], 6,
+          ['primary','secondary'], 4,
+          ['tertiary','tertiary_link'], 3,
+          2
+        ],
+      ],
+      'line-opacity': 0.8,
+    },
+  });
+
+  // Sidewalks / footways / pedestrian paths — only at z14+ where OSM geometry is meaningful
   map.addLayer({
     id: 'footway-layer', type: 'line', source: 'osm',
+    minzoom: 14,
     filter: ['==', ['get', 'type'], 'footway'],
     paint: {
       'line-color':       '#e2e8f0',
-      'line-width':       ['interpolate', ['linear'], ['zoom'], 12, 1, 16, 2.5],
-      'line-opacity':     0.75,
+      'line-width':       ['interpolate', ['linear'], ['zoom'], 14, 1, 17, 3],
+      'line-opacity':     0.8,
       'line-dasharray':   [2, 1],
     },
   });
@@ -785,6 +831,9 @@ function finalizeSelection(ring) {
       else if (type === 'crossing')                           layerKey = 'crossings';
       else if (type === 'bus_stop' || type === 'bus_station') layerKey = 'bus';
       else if (type === 'cycleway')                           layerKey = 'bike';
+      else if (['motorway','motorway_link','trunk','trunk_link','primary','primary_link',
+                'secondary','secondary_link','tertiary','tertiary_link',
+                'residential','unclassified','living_street'].includes(type)) layerKey = 'roads';
       else if (type === 'footway')                            layerKey = 'footway';
       else if (type === 'traffic_calming')                    layerKey = 'calming';
       else if (type === 'street_lamp')                        layerKey = 'streetlamp';

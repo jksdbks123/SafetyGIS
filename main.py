@@ -121,7 +121,7 @@ OVERPASS_URLS = [
 ]
 
 OVERPASS_QUERY = """
-[out:json][timeout:60];
+[out:json][timeout:90];
 (
   node["highway"="traffic_signals"]({bbox});
   node["highway"="crossing"]({bbox});
@@ -130,6 +130,7 @@ OVERPASS_QUERY = """
   node["highway"="bus_stop"]({bbox});
   node["traffic_calming"]({bbox});
   node["highway"="street_lamp"]({bbox});
+  way["highway"~"^(motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|residential|unclassified|living_street)$"]({bbox});
   way["cycleway"]({bbox});
   way["highway"="cycleway"]({bbox});
   way["highway"="footway"]({bbox});
@@ -137,9 +138,7 @@ OVERPASS_QUERY = """
   way["footway"="sidewalk"]({bbox});
   way["highway"="pedestrian"]({bbox});
 );
-out body;
->;
-out skel qt;
+out geom;
 """
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -399,11 +398,10 @@ def _osm_tile_features(x: int, y: int) -> list:
     if raw is None:
         return []
 
+    # out geom; returns coordinates directly on each element — no node resolution needed.
     features = []
-    nodes: dict[int, tuple[float, float]] = {}
     for el in raw.get("elements", []):
         if el["type"] == "node":
-            nodes[el["id"]] = (el["lon"], el["lat"])
             tags = el.get("tags", {})
             if not tags:
                 continue
@@ -425,7 +423,8 @@ def _osm_tile_features(x: int, y: int) -> list:
             })
         elif el["type"] == "way":
             tags = el.get("tags", {})
-            coords = [nodes[n] for n in el.get("nodes", []) if n in nodes]
+            # out geom; embeds geometry directly — [(lon, lat), ...]
+            coords = [(g["lon"], g["lat"]) for g in el.get("geometry", []) if g]
             if len(coords) < 2:
                 continue
             hw = tags.get("highway", "")
