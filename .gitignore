@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+*.env.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# Data caches (runtime-generated, can be large)
+data/crash_cache/
+data/osm_cache/
+data/mapillary_cache/
+
+# Logs
+*.log
+/tmp/*.log
+
+# Claude Code internal files
+CLAUDE.md
+DEVLOG.md
+Plan.md
+.claude/

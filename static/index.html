@@ -1,0 +1,324 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>GIS-Track — Phase 1</title>
+  <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
+  <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0f1117; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; }
+
+    /* ── Header ── */
+    header { padding: 10px 16px; background: #1a1d2e; border-bottom: 1px solid #2a2d3e; display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+    header h1 { font-size: 1rem; font-weight: 600; color: #fff; }
+    header span { font-size: 0.75rem; color: #6b7280; }
+
+    /* ── Main layout ── */
+    #main { flex: 1; display: flex; overflow: hidden; }
+    #map-container { flex: 1; position: relative; }
+    #map { width: 100%; height: 100%; }
+
+    /* ── Left control panel ── */
+    #panel { position: absolute; top: 12px; left: 12px; width: 228px; background: rgba(26,29,46,0.96); border: 1px solid #2a2d3e; border-radius: 8px; padding: 14px; z-index: 10; backdrop-filter: blur(6px); max-height: calc(100% - 24px); overflow-y: auto; scrollbar-width: thin; scrollbar-color: #374151 transparent; }
+    #panel::-webkit-scrollbar { width: 4px; }
+    #panel::-webkit-scrollbar-thumb { background: #374151; border-radius: 2px; }
+    #panel h2 { font-size: 0.7rem; text-transform: uppercase; letter-spacing: 0.08em; color: #6b7280; margin-bottom: 12px; }
+
+    .layer-group { margin-bottom: 14px; }
+    .layer-group h3 { font-size: 0.65rem; text-transform: uppercase; letter-spacing: 0.06em; color: #4b5563; margin-bottom: 8px; display: flex; align-items: center; gap: 5px; }
+
+    .layer-row { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; cursor: pointer; padding: 4px 0; }
+    .layer-row:hover .layer-label { color: #fff; }
+    .layer-dot  { width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }
+    .layer-line { width: 16px; height: 3px; border-radius: 2px; flex-shrink: 0; }
+    .layer-label { font-size: 0.78rem; color: #9ca3af; transition: color 0.15s; user-select: none; flex: 1; }
+    .layer-row.off .layer-label { color: #4b5563; }
+    .layer-row.off .layer-dot, .layer-row.off .layer-line { opacity: 0.25; }
+
+    .toggle { width: 28px; height: 15px; background: #374151; border-radius: 8px; position: relative; transition: background 0.2s; flex-shrink: 0; }
+    .toggle.on { background: #3b82f6; }
+    .toggle::after { content: ''; position: absolute; top: 2px; left: 2px; width: 11px; height: 11px; border-radius: 50%; background: #fff; transition: transform 0.2s; }
+    .toggle.on::after { transform: translateX(13px); }
+    .toggle.disabled { opacity: 0.35; cursor: not-allowed; }
+
+    .area-btns { display: flex; gap: 6px; margin-bottom: 14px; }
+    .area-btn { flex: 1; padding: 5px 0; font-size: 0.72rem; border: 1px solid #2a2d3e; background: transparent; color: #9ca3af; border-radius: 5px; cursor: pointer; transition: all 0.15s; }
+    .area-btn:hover { border-color: #3b82f6; color: #3b82f6; }
+    .area-btn.active { background: #1d4ed8; border-color: #3b82f6; color: #fff; }
+
+    /* Status lines */
+    #mly-status { font-size: 0.68rem; color: #6b7280; margin-top: 4px; min-height: 14px; }
+    #mly-status.loading { color: #60a5fa; }
+    #mly-status.error   { color: #f87171; }
+    #sv-hint { font-size: 0.68rem; color: #6b7280; margin-top: 4px; min-height: 14px; }
+
+    /* Crash load status */
+    #crash-load-status { position: absolute; bottom: 32px; left: 50%; transform: translateX(-50%); background: rgba(26,29,46,0.9); border: 1px solid #2a2d3e; border-radius: 5px; padding: 5px 12px; font-size: 0.72rem; color: #60a5fa; z-index: 10; pointer-events: none; white-space: nowrap; display: none; }
+    #crash-load-status:not(:empty) { display: block; }
+
+    /* ── Draw / Select tool ── */
+    .draw-btns { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 4px; }
+    .tool-btn { flex: 1; padding: 5px 4px; font-size: 0.68rem; border: 1px solid #2a2d3e; background: transparent; color: #9ca3af; border-radius: 5px; cursor: pointer; transition: all 0.15s; white-space: nowrap; text-align: center; display: flex; align-items: center; justify-content: center; gap: 3px; }
+    .tool-btn:hover { border-color: #3b82f6; color: #3b82f6; }
+    .tool-btn.active { background: #1e3a5f; border-color: #3b82f6; color: #60a5fa; }
+    .tool-btn.cancel-btn { border-color: #4b5563; color: #6b7280; }
+    .tool-btn.cancel-btn:hover { border-color: #f87171; color: #f87171; }
+    .tool-btn.download-btn { background: #064e3b; border-color: #059669; color: #34d399; width: 100%; margin-top: 5px; }
+    .tool-btn.download-btn:hover { background: #065f46; color: #6ee7b7; }
+    #draw-hint { font-size: 0.65rem; color: #6b7280; min-height: 12px; line-height: 1.4; }
+    #selection-result { margin-top: 6px; padding: 6px 8px; background: #0f1117; border: 1px solid #2a2d3e; border-radius: 5px; }
+    #selection-result .sel-label { font-size: 0.72rem; color: #9ca3af; }
+    #selection-result .sel-label strong { color: #fff; }
+    .hidden { display: none !important; }
+
+    /* ── AI Analytics panel ── */
+    .placeholder-badge { font-size: 0.55rem; background: #374151; color: #6b7280; padding: 1px 5px; border-radius: 3px; letter-spacing: 0; font-weight: 400; text-transform: none; }
+    .ai-input { width: 100%; background: #0f1117; border: 1px solid #2a2d3e; border-radius: 5px; color: #e0e0e0; font-size: 0.72rem; padding: 6px 8px; resize: none; margin-top: 6px; font-family: inherit; line-height: 1.4; }
+    .ai-input:focus { outline: none; border-color: #3b82f6; }
+    .ai-input::placeholder { color: #4b5563; }
+    #ai-response { font-size: 0.72rem; color: #9ca3af; background: #0f1117; border: 1px solid #2a2d3e; border-radius: 5px; padding: 8px; margin-bottom: 4px; max-height: 130px; overflow-y: auto; line-height: 1.5; white-space: pre-wrap; word-break: break-word; scrollbar-width: thin; scrollbar-color: #374151 transparent; }
+    #ai-response::-webkit-scrollbar { width: 3px; }
+    #ai-response::-webkit-scrollbar-thumb { background: #374151; border-radius: 2px; }
+
+    /* ── Stats ribbon (collapsible) ── */
+    #stats-ribbon { flex-shrink: 0; background: #1a1d2e; border-top: 1px solid #2a2d3e; cursor: pointer; }
+    #stats-tab { display: flex; align-items: center; justify-content: center; gap: 6px; height: 22px; font-size: 0.65rem; color: #6b7280; letter-spacing: 0.06em; text-transform: uppercase; user-select: none; transition: color 0.15s; }
+    #stats-tab:hover { color: #e0e0e0; }
+    #stats-tab .tab-arrow { font-size: 0.6rem; transition: transform 0.2s; }
+    #stats-ribbon.open #stats-tab .tab-arrow { transform: rotate(180deg); }
+    #stats { display: flex; gap: 8px; overflow: hidden; max-height: 0; transition: max-height 0.25s ease, padding 0.25s ease; padding: 0 12px; }
+    #stats-ribbon.open #stats { max-height: 70px; padding: 8px 12px; }
+    .stat-card { flex: 1; }
+    .stat-card .val { font-size: 1.1rem; font-weight: 700; color: #fff; }
+    .stat-card .lbl { font-size: 0.62rem; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em; }
+
+    /* ── Street View side panel ── */
+    #mly-panel { width: 0; background: #1a1d2e; border-left: 1px solid #2a2d3e; overflow: hidden; transition: width 0.25s ease; display: flex; flex-direction: column; flex-shrink: 0; }
+    #mly-panel.open { width: 360px; }
+    #mly-header { padding: 12px 14px; border-bottom: 1px solid #2a2d3e; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
+    #mly-header h3 { font-size: 0.85rem; font-weight: 600; color: #fff; }
+    #mly-close { background: none; border: none; color: #6b7280; font-size: 1.1rem; cursor: pointer; padding: 2px 6px; border-radius: 4px; }
+    #mly-close:hover { background: #2a2d3e; color: #fff; }
+    #sv-pano-wrap { flex: 1; position: relative; overflow: hidden; background: #0f1117; }
+    #sv-pano { position: absolute; inset: 0; }
+    #sv-placeholder { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #4b5563; font-size: 0.8rem; text-align: center; padding: 24px; pointer-events: none; line-height: 1.5; }
+
+    /* ── Zoom badge ── */
+    #zoom-badge { position: absolute; top: 12px; right: 48px; background: rgba(26,29,46,0.92); border: 1px solid #2a2d3e; border-radius: 5px; padding: 4px 9px; font-size: 0.75rem; color: #9ca3af; z-index: 10; pointer-events: none; font-variant-numeric: tabular-nums; }
+    #zoom-badge span { color: #fff; font-weight: 600; }
+
+    /* ── Pegman (Street View drag button) ── */
+    #pegman-btn { display: none; position: absolute; bottom: 72px; right: 10px; width: 32px; height: 32px; background: #fbbf24; border-radius: 50%; cursor: grab; z-index: 10; align-items: center; justify-content: center; box-shadow: 0 2px 8px rgba(0,0,0,0.5); transition: transform 0.15s, background 0.15s; user-select: none; border: 2px solid #78350f; }
+    #pegman-btn:hover { transform: scale(1.15); background: #f59e0b; }
+    #pegman-btn.active { background: #3b82f6; border-color: #1d4ed8; cursor: grabbing; transform: scale(1.1); }
+    #pegman-btn svg { width: 18px; height: 18px; fill: #78350f; pointer-events: none; }
+    #pegman-btn.active svg { fill: #fff; }
+
+    /* ── MapLibre popup ── */
+    .maplibregl-popup-content { background: #1a1d2e; border: 1px solid #2a2d3e; border-radius: 6px; color: #e0e0e0; font-size: 0.8rem; padding: 10px 12px; }
+    .maplibregl-popup-tip { border-top-color: #1a1d2e !important; }
+    .popup-title { font-weight: 600; margin-bottom: 6px; color: #fff; }
+    .popup-row { display: flex; justify-content: space-between; gap: 12px; margin-bottom: 3px; font-size: 0.78rem; }
+    .popup-key { color: #6b7280; flex-shrink: 0; }
+    .popup-scroll { max-height: 230px; overflow-y: auto; padding-right: 2px; scrollbar-width: thin; scrollbar-color: #374151 transparent; }
+    .popup-scroll::-webkit-scrollbar { width: 4px; }
+    .popup-scroll::-webkit-scrollbar-thumb { background: #374151; border-radius: 2px; }
+    .popup-divider { border: none; border-top: 1px solid #2a2d3e; margin: 6px 0; }
+    .popup-seq { font-size: 0.63rem; color: #4b5563; margin-bottom: 3px; }
+
+    /* ── Loading overlay ── */
+    #loading { position: absolute; inset: 0; background: rgba(15,17,23,0.85); display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 100; gap: 10px; }
+    #loading.hidden { display: none; }
+    .spinner { width: 28px; height: 28px; border: 3px solid #2a2d3e; border-top-color: #3b82f6; border-radius: 50%; animation: spin 0.7s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #loading p { font-size: 0.85rem; color: #9ca3af; }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>GIS-Track</h1>
+  <span>Phase 1 &mdash; California Transportation Safety</span>
+</header>
+
+<div id="main">
+  <div id="map-container">
+    <div id="map"></div>
+
+    <div id="loading">
+      <div class="spinner"></div>
+      <p>Loading map data&hellip;</p>
+    </div>
+
+    <!-- Crash data loading indicator -->
+    <div id="crash-load-status"></div>
+
+    <!-- Left panel -->
+    <div id="panel">
+      <h2>Layer Controls</h2>
+
+      <!-- Basemap -->
+      <div class="layer-group">
+        <h3>Basemap</h3>
+        <div class="area-btns">
+          <button class="area-btn active" id="btn-basemap-map"       onclick="switchBasemap('map')">Map</button>
+          <button class="area-btn"        id="btn-basemap-satellite" onclick="switchBasemap('satellite')">Satellite</button>
+        </div>
+      </div>
+
+      <!-- OSM Infrastructure -->
+      <div class="layer-group">
+        <h3>Traffic Infrastructure (OSM)</h3>
+        <div class="layer-row" id="row-signals"   onclick="toggleLayer('signals')">
+          <div class="layer-dot" style="background:#facc15"></div>
+          <span class="layer-label">Traffic Signals</span>
+          <div class="toggle on" id="toggle-signals"></div>
+        </div>
+        <div class="layer-row" id="row-crossings" onclick="toggleLayer('crossings')">
+          <div class="layer-dot" style="background:#60a5fa"></div>
+          <span class="layer-label">Crosswalks</span>
+          <div class="toggle on" id="toggle-crossings"></div>
+        </div>
+        <div class="layer-row" id="row-bus"       onclick="toggleLayer('bus')">
+          <div class="layer-dot" style="background:#34d399"></div>
+          <span class="layer-label">Bus Stops</span>
+          <div class="toggle on" id="toggle-bus"></div>
+        </div>
+        <div class="layer-row" id="row-bike"      onclick="toggleLayer('bike')">
+          <div class="layer-line" style="background:#a78bfa"></div>
+          <span class="layer-label">Bike Lanes</span>
+          <div class="toggle on" id="toggle-bike"></div>
+        </div>
+        <div class="layer-row" id="row-footway"   onclick="toggleLayer('footway')">
+          <div class="layer-line" style="background:#e2e8f0"></div>
+          <span class="layer-label">Sidewalks / Footways</span>
+          <div class="toggle on" id="toggle-footway"></div>
+        </div>
+        <div class="layer-row off" id="row-calming"    onclick="toggleLayer('calming')">
+          <div class="layer-dot" style="background:#fb923c"></div>
+          <span class="layer-label">Traffic Calming</span>
+          <div class="toggle" id="toggle-calming"></div>
+        </div>
+        <div class="layer-row off" id="row-streetlamp" onclick="toggleLayer('streetlamp')">
+          <div class="layer-dot" style="background:#fde68a"></div>
+          <span class="layer-label">Street Lamps</span>
+          <div class="toggle" id="toggle-streetlamp"></div>
+        </div>
+      </div>
+
+      <!-- Crash Data -->
+      <div class="layer-group">
+        <h3>Crash Data (CHP CCRS)</h3>
+        <div class="layer-row" id="row-heatmap" onclick="toggleLayer('heatmap')">
+          <div class="layer-dot" style="background:#ef4444"></div>
+          <span class="layer-label">Crash Heatmap</span>
+          <div class="toggle on" id="toggle-heatmap"></div>
+        </div>
+        <div class="layer-row" id="row-crashes" onclick="toggleLayer('crashes')">
+          <div class="layer-dot" style="background:#f97316"></div>
+          <span class="layer-label">Crash Points</span>
+          <div class="toggle on" id="toggle-crashes"></div>
+        </div>
+      </div>
+
+      <!-- Mapillary Signs -->
+      <div class="layer-group">
+        <h3>Detected Signs (Mapillary)</h3>
+        <div id="mly-status">Waiting for token&hellip;</div>
+        <div class="layer-row off" id="row-asset-regulatory" onclick="toggleLayer('asset-regulatory')">
+          <div class="layer-dot" style="background:#ef4444"></div>
+          <span class="layer-label">Regulatory Signs</span>
+          <div class="toggle" id="toggle-asset-regulatory"></div>
+        </div>
+        <div class="layer-row off" id="row-asset-warning" onclick="toggleLayer('asset-warning')">
+          <div class="layer-dot" style="background:#f59e0b"></div>
+          <span class="layer-label">Warning Signs</span>
+          <div class="toggle" id="toggle-asset-warning"></div>
+        </div>
+        <div class="layer-row off" id="row-asset-info" onclick="toggleLayer('asset-info')">
+          <div class="layer-dot" style="background:#3b82f6"></div>
+          <span class="layer-label">Info Signs</span>
+          <div class="toggle" id="toggle-asset-info"></div>
+        </div>
+        <div class="layer-row off" id="row-asset-crosswalks" onclick="toggleLayer('asset-crosswalks')">
+          <div class="layer-dot" style="background:#38bdf8"></div>
+          <span class="layer-label">Crosswalk Markings</span>
+          <div class="toggle" id="toggle-asset-crosswalks"></div>
+        </div>
+      </div>
+
+      <!-- Select & Export (Draw Tool) -->
+      <div class="layer-group">
+        <h3>Select &amp; Export</h3>
+        <div class="draw-btns">
+          <button class="tool-btn" id="btn-draw-rect" onclick="startDrawRect()">&#9633; Rect</button>
+          <button class="tool-btn" id="btn-draw-poly" onclick="startDrawPoly()">&#9651; Polygon</button>
+          <button class="tool-btn cancel-btn" id="btn-draw-cancel" onclick="cancelDraw()" style="display:none">&#x2715; Cancel</button>
+        </div>
+        <div id="draw-hint"></div>
+        <div id="selection-result" class="hidden">
+          <div class="sel-label"><strong id="sel-count">0</strong> features selected (visible layers only)</div>
+          <button class="tool-btn download-btn" onclick="downloadSelection()">&#11015; Download GeoJSON</button>
+        </div>
+      </div>
+
+      <!-- AI Analytics Placeholder -->
+      <div class="layer-group">
+        <h3>AI Analytics <span class="placeholder-badge">placeholder</span></h3>
+        <div id="ai-response" class="hidden"></div>
+        <textarea id="ai-input" class="ai-input" placeholder="Ask about safety in this view…" rows="2"></textarea>
+        <button class="tool-btn" style="width:100%;margin-top:5px" onclick="sendAiQuery()">&#9658; Ask</button>
+      </div>
+
+      <!-- Street View -->
+      <div class="layer-group">
+        <h3>Street View</h3>
+        <div id="sv-hint">Checking Google Maps&hellip;</div>
+        <div style="font-size:0.62rem;color:#4b5563;margin-top:2px;line-height:1.4">Drag the yellow person icon to the map, or click it to activate placement mode.</div>
+      </div>
+    </div>
+
+    <!-- Zoom indicator -->
+    <div id="zoom-badge">Z <span id="zoom-val">12</span></div>
+
+    <!-- Pegman — drag or click to place Street View -->
+    <div id="pegman-btn" title="Drag or click to place Street View" draggable="true">
+      <svg viewBox="0 0 20 26" xmlns="http://www.w3.org/2000/svg">
+        <circle cx="10" cy="4.5" r="3.5"/>
+        <path d="M6.5 9.5h7l1.5 5H14l1 7H5l1-7H4.5z"/>
+        <line x1="10" y1="14.5" x2="7" y2="21.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+        <line x1="10" y1="14.5" x2="13" y2="21.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+      </svg>
+    </div>
+
+  </div>
+
+  <!-- Street View side panel -->
+  <div id="mly-panel">
+    <div id="mly-header">
+      <h3>Street View</h3>
+      <button id="mly-close" onclick="closeSidePanel()">&#x2715;</button>
+    </div>
+    <div id="sv-pano-wrap">
+      <div id="sv-pano"></div>
+      <div id="sv-placeholder">Click anywhere on the map<br>to open Street View</div>
+    </div>
+  </div>
+</div>
+
+<!-- Stats ribbon — spans full width below the map row -->
+<div id="stats-ribbon" onclick="toggleStatsRibbon()">
+  <div id="stats-tab"><span class="tab-arrow">&#9650;</span> Stats</div>
+  <div id="stats">
+    <div class="stat-card"><div class="val" id="stat-signals">—</div><div class="lbl">Traffic Signals</div></div>
+    <div class="stat-card"><div class="val" id="stat-crossings">—</div><div class="lbl">Crosswalks</div></div>
+    <div class="stat-card"><div class="val" id="stat-crashes-total">—</div><div class="lbl">Crash Records</div></div>
+    <div class="stat-card"><div class="val" id="stat-fatal">—</div><div class="lbl">Fatal Crashes</div></div>
+  </div>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
