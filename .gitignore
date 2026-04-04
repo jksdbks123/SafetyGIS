@@ -32,7 +32,6 @@ data/mapillary_cache/
 /tmp/*.log
 
 # Claude Code internal files
-CLAUDE.md
 DEVLOG.md
 Plan.md
 .claude/
