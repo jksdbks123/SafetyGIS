@@ -170,35 +170,52 @@ def _tile2bbox(x: int, y: int, z: int):
 # CCRS crash helpers
 # ---------------------------------------------------------------------------
 
-_ccrs_resources_cache: dict | None = None
+_ccrs_resources_cache: dict | None = None     # Crashes
+_ccrs_parties_res_cache: dict | None = None   # Parties
+_ccrs_victims_res_cache: dict | None = None   # InjuredWitnessPassengers
 
-def _get_ccrs_resources() -> dict:
-    """Return {year: resource_id} for Crashes_* resources, cached in memory."""
-    global _ccrs_resources_cache
+def _load_all_ccrs_resources() -> None:
+    """Populate all three resource caches with a single package_show call."""
+    global _ccrs_resources_cache, _ccrs_parties_res_cache, _ccrs_victims_res_cache
     if _ccrs_resources_cache is not None:
-        return _ccrs_resources_cache
+        return
+    crashes, parties, victims = {}, {}, {}
     try:
         resp = requests.get(f"{CCRS_BASE_URL}/package_show", params={"id": CCRS_PACKAGE_ID}, timeout=20)
         resp.raise_for_status()
-        result = {}
         for r in resp.json()["result"]["resources"]:
-            name = r.get("name", "")
-            if not name.lower().startswith("crashes"):
-                continue
-            parts = name.split("_")
-            if len(parts) < 2:
-                continue
+            raw_name = r.get("name", "")
+            name = raw_name.lower()
+            parts = raw_name.split("_")
             try:
                 year = int(parts[-1])
-            except ValueError:
+            except (ValueError, IndexError):
                 continue
-            if year in CCRS_TARGET_YEARS:
-                result[year] = r["id"]
-        _ccrs_resources_cache = result
-        return result
+            if year not in CCRS_TARGET_YEARS:
+                continue
+            if name.startswith("crashes"):
+                crashes[year] = r["id"]
+            elif name.startswith("parties"):
+                parties[year] = r["id"]
+            elif name.startswith("injuredwitnesspassengers"):
+                victims[year] = r["id"]
     except Exception as e:
         print(f"[crash] Failed to get CCRS resources: {e}")
-        return {}
+    _ccrs_resources_cache = crashes
+    _ccrs_parties_res_cache = parties
+    _ccrs_victims_res_cache = victims
+
+def _get_ccrs_resources() -> dict:
+    _load_all_ccrs_resources()
+    return _ccrs_resources_cache or {}
+
+def _get_ccrs_parties_resources() -> dict:
+    _load_all_ccrs_resources()
+    return _ccrs_parties_res_cache or {}
+
+def _get_ccrs_victims_resources() -> dict:
+    _load_all_ccrs_resources()
+    return _ccrs_victims_res_cache or {}
 
 
 def _crash_record_to_feature(r: dict) -> dict | None:
@@ -302,14 +319,104 @@ def _fetch_county_crashes(county_code: int) -> list:
     return features
 
 
+def _fetch_county_related(county_code: int, resources: dict, table_label: str) -> dict:
+    """Fetch all records for a county from a related table (Parties or Victims).
+    Returns {collision_id: [record, ...]} grouped dict."""
+    if not resources:
+        return {}
+    grouped: dict[str, list] = {}
+    seen: set = set()
+    filters = json.dumps({"County Code": county_code})
+    for year, resource_id in sorted(resources.items()):
+        offset = 0
+        for _ in range(CCRS_MAX_PAGES):
+            params = {
+                "resource_id": resource_id,
+                "filters":     filters,
+                "limit":       CCRS_PAGE_SIZE,
+                "offset":      offset,
+            }
+            try:
+                resp = requests.get(f"{CCRS_BASE_URL}/datastore_search", params=params, timeout=90)
+                resp.raise_for_status()
+            except Exception as e:
+                print(f"[{table_label}] county={county_code} year={year}: {e}")
+                break
+            batch = resp.json().get("result", {}).get("records", [])
+            for rec in batch:
+                cid = str(rec.get("Collision Id") or "")
+                if not cid:
+                    continue
+                # Deduplicate: use collision_id + party/victim number as key
+                dedup_key = (cid, rec.get("Party Number"), rec.get("Victim Number"))
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+                cleaned = {k: v for k, v in rec.items()
+                           if k not in ("_id", "_full_text", "rank") and v is not None}
+                grouped.setdefault(cid, []).append(cleaned)
+            if len(batch) < CCRS_PAGE_SIZE:
+                break
+            offset += CCRS_PAGE_SIZE
+    return grouped
+
+
+def _enrich_features(features: list, parties_dict: dict, victims_dict: dict) -> None:
+    """Mutate crash features in-place: add summary flags and victim-based severity."""
+    NOT_IMPAIRED = {"had not been drinking", "unknown", ""}
+    DEGREE_MAP = {1: "fatal", 2: "severe_injury", 3: "other_injury", 4: "other_injury"}
+    for feat in features:
+        cid = feat["properties"]["id"]
+        parties = parties_dict.get(cid, [])
+        victims = victims_dict.get(cid, [])
+        feat["properties"]["has_pedestrian"] = any(
+            "pedestrian" in str(p.get("Party Type", "")).lower() for p in parties)
+        feat["properties"]["has_cyclist"] = any(
+            "bicycl" in str(p.get("Party Type", "")).lower() for p in parties)
+        feat["properties"]["has_impaired"] = any(
+            str(p.get("Party Sobriety", "")).strip().lower() not in NOT_IMPAIRED
+            for p in parties)
+        degrees = []
+        for v in victims:
+            try:
+                degrees.append(int(v["Victim Degree of Injury"]))
+            except (KeyError, ValueError, TypeError):
+                pass
+        if degrees:
+            feat["properties"]["severity"] = DEGREE_MAP.get(min(degrees), "pdo")
+
+
 def _cache_county_bg(county_name: str, county_code: int) -> None:
-    """Fetch and cache county crash data in a background thread."""
+    """Fetch and cache county crash + parties + victims in a background thread."""
     try:
+        # 1. Fetch crash features
         features = _fetch_county_crashes(county_code)
-        cache_path = os.path.join(CRASH_CACHE, f"{county_name}.geojson")
-        with open(cache_path, "w") as f:
+
+        # 2. Fetch parties and victims
+        print(f"[crash] {county_name}: fetching parties…")
+        parties_dict = _fetch_county_related(
+            county_code, _get_ccrs_parties_resources(), "parties")
+        print(f"[crash] {county_name}: fetching victims…")
+        victims_dict = _fetch_county_related(
+            county_code, _get_ccrs_victims_resources(), "victims")
+
+        # 3. Save related data as lookup dicts
+        with open(os.path.join(CRASH_CACHE, f"{county_name}_parties.json"), "w") as f:
+            json.dump(parties_dict, f)
+        with open(os.path.join(CRASH_CACHE, f"{county_name}_victims.json"), "w") as f:
+            json.dump(victims_dict, f)
+
+        # 4. Enrich crash features with summary flags + victim-based severity
+        _enrich_features(features, parties_dict, victims_dict)
+
+        # 5. Save crash GeoJSON
+        with open(os.path.join(CRASH_CACHE, f"{county_name}.geojson"), "w") as f:
             json.dump({"type": "FeatureCollection", "features": features}, f)
-        print(f"[crash] {county_name}: {len(features)} records cached")
+
+        n_parties = sum(len(v) for v in parties_dict.values())
+        n_victims = sum(len(v) for v in victims_dict.values())
+        print(f"[crash] {county_name}: {len(features)} crashes, "
+              f"{n_parties} parties, {n_victims} victims cached")
     except Exception as e:
         print(f"[crash] Background fetch failed for {county_name}: {e}")
     finally:
@@ -577,6 +684,45 @@ async def ai_query(body: dict = Body(...)):
         f"Connect an LLM (e.g. Claude API) to this endpoint for real safety analysis."
     )
     return {"answer": answer, "placeholder": True}
+
+
+# Lazy per-county detail cache: {county_name: {"parties": {...}, "victims": {...}}}
+_detail_cache: dict = {}
+_detail_lock = threading.Lock()
+
+
+def _load_county_detail(county_name: str) -> dict:
+    """Load parties and victims for a county into _detail_cache on first access."""
+    with _detail_lock:
+        if county_name in _detail_cache:
+            return _detail_cache[county_name]
+        parties_path = os.path.join(CRASH_CACHE, f"{county_name}_parties.json")
+        if not os.path.exists(parties_path):
+            return {}
+        victims_path = os.path.join(CRASH_CACHE, f"{county_name}_victims.json")
+        p_data = json.loads(open(parties_path).read())
+        v_data = json.loads(open(victims_path).read()) if os.path.exists(victims_path) else {}
+        _detail_cache[county_name] = {"parties": p_data, "victims": v_data}
+        return _detail_cache[county_name]
+
+
+@app.get("/api/crashes/detail")
+def get_crash_detail(ids: str = Query(..., description="Comma-separated collision IDs (max 50)")):
+    """Return parties and victims for the given crash collision IDs."""
+    id_list = [i.strip() for i in ids.split(",") if i.strip()][:50]
+    result: dict = {}
+    for county_name in CA_COUNTIES:
+        if len(result) == len(id_list):
+            break  # all IDs found
+        county_data = _load_county_detail(county_name)
+        if not county_data:
+            continue
+        p_data = county_data["parties"]
+        v_data = county_data["victims"]
+        for cid in id_list:
+            if cid not in result and cid in p_data:
+                result[cid] = {"parties": p_data[cid], "victims": v_data.get(cid, [])}
+    return JSONResponse(result)
 
 
 @app.get("/api/crashes/{area}")

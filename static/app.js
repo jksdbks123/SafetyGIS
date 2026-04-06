@@ -633,11 +633,7 @@ function addDrawLayers() {
   if (map.getSource('draw-selection'))    map.removeSource('draw-selection');
   if (map.getSource('selection-highlight')) map.removeSource('selection-highlight');
 
-  // Selection highlight source — restore after basemap switch
-  const hlData = G_selectionData
-    ? { type: 'FeatureCollection', features: G_selectionData.features }
-    : { type: 'FeatureCollection', features: [] };
-  map.addSource('selection-highlight', { type: 'geojson', data: hlData });
+  map.addSource('selection-highlight', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
 
   map.addLayer({
     id: 'selection-hl-line', type: 'line', source: 'selection-highlight',
@@ -654,6 +650,7 @@ function addDrawLayers() {
       'circle-stroke-color': '#38bdf8',
     },
   });
+  _updateHighlight();
 
   const initData = G_drawShape
     ? { type: 'FeatureCollection', features: [G_drawShape] }
@@ -807,9 +804,7 @@ function _updateHighlight() {
   const features = G_selectionData ? G_selectionData.features : [];
   src.setData({ type: 'FeatureCollection', features });
   document.getElementById('sel-count').textContent = features.length.toLocaleString();
-  if (features.length > 0) {
-    document.getElementById('selection-result').classList.remove('hidden');
-  }
+  document.getElementById('selection-result').classList.toggle('hidden', features.length === 0);
 }
 
 function _applyClickSelection(feat, append) {
@@ -829,7 +824,6 @@ function clearSelection() {
   clearDrawSelection();
   G_selectionData = null;
   _updateHighlight();
-  document.getElementById('selection-result').classList.add('hidden');
 }
 
 function _makeRect(sw, ne) {
@@ -944,6 +938,49 @@ function downloadSelection() {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+async function downloadSelectionFull() {
+  if (!G_selectionData || G_selectionData.features.length === 0) return;
+  const crashIds = G_selectionData.features
+    .filter(f => f.properties.severity !== undefined)
+    .map(f => String(f.properties.id));
+  let detail = {};
+  if (crashIds.length) {
+    try {
+      detail = await fetch(`/api/crashes/detail?ids=${crashIds.join(',')}`).then(r => r.json());
+    } catch (_) {}
+  }
+  const enriched = G_selectionData.features.map(f => {
+    const cid = String(f.properties.id);
+    if (!detail[cid]) return f;
+    return { ...f, properties: { ...f.properties, parties: detail[cid].parties, victims: detail[cid].victims } };
+  });
+  const out = {
+    type: 'FeatureCollection',
+    features: enriched,
+    metadata: { source: 'GIS-Track', timestamp: new Date().toISOString(), count: enriched.length },
+  };
+  const blob = new Blob([JSON.stringify(out, null, 2)], { type: 'application/geo+json' });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href     = url;
+  a.download = `gistrack_full_${new Date().toISOString().slice(0, 10)}.geojson`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+function applyCrashFilter() {
+  const filters = ['all'];
+  if (document.getElementById('cf-ped')?.checked)      filters.push(['==', ['get', 'has_pedestrian'], true]);
+  if (document.getElementById('cf-bike')?.checked)     filters.push(['==', ['get', 'has_cyclist'],    true]);
+  if (document.getElementById('cf-impaired')?.checked) filters.push(['==', ['get', 'has_impaired'],   true]);
+  const f = filters.length > 1 ? filters : null;
+  ['crashes-layer', 'heatmap-layer'].forEach(id => {
+    if (map.getLayer(id)) map.setFilter(id, f);
+  });
 }
 
 // ---- AI Analytics (placeholder) ----------------------------------------------
@@ -1103,10 +1140,121 @@ function closeSidePanel() {
   document.getElementById('mly-panel').classList.remove('open');
 }
 
+function openHelpPanel() {
+  document.getElementById('help-panel').classList.add('open');
+}
+
+function closeHelpPanel() {
+  document.getElementById('help-panel').classList.remove('open');
+}
+
 // ---- Stats ribbon ------------------------------------------------------------
 
 function toggleStatsRibbon() {
   document.getElementById('stats-ribbon').classList.toggle('open');
+}
+
+// ---- Crash detail (Parties & Victims) helpers --------------------------------
+
+const INJURY_DEGREE = {
+  '1': 'Killed', '2': 'Severe Injury', '3': 'Other Visible Injury',
+  '4': 'Complaint of Pain', '5': 'Possible Injury', '6': 'No Apparent Injury', '0': 'Not a Victim',
+};
+const INJURY_DEGREE_COLOR = {
+  '1': '#dc2626', '2': '#f97316', '3': '#fbbf24', '4': '#9ca3af', '6': '#374151',
+};
+
+const PARTY_TOP_KEYS = new Set([
+  'Party Number', 'Party Type', 'At Fault', 'Party Age', 'Party Sex',
+  'Party Sobriety', 'Vehicle Make', 'Vehicle Year', 'Movement Preceding Crash',
+  'Party Number Killed', 'Party Number Injured', 'Collision Id', 'County Code',
+]);
+const VICTIM_TOP_KEYS = new Set([
+  'Victim Number', 'Victim Role', 'Victim Degree of Injury', 'Victim Ejected',
+  'Victim Safety Equipment 1', 'Victim Safety Equipment 2', 'Victim Age', 'Victim Sex',
+  'Victim Seating Position', 'Collision Id', 'Party Number', 'County Code',
+]);
+
+async function _fetchCrashDetail(ids) {
+  try {
+    const data = await fetch(`/api/crashes/detail?ids=${ids.join(',')}`).then(r => r.json());
+    const allParties = ids.flatMap(id => (data[id]?.parties || []));
+    const allVictims = ids.flatMap(id => (data[id]?.victims || []));
+    const partiesEl = document.getElementById('ptab-parties');
+    const victimsEl = document.getElementById('ptab-victims');
+    if (partiesEl) {
+      partiesEl.innerHTML = allParties.length
+        ? allParties.map(_partyCardHTML).join('<hr class="popup-divider">')
+        : '<div class="popup-loading">No party data available</div>';
+    }
+    if (victimsEl) {
+      victimsEl.innerHTML = allVictims.length
+        ? allVictims.map(_victimCardHTML).join('<hr class="popup-divider">')
+        : '<div class="popup-loading">No victim data available</div>';
+    }
+    // Update tab button counts
+    document.querySelectorAll('.ptab').forEach(t => {
+      if (t.dataset.tab === 'parties') t.textContent = `Parties (${allParties.length})`;
+      if (t.dataset.tab === 'victims') t.textContent = `Victims (${allVictims.length})`;
+    });
+  } catch (_) {}
+}
+
+function _partyCardHTML(p) {
+  const type     = p['Party Type'] || '—';
+  const atFault  = p['At Fault'];
+  const age      = p['Party Age'];
+  const sex      = p['Party Sex'];
+  const sobriety = p['Party Sobriety'];
+  const make     = p['Vehicle Make'];
+  const yr       = p['Vehicle Year'];
+  const move     = p['Movement Preceding Crash'];
+  const killed   = parseInt(p['Party Number Killed']  || 0, 10);
+  const injured  = parseInt(p['Party Number Injured'] || 0, 10);
+  const extra = Object.entries(p)
+    .filter(([k, v]) => !PARTY_TOP_KEYS.has(k) && v !== null && v !== undefined && String(v).trim() !== '')
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, v]) => `<div class="popup-row"><span class="popup-key" style="font-size:0.64rem">${_esc(k)}</span><span style="font-size:0.66rem;word-break:break-all">${_esc(String(v))}</span></div>`)
+    .join('');
+  return `
+    <div class="popup-card-title">Party ${_esc(String(p['Party Number'] || ''))}: ${_esc(type)}</div>
+    ${atFault  ? `<div class="popup-row"><span class="popup-key">At Fault</span><span style="color:${atFault==='Y'?'#f97316':'#34d399'}">${_esc(atFault)}</span></div>` : ''}
+    ${(age||sex) ? `<div class="popup-row"><span class="popup-key">Age / Sex</span><span>${_esc(String(age||'—'))} / ${_esc(String(sex||'—'))}</span></div>` : ''}
+    ${sobriety ? `<div class="popup-row"><span class="popup-key">Sobriety</span><span style="font-size:0.7rem">${_esc(sobriety)}</span></div>` : ''}
+    ${(make||yr) ? `<div class="popup-row"><span class="popup-key">Vehicle</span><span>${_esc(String(yr||''))} ${_esc(String(make||''))}</span></div>` : ''}
+    ${move ? `<div class="popup-row"><span class="popup-key">Movement</span><span style="font-size:0.7rem">${_esc(move)}</span></div>` : ''}
+    ${killed  > 0 ? `<div class="popup-row"><span class="popup-key">Killed</span><span style="color:#dc2626">${killed}</span></div>` : ''}
+    ${injured > 0 ? `<div class="popup-row"><span class="popup-key">Injured</span><span>${injured}</span></div>` : ''}
+    ${extra}
+  `;
+}
+
+function _victimCardHTML(v) {
+  const role  = v['Victim Role'] || '—';
+  const deg   = String(v['Victim Degree of Injury'] ?? '');
+  const degLabel = INJURY_DEGREE[deg] || deg || '—';
+  const degColor = INJURY_DEGREE_COLOR[deg] || '#9ca3af';
+  const ejected  = v['Victim Ejected'];
+  const eq1      = v['Victim Safety Equipment 1'];
+  const eq2      = v['Victim Safety Equipment 2'];
+  const age      = v['Victim Age'];
+  const sex      = v['Victim Sex'];
+  const seat     = v['Victim Seating Position'];
+  const extra = Object.entries(v)
+    .filter(([k, val]) => !VICTIM_TOP_KEYS.has(k) && val !== null && val !== undefined && String(val).trim() !== '')
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([k, val]) => `<div class="popup-row"><span class="popup-key" style="font-size:0.64rem">${_esc(k)}</span><span style="font-size:0.66rem;word-break:break-all">${_esc(String(val))}</span></div>`)
+    .join('');
+  return `
+    <div class="popup-card-title">Victim ${_esc(String(v['Victim Number'] || ''))}: ${_esc(role)}</div>
+    <div class="popup-row"><span class="popup-key">Injury</span><span style="color:${degColor};font-weight:600">${_esc(degLabel)}</span></div>
+    ${ejected && ejected !== 'Not Ejected' ? `<div class="popup-row"><span class="popup-key">Ejected</span><span style="color:#f97316">${_esc(ejected)}</span></div>` : ''}
+    ${eq1 ? `<div class="popup-row"><span class="popup-key">Safety Equip 1</span><span style="font-size:0.7rem">${_esc(eq1)}</span></div>` : ''}
+    ${eq2 ? `<div class="popup-row"><span class="popup-key">Safety Equip 2</span><span style="font-size:0.7rem">${_esc(eq2)}</span></div>` : ''}
+    ${(age||sex) ? `<div class="popup-row"><span class="popup-key">Age / Sex</span><span>${_esc(String(age||'—'))} / ${_esc(String(sex||'—'))}</span></div>` : ''}
+    ${seat ? `<div class="popup-row"><span class="popup-key">Seat Position</span><span>${_esc(seat)}</span></div>` : ''}
+    ${extra}
+  `;
 }
 
 // ---- Popups (registered once — layer-click listeners survive setStyle) -------
@@ -1184,34 +1332,28 @@ function setupPopups() {
     // Resolve each rendered feature to its full record from CRASH_FEATURE_MAP.
     const feats = e.features.map(f => {
       const id = String(f.properties.id ?? f.properties.collision_id ?? '');
-      const full = CRASH_FEATURE_MAP.get(id);
-      return full || f;
+      return CRASH_FEATURE_MAP.get(id) || f;
     });
     const total = feats.length;
 
-    const rows = feats.slice(0, 8).map((feat, i) => {
-      const p      = feat.properties;
-      const sev    = p.severity || 'pdo';
-      const color  = SEVERITY_COLOR[sev] || '#9ca3af';
-      const label  = SEVERITY_LABEL[sev] || sev;
+    // Build Crash tab HTML (same layout as before)
+    const crashRows = feats.slice(0, 8).map((feat, i) => {
+      const p       = feat.properties;
+      const sev     = p.severity || 'pdo';
+      const color   = SEVERITY_COLOR[sev] || '#9ca3af';
+      const label   = SEVERITY_LABEL[sev] || sev;
       const typeStr = (p.collision_type || p.collision_type_description || 'unknown').replace(/_/g, ' ');
       const dateStr = p.date || (p.year ? String(p.year) : '—');
       const cond    = p.special_cond || p.special_condition || '';
-
-      // All remaining fields not shown in the header section
       const extraRows = Object.entries(p)
         .filter(([k, v]) => !CRASH_TOP_KEYS.has(k) && v !== null && v !== undefined && String(v).trim() !== '')
         .sort(([a], [b]) => a.localeCompare(b))
         .map(([k, v]) => `<div class="popup-row"><span class="popup-key" style="font-size:0.66rem">${_esc(k.replace(/_/g,' '))}</span><span style="font-size:0.68rem;word-break:break-all">${_esc(String(v))}</span></div>`)
         .join('');
-
       return `
         ${i > 0 ? '<hr class="popup-divider">' : ''}
         ${total > 1 ? `<div class="popup-seq">${i + 1} / ${Math.min(total, 8)}${total > 8 ? '+' : ''}</div>` : ''}
-        <div class="popup-row">
-          <span class="popup-key">Severity</span>
-          <span style="color:${color};font-weight:600">${_esc(label)}</span>
-        </div>
+        <div class="popup-row"><span class="popup-key">Severity</span><span style="color:${color};font-weight:600">${_esc(label)}</span></div>
         <div class="popup-row"><span class="popup-key">Type</span><span>${_esc(typeStr)}</span></div>
         <div class="popup-row"><span class="popup-key">Date</span><span>${_esc(dateStr)}</span></div>
         ${p.killed  > 0 ? `<div class="popup-row"><span class="popup-key">Killed</span><span style="color:#dc2626">${p.killed}</span></div>` : ''}
@@ -1226,13 +1368,44 @@ function setupPopups() {
       <div class="popup-title">
         Traffic Crash${total > 1 ? ` <span style="font-size:0.75rem;color:#6b7280">(${total} here)</span>` : ''}
       </div>
-      <div class="popup-scroll">${rows}</div>
+      <div class="popup-tabs">
+        <button class="ptab active" data-tab="crash">Crash</button>
+        <button class="ptab" data-tab="parties">Parties</button>
+        <button class="ptab" data-tab="victims">Victims</button>
+      </div>
+      <div id="ptab-crash"   class="ptab-content popup-scroll">${crashRows}</div>
+      <div id="ptab-parties" class="ptab-content hidden popup-scroll"><div class="popup-loading">Loading…</div></div>
+      <div id="ptab-victims" class="ptab-content hidden popup-scroll"><div class="popup-loading">Loading…</div></div>
     `).addTo(map);
+
+    // Tab switching — delegate to popup content div (recreated each addTo call)
+    const content = document.querySelector('.maplibregl-popup-content');
+    if (content) {
+      content.addEventListener('click', evt => {
+        const btn = evt.target.closest('.ptab');
+        if (!btn) return;
+        content.querySelectorAll('.ptab').forEach(b => b.classList.remove('active'));
+        content.querySelectorAll('.ptab-content').forEach(c => c.classList.add('hidden'));
+        btn.classList.add('active');
+        document.getElementById(`ptab-${btn.dataset.tab}`)?.classList.remove('hidden');
+      });
+    }
+
+    // Lazy-load parties and victims
+    const ids = feats.slice(0, 8).map(f => String(f.properties.id));
+    _fetchCrashDetail(ids);
 
     // Click to select — Cmd/Ctrl+click appends, plain click replaces
     const append = e.originalEvent.metaKey || e.originalEvent.ctrlKey;
-    if (!append) G_selectionData = { type: 'FeatureCollection', features: [] };
-    feats.forEach(f => _applyClickSelection(f, true));
+    if (!append || !G_selectionData) G_selectionData = { type: 'FeatureCollection', features: [] };
+    const existingIds = new Set(G_selectionData.features.map(f => f.properties.id));
+    feats.forEach(f => {
+      if (f && !existingIds.has(f.properties.id)) {
+        G_selectionData.features.push(f);
+        existingIds.add(f.properties.id);
+      }
+    });
+    _updateHighlight();
   });
   map.on('mouseenter', 'crashes-layer', () => { map.getCanvas().style.cursor = 'pointer'; });
   map.on('mouseleave', 'crashes-layer', () => { map.getCanvas().style.cursor = ''; });
@@ -1312,6 +1485,11 @@ function toggleLayer(key) {
   _syncLayerVisibility(key);
   document.getElementById(`row-${key}`)?.classList.toggle('off',  !LAYER_VISIBILITY[key]);
   document.getElementById(`toggle-${key}`)?.classList.toggle('on', LAYER_VISIBILITY[key]);
+
+  if (key === 'crashes') {
+    document.getElementById('crash-filters')?.classList.toggle('hidden', !LAYER_VISIBILITY[key]);
+    if (!LAYER_VISIBILITY[key]) applyCrashFilter(); // clear filters when layer hidden
+  }
 }
 
 function applyVisibilityState() {
