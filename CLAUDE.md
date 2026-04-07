@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Language
+
+**Always respond in Chinese (中文).** The user is Chinese and communicates in English only to save tokens. All assistant replies must be in Chinese without exception — never switch to Korean, Japanese, or any other language. Code, comments, filenames, and UI text remain in English.
+
 ## Project Overview
 
 **GIS-Track** — A web-based GIS application for tracking transportation safety infrastructure and crash data across all of California. Phase 1 is complete; Phase 2 (PostGIS + drawing tools) is next.

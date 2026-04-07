@@ -24,14 +24,13 @@ AREAS = {
 }
 
 
-def get_all_resources() -> tuple[dict, dict, dict]:
-    """Return ({year: id} for Crashes, Parties, InjuredWitnessPassengers)."""
+def get_all_resources() -> dict:
+    """Return {year: resource_id} for Crashes resources."""
     resp = requests.get(f"{BASE_URL}/package_show", params={"id": PACKAGE_ID}, timeout=20)
     resp.raise_for_status()
-    crashes, parties, victims = {}, {}, {}
+    crashes = {}
     for r in resp.json()["result"]["resources"]:
         raw_name = r.get("name", "")
-        name = raw_name.lower()
         parts = raw_name.split("_")
         try:
             year = int(parts[-1])
@@ -39,13 +38,9 @@ def get_all_resources() -> tuple[dict, dict, dict]:
             continue
         if year not in TARGET_YEARS:
             continue
-        if name.startswith("crashes"):
+        if raw_name.lower().startswith("crashes"):
             crashes[year] = r["id"]
-        elif name.startswith("parties"):
-            parties[year] = r["id"]
-        elif name.startswith("injuredwitnesspassengers"):
-            victims[year] = r["id"]
-    return crashes, parties, victims
+    return crashes
 
 
 def fetch_county_records(resources: dict, county_code: int, label: str) -> list:
@@ -76,23 +71,6 @@ def fetch_county_records(resources: dict, county_code: int, label: str) -> list:
         print(f"{len(all_records)} total")
     return all_records
 
-
-def group_by_collision(records: list) -> dict:
-    """Group records by Collision Id, deduplicating by (collision_id, party_num, victim_num)."""
-    grouped: dict[str, list] = {}
-    seen: set = set()
-    for rec in records:
-        cid = str(rec.get("Collision Id") or "")
-        if not cid:
-            continue
-        key = (cid, rec.get("Party Number"), rec.get("Victim Number"))
-        if key in seen:
-            continue
-        seen.add(key)
-        cleaned = {k: v for k, v in rec.items()
-                   if k not in ("_id", "_full_text", "rank") and v is not None}
-        grouped.setdefault(cid, []).append(cleaned)
-    return grouped
 
 
 def record_to_feature(r: dict) -> dict | None:
@@ -143,6 +121,11 @@ def record_to_feature(r: dict) -> dict | None:
     props["killed"]   = killed
     props["injured"]  = injured
     props["date"]     = crash_dt[:10] if len(crash_dt) >= 10 else crash_dt
+
+    # Computed flags from Crashes table (MotorVehicleInvolvedWithCode: B=Pedestrian, E=Bicycle)
+    mviw = str(r.get("MotorVehicleInvolvedWithCode") or "").strip().upper()
+    props["has_pedestrian"] = mviw == "B"
+    props["has_cyclist"]    = mviw == "E"
     return {
         "type": "Feature",
         "geometry": {"type": "Point", "coordinates": [round(lon, 6), round(lat, 6)]},
@@ -150,50 +133,23 @@ def record_to_feature(r: dict) -> dict | None:
     }
 
 
-def enrich_features(features: list, parties_dict: dict, victims_dict: dict) -> None:
-    """Mutate crash features in-place: add summary flags and victim-based severity."""
-    NOT_IMPAIRED = {"had not been drinking", "unknown", ""}
-    DEGREE_MAP = {1: "fatal", 2: "severe_injury", 3: "other_injury", 4: "other_injury"}
-    for feat in features:
-        cid = feat["properties"]["id"]
-        parties = parties_dict.get(cid, [])
-        victims = victims_dict.get(cid, [])
-        feat["properties"]["has_pedestrian"] = any(
-            "pedestrian" in str(p.get("Party Type", "")).lower() for p in parties)
-        feat["properties"]["has_cyclist"] = any(
-            "bicycl" in str(p.get("Party Type", "")).lower() for p in parties)
-        feat["properties"]["has_impaired"] = any(
-            str(p.get("Party Sobriety", "")).strip().lower() not in NOT_IMPAIRED
-            for p in parties)
-        degrees = []
-        for v in victims:
-            try:
-                degrees.append(int(v["Victim Degree of Injury"]))
-            except (KeyError, ValueError, TypeError):
-                pass
-        if degrees:
-            feat["properties"]["severity"] = DEGREE_MAP.get(min(degrees), "pdo")
-
 
 def main():
     os.makedirs(CACHE_DIR, exist_ok=True)
 
     print("Discovering CCRS resources…")
     try:
-        crash_res, parties_res, victims_res = get_all_resources()
+        crash_res = get_all_resources()
     except Exception as e:
         print(f"ERROR discovering resources: {e}")
         sys.exit(1)
 
-    print(f"  Crashes:  {sorted(crash_res)} years")
-    print(f"  Parties:  {sorted(parties_res)} years")
-    print(f"  Victims:  {sorted(victims_res)} years")
+    print(f"  Crashes: {sorted(crash_res)} years")
 
     for area_name, cfg in AREAS.items():
         cc = cfg["county_code"]
         print(f"\n=== {cfg['label']} (county_code={cc}) ===")
 
-        # Crashes
         crash_records = fetch_county_records(crash_res, cc, "crashes")
         features, seen_ids = [], set()
         for rec in crash_records:
@@ -205,29 +161,11 @@ def main():
                 seen_ids.add(fid)
                 features.append(feat)
 
-        # Parties
-        party_records = fetch_county_records(parties_res, cc, "parties")
-        parties_dict = group_by_collision(party_records)
-
-        # Victims
-        victim_records = fetch_county_records(victims_res, cc, "victims")
-        victims_dict = group_by_collision(victim_records)
-
-        # Enrich and save
-        enrich_features(features, parties_dict, victims_dict)
-
         with open(os.path.join(CACHE_DIR, f"{area_name}.geojson"), "w") as f:
             json.dump({"type": "FeatureCollection", "features": features}, f)
-        with open(os.path.join(CACHE_DIR, f"{area_name}_parties.json"), "w") as f:
-            json.dump(parties_dict, f)
-        with open(os.path.join(CACHE_DIR, f"{area_name}_victims.json"), "w") as f:
-            json.dump(victims_dict, f)
 
         fatal_n = sum(1 for ft in features if ft["properties"]["severity"] == "fatal")
-        n_p = sum(len(v) for v in parties_dict.values())
-        n_v = sum(len(v) for v in victims_dict.values())
-        print(f"  Saved: {len(features)} crashes ({fatal_n} fatal), "
-              f"{n_p} parties, {n_v} victims → {CACHE_DIR}/{area_name}.*")
+        print(f"  Saved: {len(features)} crashes ({fatal_n} fatal) → {CACHE_DIR}/{area_name}.geojson")
 
     print("\nDone.")
 

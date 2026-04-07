@@ -227,6 +227,12 @@ async function loadData() {
     document.getElementById('sv-hint').textContent = 'Add GOOGLE_MAPS_KEY to .env';
   }
 
+  // Load county list for Statistics panel
+  try {
+    const counties = await fetch('/api/counties').then(r => r.json());
+    _buildCountySelect(counties);
+  } catch (_) {}
+
   updateStats();
 }
 
@@ -339,6 +345,8 @@ function updateStats() {
   document.getElementById('stat-crossings').textContent     = crossings.length.toLocaleString();
   document.getElementById('stat-crashes-total').textContent = (G_crashData?.features.length ?? 0).toLocaleString();
   document.getElementById('stat-fatal').textContent         = fatal.length.toLocaleString();
+  // Refresh chart if panel is open and on a live scope
+  _maybeRefreshStatsOnDataUpdate();
 }
 
 // ---- Core layer rebuild (called after every style switch) --------------------
@@ -805,6 +813,7 @@ function _updateHighlight() {
   src.setData({ type: 'FeatureCollection', features });
   document.getElementById('sel-count').textContent = features.length.toLocaleString();
   document.getElementById('selection-result').classList.toggle('hidden', features.length === 0);
+  _statsOnSelectionChange(features.length);
 }
 
 function _applyClickSelection(feat, append) {
@@ -974,9 +983,8 @@ async function downloadSelectionFull() {
 
 function applyCrashFilter() {
   const filters = ['all'];
-  if (document.getElementById('cf-ped')?.checked)      filters.push(['==', ['get', 'has_pedestrian'], true]);
-  if (document.getElementById('cf-bike')?.checked)     filters.push(['==', ['get', 'has_cyclist'],    true]);
-  if (document.getElementById('cf-impaired')?.checked) filters.push(['==', ['get', 'has_impaired'],   true]);
+  if (document.getElementById('cf-ped')?.checked)  filters.push(['==', ['get', 'motorvehicleinvolvedwithcode'], 'B']);
+  if (document.getElementById('cf-bike')?.checked) filters.push(['==', ['get', 'motorvehicleinvolvedwithcode'], 'E']);
   const f = filters.length > 1 ? filters : null;
   ['crashes-layer', 'heatmap-layer'].forEach(id => {
     if (map.getLayer(id)) map.setFilter(id, f);
@@ -1157,27 +1165,33 @@ function toggleStatsRibbon() {
 // ---- Crash detail (Parties & Victims) helpers --------------------------------
 
 const INJURY_DEGREE = {
-  '1': 'Killed', '2': 'Severe Injury', '3': 'Other Visible Injury',
-  '4': 'Complaint of Pain', '5': 'Possible Injury', '6': 'No Apparent Injury', '0': 'Not a Victim',
+  'Fatal':          'Fatal',
+  'SuspectSerious': 'Suspect Serious Injury',
+  'SuspectMinor':   'Suspect Minor Injury',
+  'PossibleInjury': 'Possible Injury',
 };
 const INJURY_DEGREE_COLOR = {
-  '1': '#dc2626', '2': '#f97316', '3': '#fbbf24', '4': '#9ca3af', '6': '#374151',
+  'Fatal':          '#dc2626',
+  'SuspectSerious': '#f97316',
+  'SuspectMinor':   '#fbbf24',
+  'PossibleInjury': '#9ca3af',
 };
 
 const PARTY_TOP_KEYS = new Set([
-  'Party Number', 'Party Type', 'At Fault', 'Party Age', 'Party Sex',
-  'Party Sobriety', 'Vehicle Make', 'Vehicle Year', 'Movement Preceding Crash',
-  'Party Number Killed', 'Party Number Injured', 'Collision Id', 'County Code',
+  'PartyNumber', 'PartyType', 'IsAtFault', 'StatedAge', 'GenderDescription',
+  'SobrietyDrugPhysicalDescription1', 'Vehicle1Make', 'Vehicle1Year',
+  'MovementPrecCollDescription', 'NumberKilledParty', 'NumberInjuredParty', 'CollisionId',
 ]);
 const VICTIM_TOP_KEYS = new Set([
-  'Victim Number', 'Victim Role', 'Victim Degree of Injury', 'Victim Ejected',
-  'Victim Safety Equipment 1', 'Victim Safety Equipment 2', 'Victim Age', 'Victim Sex',
-  'Victim Seating Position', 'Collision Id', 'Party Number', 'County Code',
+  'InjuredWitPassId', 'InjuredPersonType', 'ExtentOfInjuryCode', 'Ejected',
+  'SafetyEquipmentDescription', 'SeatPositionDescription', 'StatedAge', 'Gender Desc',
+  'CollisionId', 'PartyNumber',
 ]);
 
-async function _fetchCrashDetail(ids) {
+async function _fetchCrashDetail(ids, years) {
   try {
-    const data = await fetch(`/api/crashes/detail?ids=${ids.join(',')}`).then(r => r.json());
+    const yearParam = years && years.length ? `&years=${years.join(',')}` : '';
+    const data = await fetch(`/api/crashes/detail?ids=${ids.join(',')}${yearParam}`).then(r => r.json());
     const allParties = ids.flatMap(id => (data[id]?.parties || []));
     const allVictims = ids.flatMap(id => (data[id]?.victims || []));
     const partiesEl = document.getElementById('ptab-parties');
@@ -1201,24 +1215,24 @@ async function _fetchCrashDetail(ids) {
 }
 
 function _partyCardHTML(p) {
-  const type     = p['Party Type'] || '—';
-  const atFault  = p['At Fault'];
-  const age      = p['Party Age'];
-  const sex      = p['Party Sex'];
-  const sobriety = p['Party Sobriety'];
-  const make     = p['Vehicle Make'];
-  const yr       = p['Vehicle Year'];
-  const move     = p['Movement Preceding Crash'];
-  const killed   = parseInt(p['Party Number Killed']  || 0, 10);
-  const injured  = parseInt(p['Party Number Injured'] || 0, 10);
+  const type     = p['PartyType'] || '—';
+  const atFault  = p['IsAtFault'];
+  const age      = p['StatedAge'];
+  const sex      = p['GenderDescription'];
+  const sobriety = p['SobrietyDrugPhysicalDescription1'];
+  const make     = p['Vehicle1Make'];
+  const yr       = p['Vehicle1Year'];
+  const move     = p['MovementPrecCollDescription'];
+  const killed   = parseInt(p['NumberKilledParty']  || 0, 10);
+  const injured  = parseInt(p['NumberInjuredParty'] || 0, 10);
   const extra = Object.entries(p)
     .filter(([k, v]) => !PARTY_TOP_KEYS.has(k) && v !== null && v !== undefined && String(v).trim() !== '')
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([k, v]) => `<div class="popup-row"><span class="popup-key" style="font-size:0.64rem">${_esc(k)}</span><span style="font-size:0.66rem;word-break:break-all">${_esc(String(v))}</span></div>`)
     .join('');
   return `
-    <div class="popup-card-title">Party ${_esc(String(p['Party Number'] || ''))}: ${_esc(type)}</div>
-    ${atFault  ? `<div class="popup-row"><span class="popup-key">At Fault</span><span style="color:${atFault==='Y'?'#f97316':'#34d399'}">${_esc(atFault)}</span></div>` : ''}
+    <div class="popup-card-title">Party ${_esc(String(p['PartyNumber'] || ''))}: ${_esc(type)}</div>
+    ${atFault  ? `<div class="popup-row"><span class="popup-key">At Fault</span><span style="color:${atFault==='True'?'#f97316':'#34d399'}">${_esc(atFault)}</span></div>` : ''}
     ${(age||sex) ? `<div class="popup-row"><span class="popup-key">Age / Sex</span><span>${_esc(String(age||'—'))} / ${_esc(String(sex||'—'))}</span></div>` : ''}
     ${sobriety ? `<div class="popup-row"><span class="popup-key">Sobriety</span><span style="font-size:0.7rem">${_esc(sobriety)}</span></div>` : ''}
     ${(make||yr) ? `<div class="popup-row"><span class="popup-key">Vehicle</span><span>${_esc(String(yr||''))} ${_esc(String(make||''))}</span></div>` : ''}
@@ -1230,27 +1244,25 @@ function _partyCardHTML(p) {
 }
 
 function _victimCardHTML(v) {
-  const role  = v['Victim Role'] || '—';
-  const deg   = String(v['Victim Degree of Injury'] ?? '');
+  const role     = v['InjuredPersonType'] || '—';
+  const deg      = String(v['ExtentOfInjuryCode'] ?? '');
   const degLabel = INJURY_DEGREE[deg] || deg || '—';
   const degColor = INJURY_DEGREE_COLOR[deg] || '#9ca3af';
-  const ejected  = v['Victim Ejected'];
-  const eq1      = v['Victim Safety Equipment 1'];
-  const eq2      = v['Victim Safety Equipment 2'];
-  const age      = v['Victim Age'];
-  const sex      = v['Victim Sex'];
-  const seat     = v['Victim Seating Position'];
+  const ejected  = v['Ejected'];
+  const eq       = v['SafetyEquipmentDescription'];
+  const age      = v['StatedAge'];
+  const sex      = v['Gender Desc'];
+  const seat     = v['SeatPositionDescription'];
   const extra = Object.entries(v)
     .filter(([k, val]) => !VICTIM_TOP_KEYS.has(k) && val !== null && val !== undefined && String(val).trim() !== '')
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([k, val]) => `<div class="popup-row"><span class="popup-key" style="font-size:0.64rem">${_esc(k)}</span><span style="font-size:0.66rem;word-break:break-all">${_esc(String(val))}</span></div>`)
     .join('');
   return `
-    <div class="popup-card-title">Victim ${_esc(String(v['Victim Number'] || ''))}: ${_esc(role)}</div>
+    <div class="popup-card-title">Victim ${_esc(String(v['InjuredWitPassId'] || ''))}: ${_esc(role)}</div>
     <div class="popup-row"><span class="popup-key">Injury</span><span style="color:${degColor};font-weight:600">${_esc(degLabel)}</span></div>
-    ${ejected && ejected !== 'Not Ejected' ? `<div class="popup-row"><span class="popup-key">Ejected</span><span style="color:#f97316">${_esc(ejected)}</span></div>` : ''}
-    ${eq1 ? `<div class="popup-row"><span class="popup-key">Safety Equip 1</span><span style="font-size:0.7rem">${_esc(eq1)}</span></div>` : ''}
-    ${eq2 ? `<div class="popup-row"><span class="popup-key">Safety Equip 2</span><span style="font-size:0.7rem">${_esc(eq2)}</span></div>` : ''}
+    ${ejected && ejected !== 'NotEjected' ? `<div class="popup-row"><span class="popup-key">Ejected</span><span style="color:#f97316">${_esc(ejected)}</span></div>` : ''}
+    ${eq ? `<div class="popup-row"><span class="popup-key">Safety Equip</span><span style="font-size:0.7rem">${_esc(eq)}</span></div>` : ''}
     ${(age||sex) ? `<div class="popup-row"><span class="popup-key">Age / Sex</span><span>${_esc(String(age||'—'))} / ${_esc(String(sex||'—'))}</span></div>` : ''}
     ${seat ? `<div class="popup-row"><span class="popup-key">Seat Position</span><span>${_esc(seat)}</span></div>` : ''}
     ${extra}
@@ -1391,9 +1403,10 @@ function setupPopups() {
       });
     }
 
-    // Lazy-load parties and victims
-    const ids = feats.slice(0, 8).map(f => String(f.properties.id));
-    _fetchCrashDetail(ids);
+    // Lazy-load parties and victims (pass year hints to narrow CKAN search)
+    const ids   = feats.slice(0, 8).map(f => String(f.properties.id));
+    const years = [...new Set(feats.slice(0, 8).map(f => String(f.properties.year || '')).filter(Boolean))];
+    _fetchCrashDetail(ids, years);
 
     // Click to select — Cmd/Ctrl+click appends, plain click replaces
     const append = e.originalEvent.metaKey || e.originalEvent.ctrlKey;
@@ -1518,5 +1531,341 @@ function switchBasemap(mode) {
   });
   document.getElementById('btn-basemap-map').classList.toggle('active',       mode === 'map');
   document.getElementById('btn-basemap-satellite').classList.toggle('active', mode === 'satellite');
+}
+
+// ---- Statistics Analysis Panel -----------------------------------------------
+
+let _statChart     = null;
+let _statSource    = 'crashes';   // 'crashes' | 'osm'
+let _statChartType = 'bar';       // 'bar' | 'pie'
+let G_lastStatsData = null;       // { groups, total } — used for CSV export
+
+const SEVERITY_COLORS = {
+  'fatal':         '#dc2626',
+  'severe_injury': '#f97316',
+  'other_injury':  '#fbbf24',
+  'pdo':           '#6b7280',
+};
+const STAT_PALETTE = [
+  '#3b82f6','#10b981','#f59e0b','#ef4444','#8b5cf6',
+  '#06b6d4','#ec4899','#84cc16','#f97316','#6366f1',
+  '#14b8a6','#a78bfa','#fb923c','#22d3ee','#4ade80',
+];
+
+function toggleStatsPanel() {
+  const body  = document.getElementById('stat-panel-body');
+  const arrow = document.getElementById('stats-panel-arrow');
+  const open  = body.classList.contains('hidden');
+  body.classList.toggle('hidden', !open);
+  arrow.innerHTML = open ? '&#9660;' : '&#9658;';
+  if (open) {
+    _buildCityList();
+    refreshStats();
+  }
+}
+
+function setStatSource(src) {
+  _statSource = src;
+  document.getElementById('stat-src-crashes').classList.toggle('active', src === 'crashes');
+  document.getElementById('stat-src-osm').classList.toggle('active',     src === 'osm');
+  document.getElementById('stat-scope-row').classList.toggle('hidden',   src === 'osm');
+  document.getElementById('stat-groupby-row').classList.toggle('hidden', src === 'osm');
+  document.getElementById('stat-year-row').classList.toggle('hidden',    src === 'osm');
+  refreshStats();
+}
+
+function setChartType(type) {
+  _statChartType = type;
+  document.getElementById('stat-chart-bar').classList.toggle('active', type === 'bar');
+  document.getElementById('stat-chart-pie').classList.toggle('active', type === 'pie');
+  if (G_lastStatsData) _renderChart(G_lastStatsData);
+}
+
+function _getStatScope() {
+  for (const r of document.querySelectorAll('input[name="stat-scope"]')) {
+    if (r.checked) return r.value;
+  }
+  return 'viewport';
+}
+
+async function refreshStats() {
+  const body = document.getElementById('stat-panel-body');
+  if (!body || body.classList.contains('hidden')) return;
+
+  const totalEl = document.getElementById('stat-total');
+  totalEl.textContent = 'Computing…';
+
+  if (_statSource === 'osm') {
+    const scope = _getStatScope();
+    const features = (scope === 'selection' && G_selectionData)
+      ? G_selectionData.features.filter(f => f.properties.severity === undefined)
+      : [...OSM_FEATURE_MAP.values()];
+    _renderStatsFromFeatures(features, 'type', '', `OSM features${scope === 'selection' ? ' (selection)' : ' (viewport)'}`);
+    return;
+  }
+
+  const scope   = _getStatScope();
+  const groupBy = document.getElementById('stat-groupby').value;
+  const year    = document.getElementById('stat-year').value;
+
+  if (scope === 'selection') {
+    const features = (G_selectionData?.features || []).filter(f => f.properties.severity !== undefined);
+    _renderStatsFromFeatures(features, groupBy, year, 'crashes (selection)');
+    return;
+  }
+
+  if (scope === 'viewport') {
+    _renderStatsFromFeatures([...CRASH_FEATURE_MAP.values()], groupBy, year, 'crashes (viewport)');
+    return;
+  }
+
+  // county or city — call backend
+  let url;
+  if (scope === 'county') {
+    const cc = document.getElementById('stat-county-select').value;
+    if (!cc) { totalEl.textContent = 'Select a county above'; return; }
+    url = `/api/crashes/stats?scope=county&county_code=${cc}&group_by=${groupBy}${year ? '&year=' + year : ''}`;
+  } else {
+    const city = document.getElementById('stat-city-input').value.trim();
+    if (!city) { totalEl.textContent = 'Enter a city name above'; return; }
+    url = `/api/crashes/stats?scope=city&city_name=${encodeURIComponent(city)}&group_by=${groupBy}${year ? '&year=' + year : ''}`;
+  }
+
+  try {
+    const data = await fetch(url).then(r => r.json());
+    if (data.fetching) {
+      _destroyChart();
+      totalEl.textContent = 'County not loaded yet — zoom in to load it first.';
+      return;
+    }
+    G_lastStatsData = data.groups;
+    const label = `${(data.total || 0).toLocaleString()} crashes${data.display_name ? ' · ' + data.display_name : ''}`;
+    totalEl.textContent = label;
+    _renderChart(data.groups);
+  } catch (_) {
+    totalEl.textContent = 'Error loading stats';
+  }
+}
+
+function _renderStatsFromFeatures(features, groupBy, yearFilter, label) {
+  const counts = {};
+  let total = 0;
+  for (const f of features) {
+    if (yearFilter && String(f.properties.year) !== yearFilter) continue;
+    let val = f.properties[groupBy];
+    val = (val !== undefined && val !== null && String(val).trim()) ? String(val).trim() : 'Unknown';
+    counts[val] = (counts[val] || 0) + 1;
+    total++;
+  }
+  const groups = Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 15)
+    .map(([lbl, cnt]) => ({ label: lbl, count: cnt }));
+  G_lastStatsData = groups;
+  document.getElementById('stat-total').textContent = `${total.toLocaleString()} ${label}`;
+  _renderChart(groups);
+}
+
+function _destroyChart() {
+  if (_statChart) { _statChart.destroy(); _statChart = null; }
+}
+
+function _renderChart(groups) {
+  if (!groups || groups.length === 0) {
+    _destroyChart();
+    if (!document.getElementById('stat-total').textContent) {
+      document.getElementById('stat-total').textContent = 'No data';
+    }
+    return;
+  }
+  const labels = groups.map(g => g.label);
+  const values = groups.map(g => g.count);
+  const total  = values.reduce((a, b) => a + b, 0);
+  const colors = groups.map((g, i) =>
+    (_statSource === 'crashes' && SEVERITY_COLORS[g.label])
+      ? SEVERITY_COLORS[g.label]
+      : STAT_PALETTE[i % STAT_PALETTE.length]
+  );
+
+  _destroyChart();
+  const ctx = document.getElementById('stat-chart').getContext('2d');
+  const isBar = _statChartType === 'bar';
+  _statChart = new Chart(ctx, {
+    type: isBar ? 'bar' : 'doughnut',
+    data: {
+      labels,
+      datasets: [{
+        data:            values,
+        backgroundColor: isBar ? colors.map(c => c + 'bb') : colors,
+        borderColor:     colors,
+        borderWidth:     isBar ? 0 : 1,
+        borderRadius:    isBar ? 3 : 0,
+      }],
+    },
+    options: {
+      responsive:          true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: {
+          display: !isBar,
+          labels:  { color: '#9ca3af', font: { size: 9 }, boxWidth: 10, padding: 6 },
+        },
+        tooltip: {
+          callbacks: {
+            label: ctx => ` ${ctx.raw.toLocaleString()} (${((ctx.raw / total) * 100).toFixed(1)}%)`,
+          },
+        },
+      },
+      scales: isBar ? {
+        x: { ticks: { color: '#6b7280', font: { size: 8 }, maxRotation: 40 }, grid: { color: '#1f2937' } },
+        y: { ticks: { color: '#6b7280', font: { size: 8 } },                  grid: { color: '#1f2937' } },
+      } : {},
+    },
+  });
+}
+
+function exportStatsCsv() {
+  if (!G_lastStatsData || !G_lastStatsData.length) return;
+  const total = G_lastStatsData.reduce((s, g) => s + g.count, 0);
+  const rows  = [['Label', 'Count', 'Percent']];
+  for (const g of G_lastStatsData) {
+    rows.push([g.label, g.count, ((g.count / total) * 100).toFixed(2) + '%']);
+  }
+  rows.push(['Total', total, '100%']);
+  const csv  = rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const a    = document.createElement('a');
+  a.href     = URL.createObjectURL(blob);
+  a.download = `gistrack_stats_${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function _buildCountySelect(counties) {
+  const sel = document.getElementById('stat-county-select');
+  if (!sel) return;
+  const sorted = Object.entries(counties).sort((a, b) => a[0].localeCompare(b[0]));
+  for (const [name, code] of sorted) {
+    const opt = document.createElement('option');
+    opt.value       = code;
+    opt.textContent = name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+    sel.appendChild(opt);
+  }
+}
+
+function _buildCityList() {
+  const cities = new Set();
+  for (const f of CRASH_FEATURE_MAP.values()) {
+    const c = f.properties.city_name;
+    if (c) cities.add(String(c).trim());
+  }
+  const dl = document.getElementById('stat-city-list');
+  if (!dl) return;
+  dl.innerHTML = '';
+  for (const c of [...cities].sort()) {
+    const opt = document.createElement('option');
+    opt.value = c;
+    dl.appendChild(opt);
+  }
+}
+
+function _statsOnSelectionChange(selCount) {
+  const selRadio    = document.getElementById('stat-scope-selection');
+  const selCountEl  = document.getElementById('stat-sel-count');
+  if (!selRadio) return;
+  const hasSelection = selCount > 0;
+  selRadio.disabled = !hasSelection;
+  if (selCountEl) selCountEl.textContent = hasSelection ? `(${selCount.toLocaleString()})` : '';
+  if (hasSelection) {
+    selRadio.checked = true;
+  } else if (selRadio.checked) {
+    document.getElementById('stat-scope-viewport').checked = true;
+  }
+  const body = document.getElementById('stat-panel-body');
+  if (body && !body.classList.contains('hidden')) refreshStats();
+}
+
+function _maybeRefreshStatsOnDataUpdate() {
+  const body = document.getElementById('stat-panel-body');
+  if (!body || body.classList.contains('hidden')) return;
+  const scope = _getStatScope();
+  if (scope === 'viewport' || _statSource === 'osm') refreshStats();
+}
+
+// =============================================================================
+// Data Source Info Modal
+// =============================================================================
+
+const _DATA_META = {
+  basemap: {
+    title: 'Basemap Tiles',
+    rows: [
+      ['Map style',   'OpenFreeMap — liberty style'],
+      ['Attribution', '© OpenStreetMap contributors'],
+      ['License',     'Open Database License (ODbL) 1.0'],
+      ['Satellite',   'Esri World Imagery'],
+      ['Sat. credit', '© Esri, Maxar, Earthstar Geographics'],
+      ['Usage',       'Display only — no routing or geocoding'],
+    ],
+  },
+  osm: {
+    title: 'OpenStreetMap Infrastructure',
+    rows: [
+      ['Source',      'OpenStreetMap contributors'],
+      ['License',     'Open Database License (ODbL) 1.0'],
+      ['API',         'Overpass API (3-mirror fallback)'],
+      ['Tile cache',  'Zoom-12 tiles, cached on first viewport visit'],
+      ['Update lag',  'Hours to days behind real-world edits'],
+      ['Coverage',    'California — dynamic, viewport-based'],
+      ['More info',   'openstreetmap.org/copyright'],
+    ],
+  },
+  crash: {
+    title: 'CHP Crash Data (CCRS)',
+    rows: [
+      ['Source',    'California Highway Patrol (CHP)'],
+      ['Dataset',   'Crash Cause Reporting System (CCRS)'],
+      ['Portal',    'data.ca.gov (CKAN Datastore API)'],
+      ['License',   'California Open Data — Public Domain'],
+      ['Coverage',  'All 58 CA counties, years 2019–2024'],
+      ['Refresh',   'API updated daily; app caches per county on first view'],
+      ['Note',      'Geocoding accuracy varies; some records lack coordinates and are excluded'],
+    ],
+  },
+  mapillary: {
+    title: 'Mapillary Street Signs',
+    rows: [
+      ['Provider',   'Mapillary (Meta Platforms, Inc.)'],
+      ['Imagery',    'CC BY-SA 4.0'],
+      ['Detection',  'Mapillary AI computer vision model'],
+      ['Auth',       'Requires Mapillary API token (server-side proxy)'],
+      ['Coverage',   'Varies by location; urban areas better covered'],
+      ['Terms',      'mapillary.com/terms'],
+    ],
+  },
+  streetview: {
+    title: 'Street View',
+    rows: [
+      ['Provider', 'Google Maps Platform'],
+      ['APIs',     'Maps JavaScript API — Street View Service'],
+      ['Auth',     'Requires Google Maps API key'],
+      ['Terms',    'Google Maps Platform Terms of Service'],
+      ['Note',     'Key usage subject to Google billing; not embedded — opens in side panel'],
+    ],
+  },
+};
+
+function showDataInfo(key) {
+  const meta = _DATA_META[key];
+  if (!meta) return;
+  let rows = meta.rows.map(([k, v]) =>
+    `<tr><td style="color:#9ca3af;padding:3px 8px 3px 0;white-space:nowrap;vertical-align:top">${k}</td>` +
+    `<td style="color:#e0e0e0;padding:3px 0;line-height:1.5">${v}</td></tr>`
+  ).join('');
+  document.getElementById('data-info-title').textContent = meta.title;
+  document.getElementById('data-info-table').innerHTML = rows;
+  document.getElementById('data-info-modal').classList.remove('hidden');
+}
+
+function closeDataInfo() {
+  document.getElementById('data-info-modal').classList.add('hidden');
 }
 

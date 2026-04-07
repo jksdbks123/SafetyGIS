@@ -1,7 +1,6 @@
 import json
 import math
 import os
-import shutil
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -103,6 +102,9 @@ CA_COUNTIES: dict[str, tuple[int, tuple[float, float, float, float]]] = {
 #     if os.path.exists(_old) and not os.path.exists(_new):
 #         shutil.copy(_old, _new)
 #         print(f"[crash] Migrated {_area} → crash_cache")
+
+# Reverse lookup: county_code → county_name
+_CC_TO_NAME: dict[int, str] = {code: name for name, (code, _) in CA_COUNTIES.items()}
 
 # Background-fetch state — tracks counties currently being fetched
 _fetching_counties: set = set()
@@ -271,6 +273,11 @@ def _crash_record_to_feature(r: dict) -> dict | None:
     props["injured"]  = injured
     props["date"]     = crash_dt[:10] if len(crash_dt) >= 10 else crash_dt
 
+    # Computed flags from Crashes table (MotorVehicleInvolvedWithCode: B=Pedestrian, E=Bicycle)
+    mviw = str(r.get("MotorVehicleInvolvedWithCode") or "").strip().upper()
+    props["has_pedestrian"] = mviw == "B"
+    props["has_cyclist"]    = mviw == "E"
+
     return {
         "type": "Feature",
         "geometry": {"type": "Point", "coordinates": [round(lon, 6), round(lat, 6)]},
@@ -319,109 +326,44 @@ def _fetch_county_crashes(county_code: int) -> list:
     return features
 
 
-def _fetch_county_related(county_code: int, resources: dict, table_label: str) -> dict:
-    """Fetch all records for a county from a related table (Parties or Victims).
-    Returns {collision_id: [record, ...]} grouped dict."""
-    if not resources:
-        return {}
-    grouped: dict[str, list] = {}
-    seen: set = set()
-    filters = json.dumps({"County Code": county_code})
-    for year, resource_id in sorted(resources.items()):
-        offset = 0
-        for _ in range(CCRS_MAX_PAGES):
-            params = {
-                "resource_id": resource_id,
-                "filters":     filters,
-                "limit":       CCRS_PAGE_SIZE,
-                "offset":      offset,
-            }
-            try:
-                resp = requests.get(f"{CCRS_BASE_URL}/datastore_search", params=params, timeout=90)
-                resp.raise_for_status()
-            except Exception as e:
-                print(f"[{table_label}] county={county_code} year={year}: {e}")
-                break
-            batch = resp.json().get("result", {}).get("records", [])
-            for rec in batch:
-                cid = str(rec.get("Collision Id") or "")
-                if not cid:
-                    continue
-                # Deduplicate: use collision_id + party/victim number as key
-                dedup_key = (cid, rec.get("Party Number"), rec.get("Victim Number"))
-                if dedup_key in seen:
-                    continue
-                seen.add(dedup_key)
-                cleaned = {k: v for k, v in rec.items()
-                           if k not in ("_id", "_full_text", "rank") and v is not None}
-                grouped.setdefault(cid, []).append(cleaned)
-            if len(batch) < CCRS_PAGE_SIZE:
-                break
-            offset += CCRS_PAGE_SIZE
-    return grouped
-
-
-def _enrich_features(features: list, parties_dict: dict, victims_dict: dict) -> None:
-    """Mutate crash features in-place: add summary flags and victim-based severity."""
-    NOT_IMPAIRED = {"had not been drinking", "unknown", ""}
-    DEGREE_MAP = {1: "fatal", 2: "severe_injury", 3: "other_injury", 4: "other_injury"}
-    for feat in features:
-        cid = feat["properties"]["id"]
-        parties = parties_dict.get(cid, [])
-        victims = victims_dict.get(cid, [])
-        feat["properties"]["has_pedestrian"] = any(
-            "pedestrian" in str(p.get("Party Type", "")).lower() for p in parties)
-        feat["properties"]["has_cyclist"] = any(
-            "bicycl" in str(p.get("Party Type", "")).lower() for p in parties)
-        feat["properties"]["has_impaired"] = any(
-            str(p.get("Party Sobriety", "")).strip().lower() not in NOT_IMPAIRED
-            for p in parties)
-        degrees = []
-        for v in victims:
-            try:
-                degrees.append(int(v["Victim Degree of Injury"]))
-            except (KeyError, ValueError, TypeError):
-                pass
-        if degrees:
-            feat["properties"]["severity"] = DEGREE_MAP.get(min(degrees), "pdo")
-
-
 def _cache_county_bg(county_name: str, county_code: int) -> None:
-    """Fetch and cache county crash + parties + victims in a background thread."""
+    """Fetch and cache county crash data in a background thread."""
     try:
-        # 1. Fetch crash features
         features = _fetch_county_crashes(county_code)
-
-        # 2. Fetch parties and victims
-        print(f"[crash] {county_name}: fetching parties…")
-        parties_dict = _fetch_county_related(
-            county_code, _get_ccrs_parties_resources(), "parties")
-        print(f"[crash] {county_name}: fetching victims…")
-        victims_dict = _fetch_county_related(
-            county_code, _get_ccrs_victims_resources(), "victims")
-
-        # 3. Save related data as lookup dicts
-        with open(os.path.join(CRASH_CACHE, f"{county_name}_parties.json"), "w") as f:
-            json.dump(parties_dict, f)
-        with open(os.path.join(CRASH_CACHE, f"{county_name}_victims.json"), "w") as f:
-            json.dump(victims_dict, f)
-
-        # 4. Enrich crash features with summary flags + victim-based severity
-        _enrich_features(features, parties_dict, victims_dict)
-
-        # 5. Save crash GeoJSON
         with open(os.path.join(CRASH_CACHE, f"{county_name}.geojson"), "w") as f:
             json.dump({"type": "FeatureCollection", "features": features}, f)
-
-        n_parties = sum(len(v) for v in parties_dict.values())
-        n_victims = sum(len(v) for v in victims_dict.values())
-        print(f"[crash] {county_name}: {len(features)} crashes, "
-              f"{n_parties} parties, {n_victims} victims cached")
+        print(f"[crash] {county_name}: {len(features)} records cached")
     except Exception as e:
         print(f"[crash] Background fetch failed for {county_name}: {e}")
     finally:
         with _fetching_lock:
             _fetching_counties.discard(county_name)
+
+
+def _fetch_detail_records(resources: dict, cid: str, numeric_id: bool, limit: int = 20) -> list:
+    """Fetch Parties or IWP records for a single CollisionId across yearly resources.
+    Returns the first year that has results (crashes belong to exactly one year)."""
+    filter_val = int(cid) if numeric_id and cid.isdigit() else cid
+    for _year, resource_id in sorted(resources.items(), reverse=True):
+        try:
+            resp = requests.get(
+                f"{CCRS_BASE_URL}/datastore_search",
+                params={
+                    "resource_id": resource_id,
+                    "filters":     json.dumps({"CollisionId": filter_val}),
+                    "limit":       limit,
+                },
+                timeout=15,
+            )
+            resp.raise_for_status()
+            records = resp.json().get("result", {}).get("records", [])
+            if records:
+                return [{k: v for k, v in r.items()
+                         if k not in ("_id", "_full_text", "rank") and v is not None}
+                        for r in records]
+        except Exception as e:
+            print(f"[detail] resource {resource_id}: {e}")
+    return []
 
 
 def _fetch_tile(x: int, y: int) -> list:
@@ -686,43 +628,117 @@ async def ai_query(body: dict = Body(...)):
     return {"answer": answer, "placeholder": True}
 
 
-# Lazy per-county detail cache: {county_name: {"parties": {...}, "victims": {...}}}
-_detail_cache: dict = {}
-_detail_lock = threading.Lock()
-
-
-def _load_county_detail(county_name: str) -> dict:
-    """Load parties and victims for a county into _detail_cache on first access."""
-    with _detail_lock:
-        if county_name in _detail_cache:
-            return _detail_cache[county_name]
-        parties_path = os.path.join(CRASH_CACHE, f"{county_name}_parties.json")
-        if not os.path.exists(parties_path):
-            return {}
-        victims_path = os.path.join(CRASH_CACHE, f"{county_name}_victims.json")
-        p_data = json.loads(open(parties_path).read())
-        v_data = json.loads(open(victims_path).read()) if os.path.exists(victims_path) else {}
-        _detail_cache[county_name] = {"parties": p_data, "victims": v_data}
-        return _detail_cache[county_name]
-
-
 @app.get("/api/crashes/detail")
-def get_crash_detail(ids: str = Query(..., description="Comma-separated collision IDs (max 50)")):
-    """Return parties and victims for the given crash collision IDs."""
-    id_list = [i.strip() for i in ids.split(",") if i.strip()][:50]
+def get_crash_detail(
+    ids: str = Query(..., description="Comma-separated collision IDs (max 10)"),
+    years: str = Query("", description="Comma-separated year hints to narrow search"),
+):
+    """Return parties and victims for the given crash collision IDs (on-demand CKAN fetch)."""
+    id_list = [i.strip() for i in ids.split(",") if i.strip()][:10]
+    year_hints: set[int] = set()
+    for y in years.split(","):
+        try:
+            year_hints.add(int(y.strip()))
+        except ValueError:
+            pass
+
+    resources_p = _get_ccrs_parties_resources()
+    resources_v = _get_ccrs_victims_resources()
+    if year_hints:
+        resources_p = {k: v for k, v in resources_p.items() if k in year_hints}
+        resources_v = {k: v for k, v in resources_v.items() if k in year_hints}
+
     result: dict = {}
-    for county_name in CA_COUNTIES:
-        if len(result) == len(id_list):
-            break  # all IDs found
-        county_data = _load_county_detail(county_name)
-        if not county_data:
-            continue
-        p_data = county_data["parties"]
-        v_data = county_data["victims"]
-        for cid in id_list:
-            if cid not in result and cid in p_data:
-                result[cid] = {"parties": p_data[cid], "victims": v_data.get(cid, [])}
+    for cid in id_list:
+        parties = _fetch_detail_records(resources_p, cid, numeric_id=True)
+        victims = _fetch_detail_records(resources_v, cid, numeric_id=False)
+        if parties or victims:
+            result[cid] = {"parties": parties, "victims": victims}
     return JSONResponse(result)
+
+
+@app.get("/api/counties")
+def get_counties():
+    """Return {county_name: county_code} for all 58 CA counties."""
+    return JSONResponse({name: code for name, (code, _) in CA_COUNTIES.items()})
+
+
+_STATS_ALLOWED_FIELDS = {
+    "severity", "year", "collision_type_description", "weather_1",
+    "road_condition_1", "lightingdescription", "motorvehicleinvolvedwithcode", "day_of_week",
+    "type",  # OSM feature type (not used here but harmless)
+}
+
+@app.get("/api/crashes/stats")
+def get_crashes_stats(
+    scope: str = Query(..., description="county | city"),
+    county_code: int = Query(None),
+    city_name: str = Query(""),
+    group_by: str = Query("severity"),
+    year: str = Query("", description="Comma-separated years to filter, empty = all"),
+):
+    """Aggregate crash counts from cached county files.
+    Viewport/selection scopes are handled client-side.
+    """
+    if group_by not in _STATS_ALLOWED_FIELDS:
+        raise HTTPException(status_code=400, detail=f"Invalid group_by: {group_by}")
+
+    year_filter: set[int] = set()
+    for y in year.split(","):
+        try:
+            year_filter.add(int(y.strip()))
+        except ValueError:
+            pass
+
+    if scope == "county":
+        if county_code is None:
+            raise HTTPException(status_code=400, detail="county_code required for scope=county")
+        county_name = _CC_TO_NAME.get(county_code)
+        if not county_name:
+            raise HTTPException(status_code=404, detail="Unknown county code")
+        target_files = [os.path.join(CRASH_CACHE, f"{county_name}.geojson")]
+        display_name = county_name.replace("_", " ").title() + " County"
+        if not os.path.exists(target_files[0]):
+            return JSONResponse({"fetching": True})
+    elif scope == "city":
+        city_q = city_name.strip().lower()
+        if not city_q:
+            raise HTTPException(status_code=400, detail="city_name required for scope=city")
+        target_files = [
+            os.path.join(CRASH_CACHE, f"{n}.geojson")
+            for n in CA_COUNTIES
+            if os.path.exists(os.path.join(CRASH_CACHE, f"{n}.geojson"))
+        ]
+        display_name = city_name.strip().title()
+    else:
+        raise HTTPException(status_code=400, detail="scope must be county or city")
+
+    counts: dict[str, int] = {}
+    total = 0
+    for path in target_files:
+        with open(path) as fh:
+            features = json.load(fh).get("features", [])
+        for feat in features:
+            props = feat.get("properties", {})
+            if scope == "city":
+                cn = str(props.get("city_name", "")).strip().lower()
+                if cn != city_q:
+                    continue
+            if year_filter and props.get("year") not in year_filter:
+                continue
+            val = props.get(group_by)
+            val = str(val).strip() if val is not None else "Unknown"
+            if not val:
+                val = "Unknown"
+            counts[val] = counts.get(val, 0) + 1
+            total += 1
+
+    sorted_groups = sorted(counts.items(), key=lambda x: -x[1])[:15]
+    return JSONResponse({
+        "groups":       [{"label": lbl, "count": cnt} for lbl, cnt in sorted_groups],
+        "total":        total,
+        "display_name": display_name,
+    })
 
 
 @app.get("/api/crashes/{area}")

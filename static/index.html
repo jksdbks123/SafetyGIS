@@ -3,9 +3,10 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>GIS-Track — Phase 1</title>
+  <title>GIS-Track — California Transportation Safety</title>
   <link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet" />
   <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0f1117; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; }
@@ -176,6 +177,34 @@
     .badge-pdo    { background: #1f2937; color: #9ca3af; }
     .badge-road   { display: inline-block; width: 20px; height: 4px; border-radius: 2px; vertical-align: middle; margin-right: 4px; }
 
+    /* ── Statistics Analysis Panel ── */
+    .stat-section-label { font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.06em; color: #4b5563; margin-bottom: 3px; margin-top: 2px; }
+    .stat-scope-label { font-size: 0.68rem; color: #9ca3af; display: flex; align-items: center; gap: 5px; margin-bottom: 3px; cursor: pointer; }
+    .stat-scope-label:hover { color: #e0e0e0; }
+    .stat-scope-label input[type="radio"] { accent-color: #3b82f6; flex-shrink: 0; }
+    .stat-select { width: 100%; background: #0f1117; border: 1px solid #2a2d3e; border-radius: 4px; color: #9ca3af; font-size: 0.68rem; padding: 4px 6px; margin-bottom: 2px; font-family: inherit; }
+    .stat-select:focus { outline: none; border-color: #3b82f6; }
+    .stat-text-input { background: #0f1117; border: 1px solid #2a2d3e; border-radius: 4px; color: #9ca3af; font-size: 0.68rem; padding: 4px 6px; font-family: inherit; }
+    .stat-text-input:focus { outline: none; border-color: #3b82f6; }
+    .stat-text-input::placeholder { color: #374151; }
+    #stat-chart-wrap { position: relative; width: 100%; height: 160px; margin: 6px 0 2px; }
+
+    /* ── Data info modal ── */
+    #data-info-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.65); z-index: 9000; display: flex; align-items: center; justify-content: center; }
+    #data-info-modal.hidden { display: none; }
+    #data-info-box { background: #1a1d2e; border: 1px solid #374151; border-radius: 8px; padding: 18px 20px; width: 340px; max-width: calc(100vw - 32px); box-shadow: 0 8px 32px rgba(0,0,0,0.6); }
+    #data-info-box h4 { font-size: 0.85rem; font-weight: 600; color: #fff; margin-bottom: 12px; }
+    #data-info-box table { width: 100%; border-collapse: collapse; font-size: 0.72rem; }
+    #data-info-close { float: right; background: none; border: none; color: #6b7280; font-size: 1.1rem; cursor: pointer; margin: -4px -6px 0 0; padding: 2px 6px; border-radius: 4px; }
+    #data-info-close:hover { background: #2a2d3e; color: #fff; }
+    /* ── Info button ── */
+    .info-btn { display: inline-flex; align-items: center; justify-content: center; width: 13px; height: 13px; border-radius: 50%; background: #1f2937; border: 1px solid #374151; color: #4b5563; font-size: 0.55rem; cursor: pointer; flex-shrink: 0; line-height: 1; font-style: normal; vertical-align: middle; transition: all 0.15s; }
+    .info-btn:hover { background: #374151; color: #9ca3af; border-color: #4b5563; }
+    /* ── Disclaimer footer ── */
+    #disclaimer-bar { background: #0d0f19; border-top: 1px solid #1f2937; padding: 4px 16px; font-size: 0.6rem; color: #374151; text-align: center; flex-shrink: 0; line-height: 1.5; }
+    #disclaimer-bar a { color: #4b5563; text-decoration: none; }
+    #disclaimer-bar a:hover { color: #6b7280; }
+
     /* ── Loading overlay ── */
     #loading { position: absolute; inset: 0; background: rgba(15,17,23,0.85); display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 100; gap: 10px; }
     #loading.hidden { display: none; }
@@ -188,7 +217,9 @@
 
 <header>
   <h1>GIS-Track</h1>
-  <span>Phase 1 &mdash; California Transportation Safety</span>
+  <span>California Transportation Safety</span>
+  <span style="margin-left:auto;font-size:0.65rem;color:#4b5563;white-space:nowrap">Developed by Zhihui &bull; Vibe Coding Exercise</span>
+  <button onclick="openHelpPanel()" style="background:none;border:1px solid #374151;color:#4b5563;font-size:0.62rem;border-radius:4px;padding:2px 8px;cursor:pointer;white-space:nowrap;margin-left:8px;flex-shrink:0" title="View disclaimer and data credits">⚠ Disclaimer</button>
 </header>
 
 <div id="main">
@@ -209,7 +240,7 @@
 
       <!-- Basemap -->
       <div class="layer-group">
-        <h3>Basemap</h3>
+        <h3>Basemap <span class="info-btn" onclick="event.stopPropagation();showDataInfo('basemap')" title="Data source info">ⓘ</span></h3>
         <div class="area-btns">
           <button class="area-btn active" id="btn-basemap-map"       onclick="switchBasemap('map')">Map</button>
           <button class="area-btn"        id="btn-basemap-satellite" onclick="switchBasemap('satellite')">Satellite</button>
@@ -218,7 +249,7 @@
 
       <!-- OSM Infrastructure -->
       <div class="layer-group">
-        <h3>Traffic Infrastructure (OSM)</h3>
+        <h3>Traffic Infrastructure (OSM) <span class="info-btn" onclick="event.stopPropagation();showDataInfo('osm')" title="Data source info">ⓘ</span></h3>
         <div class="layer-row" id="row-signals"   onclick="toggleLayer('signals')">
           <div class="layer-dot" style="background:#facc15"></div>
           <span class="layer-label">Traffic Signals</span>
@@ -263,7 +294,7 @@
 
       <!-- Crash Data -->
       <div class="layer-group">
-        <h3>Crash Data (CHP CCRS)</h3>
+        <h3>Crash Data (CHP CCRS) <span class="info-btn" onclick="event.stopPropagation();showDataInfo('crash')" title="Data source info">ⓘ</span></h3>
         <div class="layer-row" id="row-heatmap" onclick="toggleLayer('heatmap')">
           <div class="layer-dot" style="background:#ef4444"></div>
           <span class="layer-label">Crash Heatmap</span>
@@ -275,15 +306,14 @@
           <div class="toggle on" id="toggle-crashes"></div>
         </div>
         <div id="crash-filters" class="crash-filter-row hidden">
-          <label><input type="checkbox" id="cf-ped"      onchange="applyCrashFilter()"> Pedestrian involved</label>
-          <label><input type="checkbox" id="cf-bike"     onchange="applyCrashFilter()"> Cyclist involved</label>
-          <label><input type="checkbox" id="cf-impaired" onchange="applyCrashFilter()"> Impaired driver</label>
+          <label><input type="checkbox" id="cf-ped"  onchange="applyCrashFilter()"> Pedestrian involved</label>
+          <label><input type="checkbox" id="cf-bike" onchange="applyCrashFilter()"> Cyclist involved</label>
         </div>
       </div>
 
       <!-- Mapillary Signs -->
       <div class="layer-group">
-        <h3>Detected Signs (Mapillary)</h3>
+        <h3>Detected Signs (Mapillary) <span class="info-btn" onclick="event.stopPropagation();showDataInfo('mapillary')" title="Data source info">ⓘ</span></h3>
         <div id="mly-status">Waiting for token&hellip;</div>
         <div class="layer-row off" id="row-asset-regulatory" onclick="toggleLayer('asset-regulatory')">
           <div class="layer-dot" style="background:#ef4444"></div>
@@ -332,9 +362,85 @@
         <button class="tool-btn" style="width:100%;margin-top:5px" onclick="sendAiQuery()">&#9658; Ask</button>
       </div>
 
+      <!-- Statistics Analysis -->
+      <div class="layer-group">
+        <h3 style="cursor:pointer;user-select:none;display:flex;align-items:center;justify-content:space-between" onclick="toggleStatsPanel()">
+          Statistics
+          <span id="stats-panel-arrow" style="font-size:0.6rem">&#9658;</span>
+        </h3>
+        <div id="stat-panel-body" class="hidden">
+          <div style="display:flex;gap:4px;margin-bottom:8px">
+            <button class="tool-btn active" id="stat-src-crashes" onclick="setStatSource('crashes')">Crashes</button>
+            <button class="tool-btn" id="stat-src-osm" onclick="setStatSource('osm')">OSM Infra</button>
+          </div>
+
+          <div id="stat-scope-row">
+            <div class="stat-section-label">SCOPE</div>
+            <label class="stat-scope-label">
+              <input type="radio" name="stat-scope" value="selection" id="stat-scope-selection" onchange="refreshStats()" disabled>
+              Selection <span id="stat-sel-count" style="color:#4b5563;font-size:0.62rem"></span>
+            </label>
+            <label class="stat-scope-label">
+              <input type="radio" name="stat-scope" value="viewport" id="stat-scope-viewport" onchange="refreshStats()" checked>
+              Viewport
+            </label>
+            <label class="stat-scope-label">
+              <input type="radio" name="stat-scope" value="county" id="stat-scope-county" onchange="refreshStats()">
+              County
+            </label>
+            <select id="stat-county-select" class="stat-select" style="margin-left:14px;width:calc(100% - 14px)"
+                    onclick="document.getElementById('stat-scope-county').checked=true"
+                    onchange="document.getElementById('stat-scope-county').checked=true;refreshStats()">
+              <option value="">-- Select county --</option>
+            </select>
+            <label class="stat-scope-label" style="margin-top:1px">
+              <input type="radio" name="stat-scope" value="city" id="stat-scope-city" onchange="refreshStats()">
+              City
+            </label>
+            <input type="text" id="stat-city-input" list="stat-city-list" placeholder="e.g. Sacramento"
+                   class="stat-text-input" style="margin-left:14px;width:calc(100% - 14px)"
+                   onclick="document.getElementById('stat-scope-city').checked=true"
+                   onchange="document.getElementById('stat-scope-city').checked=true;refreshStats()">
+            <datalist id="stat-city-list"></datalist>
+          </div>
+
+          <div id="stat-groupby-row" style="margin-top:6px">
+            <div class="stat-section-label">GROUP BY</div>
+            <select id="stat-groupby" class="stat-select" onchange="refreshStats()">
+              <option value="severity">Severity</option>
+              <option value="year">Year</option>
+              <option value="collision_type_description">Collision Type</option>
+              <option value="weather_1">Weather</option>
+              <option value="road_condition_1">Road Condition</option>
+              <option value="lightingdescription">Lighting</option>
+              <option value="motorvehicleinvolvedwithcode">Involved With</option>
+              <option value="day_of_week">Day of Week</option>
+            </select>
+          </div>
+
+          <div id="stat-year-row" style="margin-top:6px">
+            <div class="stat-section-label">YEAR</div>
+            <select id="stat-year" class="stat-select" onchange="refreshStats()">
+              <option value="">All years</option>
+              <option>2024</option><option>2023</option><option>2022</option>
+              <option>2021</option><option>2020</option><option>2019</option>
+            </select>
+          </div>
+
+          <div style="display:flex;gap:4px;margin-top:8px">
+            <button class="tool-btn active" id="stat-chart-bar" onclick="setChartType('bar')">Bar</button>
+            <button class="tool-btn" id="stat-chart-pie" onclick="setChartType('pie')">Donut</button>
+          </div>
+
+          <div id="stat-chart-wrap"><canvas id="stat-chart"></canvas></div>
+          <div id="stat-total" style="font-size:0.65rem;color:#4b5563;text-align:center;margin-top:2px"></div>
+          <button class="tool-btn" onclick="exportStatsCsv()" style="width:100%;margin-top:5px">&#11015; Export CSV</button>
+        </div>
+      </div>
+
       <!-- Street View -->
       <div class="layer-group">
-        <h3>Street View</h3>
+        <h3>Street View <span class="info-btn" onclick="event.stopPropagation();showDataInfo('streetview')" title="Data source info">ⓘ</span></h3>
         <div id="sv-hint">Checking Google Maps&hellip;</div>
         <div style="font-size:0.62rem;color:#4b5563;margin-top:2px;line-height:1.4">Drag the yellow person icon to the map, or click it to activate placement mode.</div>
       </div>
@@ -391,6 +497,28 @@
             <li>Mapillary street-level detected signs</li>
           </ul>
           <p>Use the layer controls on the left to show/hide data. Click any feature to inspect it. Draw a fence or click features to build a selection, then export as GeoJSON.</p>
+          <p style="margin-top:8px;color:#4b5563;font-size:0.68rem">Developed by <b style="color:#6b7280">Zhihui</b> as a personal vibe coding exercise. Not an official product.</p>
+        </div>
+      </details>
+
+      <details open>
+        <summary>⚠ Disclaimer &amp; Data Credits</summary>
+        <div class="hc">
+          <p><b>For educational and personal use only.</b> This application was developed by Zhihui as a vibe coding exercise and is <b>not intended for operational, professional, navigation, or safety-critical decision-making</b>.</p>
+          <p><b>No warranty.</b> The data shown may be incomplete, inaccurate, out of date, or contain errors. The developer makes no representations or warranties of any kind regarding the accuracy, completeness, or fitness for any particular purpose of the information displayed.</p>
+          <p><b>No liability.</b> The developer shall not be liable for any damages, losses, or consequences arising from the use of, or reliance on, any information presented in this application.</p>
+          <p><b>Third-party terms apply.</b> This application uses data and services from third parties, each governed by their own terms:</p>
+          <table>
+            <tr><th>Data / Service</th><th>Provider &amp; Terms</th></tr>
+            <tr><td>Crash records (CCRS)</td><td>California Highway Patrol via data.ca.gov — CA Open Data</td></tr>
+            <tr><td>Map data (OSM)</td><td>© OpenStreetMap contributors — ODbL 1.0</td></tr>
+            <tr><td>Basemap tiles</td><td>OpenFreeMap (ODbL) · Esri World Imagery (© Esri, Maxar)</td></tr>
+            <tr><td>Street signs</td><td>Mapillary / Meta Platforms — CC BY-SA 4.0 · mapillary.com/terms</td></tr>
+            <tr><td>Street View</td><td>Google Maps Platform — Google Maps Platform ToS</td></tr>
+            <tr><td>Chart.js</td><td>MIT License</td></tr>
+          </table>
+          <p style="margin-top:6px"><b>Privacy.</b> This application does not collect, store, or transmit any personally identifiable information. All data fetched from third-party APIs is for display purposes only and is cached locally on the server running the app.</p>
+          <p><b>Not affiliated.</b> This project is not affiliated with, endorsed by, or connected to the California Highway Patrol, Caltrans, OpenStreetMap Foundation, Mapillary, Meta, Google, or Esri.</p>
         </div>
       </details>
 
@@ -408,7 +536,7 @@
             <tr><td><span class="help-badge badge-injury">Injury</span></td><td>Degree 3 (visible) or 4 (complaint of pain)</td></tr>
             <tr><td><span class="help-badge badge-pdo">PDO</span></td><td>Property damage only — no injury recorded</td></tr>
           </table>
-          <p style="margin-top:6px"><b>Filters:</b> Use the "Pedestrian involved", "Cyclist involved", and "Impaired driver" checkboxes under Crash Points to narrow the visible crashes. These require parties data to be cached (happens automatically after the first crash fetch).</p>
+          <p style="margin-top:6px"><b>Filters:</b> Use the "Pedestrian involved" and "Cyclist involved" checkboxes under Crash Points to narrow the visible crashes. These are derived from the <code>MotorVehicleInvolvedWithCode</code> field (B=Pedestrian, E=Bicycle) and are available immediately from cached crash data.</p>
           <p><b>Key fields:</b></p>
           <table>
             <tr><th>Field</th><th>Description</th></tr>
@@ -560,6 +688,25 @@
     <div class="stat-card"><div class="val" id="stat-crashes-total">—</div><div class="lbl">Crash Records</div></div>
     <div class="stat-card"><div class="val" id="stat-fatal">—</div><div class="lbl">Fatal Crashes</div></div>
   </div>
+</div>
+
+<!-- Data source info modal -->
+<div id="data-info-modal" class="hidden" onclick="closeDataInfo()">
+  <div id="data-info-box" onclick="event.stopPropagation()">
+    <button id="data-info-close" onclick="closeDataInfo()">&#x2715;</button>
+    <h4 id="data-info-title"></h4>
+    <table id="data-info-table"></table>
+    <p style="font-size:0.62rem;color:#4b5563;margin-top:10px">Click outside or ✕ to close</p>
+  </div>
+</div>
+
+<!-- Disclaimer footer bar -->
+<div id="disclaimer-bar">
+  ⚠ For educational &amp; personal use only &mdash; not for operational or safety-critical decisions &mdash;
+  Data: <a href="https://data.ca.gov" target="_blank">CHP CCRS via data.ca.gov</a> &bull;
+  <a href="https://openstreetmap.org/copyright" target="_blank">© OpenStreetMap (ODbL)</a> &bull;
+  <a href="https://mapillary.com/terms" target="_blank">Mapillary (CC BY-SA 4.0)</a> &bull; Google Maps Platform &mdash;
+  Developed by Zhihui &bull; Not affiliated with any data provider
 </div>
 
 <script src="/static/app.js"></script>
