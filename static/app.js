@@ -927,26 +927,26 @@ function _pointInRing([px, py], ring) {
   return inside;
 }
 
+function _triggerDownload(content, filename, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement('a');
+  a.href     = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
 function downloadSelection() {
   if (!G_selectionData || G_selectionData.features.length === 0) return;
   const out = {
     type:     'FeatureCollection',
     features: G_selectionData.features,
-    metadata: {
-      source:    'GIS-Track',
-      timestamp: new Date().toISOString(),
-      count:     G_selectionData.features.length,
-    },
+    metadata: { source: 'GIS-Track', timestamp: new Date().toISOString(), count: G_selectionData.features.length },
   };
-  const blob = new Blob([JSON.stringify(out, null, 2)], { type: 'application/geo+json' });
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement('a');
-  a.href     = url;
-  a.download = `gistrack_${new Date().toISOString().slice(0, 10)}.geojson`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  _triggerDownload(JSON.stringify(out, null, 2), `gistrack_${new Date().toISOString().slice(0, 10)}.geojson`, 'application/geo+json');
 }
 
 async function downloadSelectionFull() {
@@ -970,15 +970,7 @@ async function downloadSelectionFull() {
     features: enriched,
     metadata: { source: 'GIS-Track', timestamp: new Date().toISOString(), count: enriched.length },
   };
-  const blob = new Blob([JSON.stringify(out, null, 2)], { type: 'application/geo+json' });
-  const url  = URL.createObjectURL(blob);
-  const a    = document.createElement('a');
-  a.href     = url;
-  a.download = `gistrack_full_${new Date().toISOString().slice(0, 10)}.geojson`;
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  _triggerDownload(JSON.stringify(out, null, 2), `gistrack_full_${new Date().toISOString().slice(0, 10)}.geojson`, 'application/geo+json');
 }
 
 function applyCrashFilter() {
@@ -1730,13 +1722,8 @@ function exportStatsCsv() {
     rows.push([g.label, g.count, ((g.count / total) * 100).toFixed(2) + '%']);
   }
   rows.push(['Total', total, '100%']);
-  const csv  = rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
-  const blob = new Blob([csv], { type: 'text/csv' });
-  const a    = document.createElement('a');
-  a.href     = URL.createObjectURL(blob);
-  a.download = `gistrack_stats_${new Date().toISOString().slice(0, 10)}.csv`;
-  a.click();
-  URL.revokeObjectURL(a.href);
+  const csv = rows.map(r => r.map(v => `"${String(v).replace(/"/g, '""')}"`).join(',')).join('\n');
+  _triggerDownload(csv, `gistrack_stats_${new Date().toISOString().slice(0, 10)}.csv`, 'text/csv');
 }
 
 function _buildCountySelect(counties) {
@@ -1751,7 +1738,11 @@ function _buildCountySelect(counties) {
   }
 }
 
+let _cityListSize = 0;
+
 function _buildCityList() {
+  if (CRASH_FEATURE_MAP.size === _cityListSize) return;
+  _cityListSize = CRASH_FEATURE_MAP.size;
   const cities = new Set();
   for (const f of CRASH_FEATURE_MAP.values()) {
     const c = f.properties.city_name;

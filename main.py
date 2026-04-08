@@ -175,12 +175,16 @@ def _tile2bbox(x: int, y: int, z: int):
 _ccrs_resources_cache: dict | None = None     # Crashes
 _ccrs_parties_res_cache: dict | None = None   # Parties
 _ccrs_victims_res_cache: dict | None = None   # InjuredWitnessPassengers
+_ccrs_load_lock = threading.Lock()
 
 def _load_all_ccrs_resources() -> None:
     """Populate all three resource caches with a single package_show call."""
     global _ccrs_resources_cache, _ccrs_parties_res_cache, _ccrs_victims_res_cache
     if _ccrs_resources_cache is not None:
         return
+    with _ccrs_load_lock:
+        if _ccrs_resources_cache is not None:
+            return
     crashes, parties, victims = {}, {}, {}
     try:
         resp = requests.get(f"{CCRS_BASE_URL}/package_show", params={"id": CCRS_PACKAGE_ID}, timeout=20)
