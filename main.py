@@ -195,11 +195,11 @@ def _load_all_ccrs_resources() -> None:
                 continue
             if year not in CCRS_TARGET_YEARS:
                 continue
-            if name.startswith("crashes"):
+            if name.startswith("crashes") and year not in crashes:
                 crashes[year] = r["id"]
-            elif name.startswith("parties"):
+            elif name.startswith("parties") and year not in parties:
                 parties[year] = r["id"]
-            elif name.startswith("injuredwitnesspassengers"):
+            elif name.startswith("injuredwitnesspassengers") and year not in victims:
                 victims[year] = r["id"]
     except Exception as e:
         print(f"[crash] Failed to get CCRS resources: {e}")
@@ -293,7 +293,7 @@ def _fetch_county_crashes(county_code: int) -> list:
 
     features: list = []
     seen_ids: set[str] = set()
-    filters = json.dumps({"County Code": county_code})
+    filters = json.dumps({"County Code": str(county_code)})
 
     for year, resource_id in sorted(resources.items()):
         offset = 0

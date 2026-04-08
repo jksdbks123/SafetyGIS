@@ -38,7 +38,7 @@ def get_all_resources() -> dict:
             continue
         if year not in TARGET_YEARS:
             continue
-        if raw_name.lower().startswith("crashes"):
+        if raw_name.lower().startswith("crashes") and year not in crashes:
             crashes[year] = r["id"]
     return crashes
 
@@ -46,7 +46,7 @@ def get_all_resources() -> dict:
 def fetch_county_records(resources: dict, county_code: int, label: str) -> list:
     """Fetch all records for a county from a set of yearly resources with pagination."""
     all_records = []
-    filters = json.dumps({"County Code": county_code})
+    filters = json.dumps({"County Code": str(county_code)})
     for year, resource_id in sorted(resources.items()):
         offset = 0
         print(f"    [{label}] county={county_code} year={year}…", end=" ", flush=True)
