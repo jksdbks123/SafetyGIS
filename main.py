@@ -1,8 +1,11 @@
 import json
 import math
 import os
+import subprocess
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
 
 import requests
 from dotenv import load_dotenv
@@ -21,10 +24,12 @@ MLY_CACHE   = os.path.join(DATA_DIR, "mapillary_cache")
 
 OSM_CACHE    = os.path.join(DATA_DIR, "osm_cache")
 CRASH_CACHE  = os.path.join(DATA_DIR, "crash_cache")
+RANKINGS_DIR = os.environ.get("RANKINGS_DIR", os.path.join(DATA_DIR, "rankings"))
 
 os.makedirs(MLY_CACHE,   exist_ok=True)
 os.makedirs(OSM_CACHE,   exist_ok=True)
 os.makedirs(CRASH_CACHE, exist_ok=True)
+os.makedirs(RANKINGS_DIR, exist_ok=True)
 
 # CCRS API constants
 CCRS_BASE_URL    = "https://data.ca.gov/api/3/action"
@@ -95,20 +100,16 @@ CA_COUNTIES: dict[str, tuple[int, tuple[float, float, float, float]]] = {
     "yuba":            (58, (39.00, -121.47, 39.55, -120.99)),
 }
 
-# # Migrate old area crash files into crash_cache on first run
-# for _area in ["sacramento", "humboldt"]:
-#     _old = os.path.join(DATA_DIR, f"{_area}_crashes.geojson")
-#     _new = os.path.join(CRASH_CACHE, f"{_area}.geojson")
-#     if os.path.exists(_old) and not os.path.exists(_new):
-#         shutil.copy(_old, _new)
-#         print(f"[crash] Migrated {_area} → crash_cache")
-
 # Reverse lookup: county_code → county_name
 _CC_TO_NAME: dict[int, str] = {code: name for name, (code, _) in CA_COUNTIES.items()}
 
 # Background-fetch state — tracks counties currently being fetched
 _fetching_counties: set = set()
 _fetching_lock = threading.Lock()
+
+# OSM background-fetch state (per-county systematic tile download)
+_fetching_osm_counties: set = set()
+_fetching_osm_lock = threading.Lock()
 
 MAPILLARY_TOKEN  = os.getenv("MAPILLARY_TOKEN", "")
 GOOGLE_MAPS_KEY  = os.getenv("GOOGLE_MAPS_KEY", "")
@@ -128,6 +129,9 @@ OVERPASS_QUERY = """
   node["highway"="traffic_signals"]({bbox});
   node["highway"="crossing"]({bbox});
   node["highway"="stop"]({bbox});
+  node["highway"="give_way"]({bbox});
+  node["highway"="mini_roundabout"]({bbox});
+  way["junction"="roundabout"]({bbox});
   node["amenity"="bus_station"]({bbox});
   node["highway"="bus_stop"]({bbox});
   node["traffic_calming"]({bbox});
@@ -461,7 +465,12 @@ def _osm_tile_features(x: int, y: int) -> list:
             hw  = tags.get("highway")
             am  = tags.get("amenity")
             tc  = tags.get("traffic_calming")
-            if hw:
+            jn = tags.get("junction")
+            if hw == "give_way":
+                ftype = "give_way"
+            elif hw == "mini_roundabout" or jn == "roundabout":
+                ftype = "roundabout"
+            elif hw:
                 ftype = hw
             elif am:
                 ftype = am
@@ -483,7 +492,10 @@ def _osm_tile_features(x: int, y: int) -> list:
             hw = tags.get("highway", "")
             cy = tags.get("cycleway", "")
             ft = tags.get("footway", "")
-            if hw == "cycleway" or cy:
+            jn = tags.get("junction", "")
+            if jn == "roundabout":
+                wtype = "roundabout"
+            elif hw == "cycleway" or cy:
                 wtype = "cycleway"
             elif hw in ("footway", "path", "pedestrian") or ft == "sidewalk":
                 wtype = "footway"
@@ -498,6 +510,46 @@ def _osm_tile_features(x: int, y: int) -> list:
     with open(cache_path, "w") as f:
         json.dump(features, f)
     return features
+
+
+def _county_osm_status(county_name: str) -> dict:
+    """Return tile completeness for a county's OSM data (cached at z12)."""
+    _, (south, west, north, east) = CA_COUNTIES[county_name]
+    tiles = [
+        (x, y)
+        for x in range(_lon2tile(west, OSM_CACHE_ZOOM), _lon2tile(east, OSM_CACHE_ZOOM) + 1)
+        for y in range(_lat2tile(north, OSM_CACHE_ZOOM), _lat2tile(south, OSM_CACHE_ZOOM) + 1)
+    ]
+    total  = len(tiles)
+    cached = sum(
+        1 for x, y in tiles
+        if os.path.exists(os.path.join(OSM_CACHE, f"{OSM_CACHE_ZOOM}_{x}_{y}.json"))
+    )
+    pct = round(cached / total * 100, 1) if total else 0.0
+    return {"total": total, "cached": cached, "pct": pct}
+
+
+def _fetch_county_osm_bg(county_name: str) -> None:
+    """Fetch all z12 OSM tiles for a county bbox in a background thread."""
+    _, (south, west, north, east) = CA_COUNTIES[county_name]
+    tiles = [
+        (x, y)
+        for x in range(_lon2tile(west, OSM_CACHE_ZOOM), _lon2tile(east, OSM_CACHE_ZOOM) + 1)
+        for y in range(_lat2tile(north, OSM_CACHE_ZOOM), _lat2tile(south, OSM_CACHE_ZOOM) + 1)
+    ]
+    total = len(tiles)
+    print(f"[osm] {county_name}: fetching {total} tiles")
+    done = 0
+    # Use 4 workers to be polite to Overpass; already-cached tiles return instantly
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {pool.submit(_osm_tile_features, x, y): (x, y) for x, y in tiles}
+        for fut in as_completed(futures):
+            done += 1
+            if done % 10 == 0 or done == total:
+                print(f"[osm] {county_name}: {done}/{total} tiles")
+    print(f"[osm] {county_name}: done")
+    with _fetching_osm_lock:
+        _fetching_osm_counties.discard(county_name)
 
 
 @app.get("/api/osm/dynamic")
@@ -550,17 +602,7 @@ def get_osm_dynamic(bbox: str = Query(..., description="west,south,east,north"))
     return JSONResponse({"type": "FeatureCollection", "features": features})
 
 
-# Static pre-fetched area files (registered AFTER /api/osm/dynamic)
-@app.get("/api/osm/{area}")
-def get_osm(area: str):
-    path = os.path.join(DATA_DIR, f"{area}_osm.geojson")
-    if not os.path.exists(path):
-        return JSONResponse({"type": "FeatureCollection", "features": []})
-    with open(path) as f:
-        return JSONResponse(json.load(f))
-
-
-# Dynamic crash endpoint — MUST be before /api/crashes/{area}
+# Dynamic crash endpoint
 @app.get("/api/crashes/dynamic")
 def get_crashes_dynamic(bbox: str = Query(..., description="west,south,east,north")):
     """
@@ -745,15 +787,6 @@ def get_crashes_stats(
     })
 
 
-@app.get("/api/crashes/{area}")
-def get_crashes(area: str):
-    path = os.path.join(DATA_DIR, f"{area}_crashes.geojson")
-    if not os.path.exists(path):
-        return JSONResponse({"type": "FeatureCollection", "features": []})
-    with open(path) as f:
-        return JSONResponse(json.load(f))
-
-
 # ---------------------------------------------------------------------------
 # Mapillary proxy
 # ---------------------------------------------------------------------------
@@ -838,3 +871,265 @@ def mapillary_single(image_id: str):
         json.dump(data, f)
 
     return JSONResponse(data)
+
+
+# ---------------------------------------------------------------------------
+# Safety Rankings — compute + serve
+# ---------------------------------------------------------------------------
+
+_rank_job: dict = {"status": "idle", "progress": 0, "message": "", "log": []}
+_rank_job_lock = threading.Lock()
+# Active rankings directory — can be changed at runtime via the compute endpoint.
+_active_rankings_dir: str = RANKINGS_DIR
+
+_SCRIPT_PATH = os.path.join(BASE_DIR, "scripts", "build_safety_rankings.py")
+
+# Counties present in CA_COUNTIES (for validation)
+_CA_COUNTY_NAMES = set(CA_COUNTIES.keys())
+
+
+def _get_rankings_path() -> str:
+    return os.path.join(_active_rankings_dir, "statewide.json")
+
+
+def _run_rankings_script(county: str | None, output_dir: str,
+                         weights: str | None = None) -> None:
+    global _active_rankings_dir
+    cmd = [sys.executable, _SCRIPT_PATH]
+    if county and county != "all":
+        cmd += ["--county", county]
+    if weights:
+        cmd += ["--weights", weights]
+    env = os.environ.copy()
+    env["RANKINGS_DIR"] = output_dir
+
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, env=env, cwd=BASE_DIR,
+        )
+    except Exception as e:
+        with _rank_job_lock:
+            _rank_job.update({"status": "error", "message": str(e)})
+        return
+
+    total_counties = 1
+    done_counties  = 0
+
+    for raw in proc.stdout:
+        line = raw.rstrip()
+        with _rank_job_lock:
+            _rank_job["log"].append(line)
+            if len(_rank_job["log"]) > 500:
+                _rank_job["log"] = _rank_job["log"][-500:]
+            _rank_job["message"] = line
+
+            if line.startswith("Processing ") and " county" in line:
+                try:
+                    total_counties = max(1, int(line.split()[1]))
+                except (ValueError, IndexError):
+                    pass
+                _rank_job["progress"] = 2
+            elif line.startswith("[") and "Loading crashes" in line:
+                done_counties += 1
+                pct = 5 + int(85 * (done_counties - 1) / total_counties)
+                _rank_job["progress"] = pct
+            elif "Ranking statewide" in line:
+                _rank_job["progress"] = 92
+            elif line.startswith("Written:"):
+                _rank_job["progress"] = 100
+
+    proc.wait()
+    with _rank_job_lock:
+        if proc.returncode == 0:
+            _active_rankings_dir = output_dir   # point all read endpoints here
+            _rank_job.update({"status": "done", "progress": 100,
+                              "output_dir": output_dir})
+        else:
+            _rank_job.update({"status": "error",
+                               "message": _rank_job["message"] or "Script failed"})
+
+
+@app.get("/api/system/pick_dir")
+def pick_directory():
+    """Open a native macOS folder picker dialog and return the chosen path."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.wm_attributes("-topmost", 1)
+        path = filedialog.askdirectory(title="Select Rankings Output Folder")
+        root.destroy()
+        return JSONResponse({"path": path or ""})
+    except Exception as e:
+        raise HTTPException(500, f"Folder picker unavailable: {e}")
+
+
+@app.get("/api/crashes/county_status")
+@app.get("/api/data/county_status")
+def get_county_status():
+    """Return crash + OSM tile readiness for all 58 CA counties.
+
+    Fields per county:
+      crash_ready       – crash GeoJSON exists in crash_cache/
+      fetching_crash    – background download running
+      osm_tile_total    – expected z12 tiles in county bbox
+      osm_tile_cached   – tiles present in osm_cache/
+      osm_pct           – cached / total * 100
+      fetching_osm      – background tile download running
+      analysis_ready    – crash_ready AND osm_pct >= 95
+    """
+    crash_cached = set(
+        f[:-8] for f in os.listdir(CRASH_CACHE)
+        if f.endswith(".geojson") and f[:-8] in CA_COUNTIES
+    ) if os.path.isdir(CRASH_CACHE) else set()
+
+    result = {}
+    for name, (code, bbox) in CA_COUNTIES.items():
+        osm          = _county_osm_status(name)
+        crash_ready  = name in crash_cached
+        result[name] = {
+            "code":            code,
+            "bbox":            list(bbox),
+            "crash_ready":     crash_ready,
+            "fetching_crash":  name in _fetching_counties,
+            "osm_tile_total":  osm["total"],
+            "osm_tile_cached": osm["cached"],
+            "osm_pct":         osm["pct"],
+            "fetching_osm":    name in _fetching_osm_counties,
+            "analysis_ready":  crash_ready and osm["pct"] >= 95,
+        }
+    return JSONResponse(result)
+
+
+@app.post("/api/data/county/{county_name}/fetch_crash")
+def fetch_county_crash(county_name: str):
+    """Trigger background download of crash data for one county."""
+    if county_name not in CA_COUNTIES:
+        raise HTTPException(404, f"Unknown county '{county_name}'")
+    county_code = CA_COUNTIES[county_name][0]
+    cache_path  = os.path.join(CRASH_CACHE, f"{county_name}.geojson")
+    with _fetching_lock:
+        if os.path.exists(cache_path):
+            return JSONResponse({"status": "already_cached"})
+        if county_name in _fetching_counties:
+            return JSONResponse({"status": "already_fetching"})
+        _fetching_counties.add(county_name)
+    threading.Thread(
+        target=_cache_county_bg, args=(county_name, county_code), daemon=True
+    ).start()
+    return JSONResponse({"status": "started"})
+
+
+@app.post("/api/data/county/{county_name}/fetch_osm")
+def fetch_county_osm(county_name: str):
+    """Trigger background download of all z12 OSM tiles for one county."""
+    if county_name not in CA_COUNTIES:
+        raise HTTPException(404, f"Unknown county '{county_name}'")
+    with _fetching_osm_lock:
+        if county_name in _fetching_osm_counties:
+            return JSONResponse({"status": "already_fetching"})
+        _fetching_osm_counties.add(county_name)
+    threading.Thread(
+        target=_fetch_county_osm_bg, args=(county_name,), daemon=True
+    ).start()
+    return JSONResponse({"status": "started"})
+
+
+@app.get("/api/rankings/config")
+def get_rankings_config():
+    """Return current active rankings dir and list of cached counties."""
+    cached = sorted(
+        f[:-8] for f in os.listdir(CRASH_CACHE)
+        if f.endswith(".geojson") and f[:-8] in _CA_COUNTY_NAMES
+    ) if os.path.isdir(CRASH_CACHE) else []
+    has_file = os.path.exists(_get_rankings_path())
+    return JSONResponse({
+        "active_dir": _active_rankings_dir,
+        "has_rankings": has_file,
+        "cached_counties": cached,
+    })
+
+
+@app.post("/api/rankings/compute")
+def start_rankings_compute(
+    county: str | None = None,
+    output_dir: str | None = None,
+    weights: str | None = None,
+):
+    """Start build_safety_rankings.py. county='all' or a county name. output_dir overrides RANKINGS_DIR."""
+    if county and county != "all" and county not in _CA_COUNTY_NAMES:
+        raise HTTPException(400, f"Unknown county '{county}'")
+    effective_dir = output_dir.strip() if output_dir and output_dir.strip() else _active_rankings_dir
+    with _rank_job_lock:
+        if _rank_job["status"] == "running":
+            raise HTTPException(409, "Computation already running")
+        _rank_job.update({"status": "running", "progress": 0,
+                          "message": "Starting…", "log": [],
+                          "output_dir": effective_dir})
+    threading.Thread(
+        target=_run_rankings_script, args=(county, effective_dir, weights), daemon=True
+    ).start()
+    return JSONResponse({"status": "started", "output_dir": effective_dir})
+
+
+@app.post("/api/rankings/set_dir")
+def set_rankings_dir(output_dir: str = Body(..., embed=True)):
+    """Point the app at an existing statewide.json in output_dir without recomputing."""
+    global _active_rankings_dir
+    path = os.path.join(output_dir.strip(), "statewide.json")
+    if not os.path.exists(path):
+        raise HTTPException(404, f"No statewide.json found in '{output_dir}'")
+    _active_rankings_dir = output_dir.strip()
+    return JSONResponse({"active_dir": _active_rankings_dir})
+
+
+@app.get("/api/rankings/status")
+def get_rankings_status():
+    """Poll computation progress."""
+    with _rank_job_lock:
+        return JSONResponse(dict(_rank_job, log=_rank_job["log"][-20:]))
+
+
+@app.get("/api/rankings/download")
+def download_rankings():
+    """Download the active statewide.json."""
+    path = _get_rankings_path()
+    if not os.path.exists(path):
+        raise HTTPException(404, "Rankings file not found. Run computation first.")
+    return FileResponse(path, media_type="application/json",
+                        filename="statewide_rankings.json")
+
+
+@app.get("/api/rankings/bins")
+def list_ranking_bins():
+    """List all bin keys with facility counts."""
+    path = _get_rankings_path()
+    if not os.path.exists(path):
+        raise HTTPException(404, "Rankings not computed. Run scripts/build_safety_rankings.py first.")
+    with open(path) as f:
+        data = json.load(f)
+    return JSONResponse({
+        "generated_at": data["generated_at"],
+        "counties": data["counties_included"],
+        "bins": {
+            k: {"count": v["facility_count"], "has_data": "insufficient_data" not in v}
+            for k, v in data["bins"].items()
+        },
+    })
+
+
+@app.get("/api/rankings/bin/{bin_key:path}")
+def get_ranking_bin(bin_key: str):
+    """Return worst/best facilities for one bin key (URL-encoded pipe separators)."""
+    path = _get_rankings_path()
+    if not os.path.exists(path):
+        raise HTTPException(404, "Rankings not computed")
+    with open(path) as f:
+        data = json.load(f)
+    bin_data = data["bins"].get(bin_key)
+    if not bin_data:
+        raise HTTPException(404, f"Bin '{bin_key}' not found")
+    return JSONResponse(bin_data)

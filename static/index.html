@@ -189,6 +189,62 @@
     .stat-text-input::placeholder { color: #374151; }
     #stat-chart-wrap { position: relative; width: 100%; height: 160px; margin: 6px 0 2px; }
 
+    /* ── Safety Rankings Panel ── */
+    #rank-compute-row { display: flex; gap: 5px; margin-bottom: 8px; }
+    #rank-compute-row .tool-btn { flex: 1; }
+    #rank-progress-wrap { margin-bottom: 8px; }
+    #rank-progress-bar-bg { background: #1f2937; border-radius: 3px; height: 6px; overflow: hidden; margin-bottom: 3px; }
+    #rank-progress-bar    { height: 100%; background: #3b82f6; border-radius: 3px; width: 0%; transition: width 0.4s ease; }
+    #rank-progress-msg    { font-size: 0.62rem; color: #6b7280; word-break: break-all; line-height: 1.4; }
+    #rank-divider { border: none; border-top: 1px solid #2a2d3e; margin: 8px 0; }
+    .rank-weight-row { display: grid; grid-template-columns: repeat(3,1fr); gap: 4px; margin-bottom: 6px; }
+    .rank-weight-cell { display: flex; flex-direction: column; gap: 2px; }
+    .rank-weight-cell label { font-size: 0.58rem; color: #6b7280; text-transform: uppercase; letter-spacing: 0.04em; }
+    .rank-weight-input { background: #0f1117; border: 1px solid #2a2d3e; border-radius: 3px; color: #e0e0e0; font-size: 0.68rem; padding: 3px 5px; width: 100%; font-family: inherit; text-align: right; }
+    .rank-weight-input:focus { outline: none; border-color: #3b82f6; }
+
+    /* ── County Status Panel ── */
+    #county-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 3px; margin-top: 6px; max-height: 160px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #374151 transparent; }
+    .county-chip { font-size: 0.58rem; padding: 3px 4px; border-radius: 3px; cursor: pointer; text-align: center; border: 1px solid transparent; line-height: 1.3; transition: all 0.15s; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .county-chip.ready    { background: #052e16; border-color: #166534; color: #4ade80; }
+    .county-chip.partial  { background: #1c1a06; border-color: #854d0e; color: #fbbf24; }
+    .county-chip.uncached { background: #1f2937; border-color: #374151; color: #4b5563; }
+    .county-chip.uncached:hover, .county-chip.partial:hover { background: #2a2d3e; border-color: #3b82f6; color: #93c5fd; }
+    .county-chip.loading  { background: #1e3a5f; border-color: #3b82f6; color: #93c5fd; animation: pulse 1s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+
+    /* ── Crash Dashboard Popup ── */
+    #rank-dash-panel { position: absolute; right: 12px; top: 12px; width: 300px; background: rgba(26,29,46,0.97); border: 1px solid #2a2d3e; border-radius: 8px; z-index: 20; backdrop-filter: blur(6px); display: none; }
+    #rank-dash-panel.open { display: block; }
+    #rank-dash-header { padding: 10px 12px 8px; border-bottom: 1px solid #2a2d3e; display: flex; align-items: center; justify-content: space-between; }
+    #rank-dash-title { font-size: 0.78rem; font-weight: 600; color: #fff; }
+    #rank-dash-close { background: none; border: none; color: #6b7280; font-size: 1rem; cursor: pointer; padding: 0 4px; }
+    #rank-dash-close:hover { color: #fff; }
+    #rank-dash-body { padding: 10px 12px; overflow-y: auto; max-height: calc(100vh - 200px); scrollbar-width: thin; scrollbar-color: #374151 transparent; }
+    .dash-stat-row { display: flex; justify-content: space-between; margin-bottom: 4px; font-size: 0.68rem; }
+    .dash-stat-row .dk { color: #6b7280; }
+    .dash-stat-row .dv { color: #e0e0e0; font-weight: 600; }
+    .dash-chart-title { font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.06em; color: #4b5563; margin: 8px 0 4px; }
+    .dash-bar-row { display: flex; align-items: center; gap: 5px; margin-bottom: 3px; font-size: 0.62rem; }
+    .dash-bar-label { color: #9ca3af; width: 110px; flex-shrink: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .dash-bar-bg { flex: 1; background: #1f2937; border-radius: 2px; height: 5px; overflow: hidden; }
+    .dash-bar-fill { height: 100%; border-radius: 2px; }
+    .dash-bar-count { color: #4b5563; width: 24px; text-align: right; flex-shrink: 0; }
+    .rank-select { width: 100%; background: #0f1117; border: 1px solid #2a2d3e; border-radius: 4px; color: #9ca3af; font-size: 0.68rem; padding: 4px 6px; margin-bottom: 5px; font-family: inherit; }
+    .rank-select:focus { outline: none; border-color: #3b82f6; }
+    #rank-bin-label { font-size: 0.62rem; color: #4b5563; margin-bottom: 4px; font-family: ui-monospace, monospace; word-break: break-all; }
+    #rank-table-wrap { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 6px; }
+    .rank-col-hdr { font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.06em; font-weight: 700; margin-bottom: 4px; }
+    .rank-col-hdr.worst { color: #ef4444; }
+    .rank-col-hdr.best  { color: #22c55e; }
+    .rank-row { font-size: 0.65rem; color: #9ca3af; padding: 3px 0; border-bottom: 1px solid #1f2937; cursor: pointer; transition: color 0.1s; line-height: 1.35; }
+    .rank-row:hover { color: #fff; }
+    .rank-row .rn { font-size: 0.58rem; color: #4b5563; }
+    .rank-row .re { font-size: 0.6rem; }
+    .rank-row .re.worst { color: #ef4444; }
+    .rank-row .re.best  { color: #22c55e; }
+    #rank-status { font-size: 0.65rem; color: #6b7280; text-align: center; padding: 8px 0; }
+
     /* ── Data info modal ── */
     #data-info-modal { position: fixed; inset: 0; background: rgba(0,0,0,0.65); z-index: 9000; display: flex; align-items: center; justify-content: center; }
     #data-info-modal.hidden { display: none; }
@@ -229,6 +285,15 @@
     <div id="loading">
       <div class="spinner"></div>
       <p>Loading map data&hellip;</p>
+    </div>
+
+    <!-- Crash Dashboard Popup (appears over map on ranked facility click) -->
+    <div id="rank-dash-panel">
+      <div id="rank-dash-header">
+        <span id="rank-dash-title">Facility Summary</span>
+        <button id="rank-dash-close" onclick="closeRankDash()">&#x2715;</button>
+      </div>
+      <div id="rank-dash-body"></div>
     </div>
 
     <!-- Crash data loading indicator -->
@@ -360,6 +425,141 @@
         <div id="ai-response" class="hidden"></div>
         <textarea id="ai-input" class="ai-input" placeholder="Ask about safety in this view…" rows="2"></textarea>
         <button class="tool-btn" style="width:100%;margin-top:5px" onclick="sendAiQuery()">&#9658; Ask</button>
+      </div>
+
+      <!-- Safety Rankings -->
+      <div class="layer-group">
+        <h3 style="cursor:pointer;user-select:none;display:flex;align-items:center;justify-content:space-between" onclick="toggleRankingsPanel()">
+          Safety Rankings
+          <span id="rank-panel-arrow" style="font-size:0.6rem">&#9658;</span>
+        </h3>
+        <div id="rank-panel-body" class="hidden">
+          <!-- Compute + Download -->
+          <div class="stat-section-label">OUTPUT PATH</div>
+          <div style="display:flex;gap:4px;margin-bottom:5px">
+            <input id="rank-output-dir" class="stat-text-input" style="flex:1;min-width:0"
+                   placeholder="default (data/rankings)" readonly title="Click folder icon to choose">
+            <button class="tool-btn" style="flex-shrink:0" onclick="pickRankingsDir()" title="Browse folder">&#128193;</button>
+            <button class="tool-btn" style="white-space:nowrap;flex-shrink:0" onclick="setRankingsDir()" title="Load rankings from this path">Use</button>
+          </div>
+          <div class="stat-section-label">EPDO WEIGHTS</div>
+          <div class="rank-weight-row">
+            <div class="rank-weight-cell">
+              <label>Fatal</label>
+              <input class="rank-weight-input" id="rank-w-fatal"  type="number" step="0.1" min="0" value="10">
+            </div>
+            <div class="rank-weight-cell">
+              <label>Injury</label>
+              <input class="rank-weight-input" id="rank-w-injury" type="number" step="0.1" min="0" value="2">
+            </div>
+            <div class="rank-weight-cell">
+              <label>PDO</label>
+              <input class="rank-weight-input" id="rank-w-pdo"    type="number" step="0.1" min="0" value="0.2">
+            </div>
+          </div>
+          <div class="stat-section-label">SCOPE</div>
+          <select class="rank-select" id="rank-county-scope">
+            <option value="all">All cached counties</option>
+          </select>
+          <div id="rank-compute-row">
+            <button class="tool-btn" id="rank-compute-btn" onclick="startRankingsCompute()">&#9654; Compute</button>
+            <button class="tool-btn" id="rank-download-btn" onclick="downloadRankings()">&#8595; Download</button>
+          </div>
+          <div id="rank-progress-wrap" class="hidden">
+            <div id="rank-progress-bar-bg"><div id="rank-progress-bar"></div></div>
+            <div id="rank-progress-msg"></div>
+          </div>
+          <hr id="rank-divider">
+
+          <div class="stat-section-label" style="margin-bottom:5px">FACILITY TYPE</div>
+          <select class="rank-select" id="rank-fac-type" onchange="onRankFacTypeChange()">
+            <option value="int">Intersection</option>
+            <option value="seg">Road Segment</option>
+          </select>
+
+          <!-- Intersection filters -->
+          <div id="rank-int-filters">
+            <select class="rank-select" id="rank-control">
+              <option value="">Any Control Type</option>
+              <option value="signal">Signal</option>
+              <option value="stop">All-Way Stop</option>
+              <option value="give_way">Yield</option>
+              <option value="roundabout">Roundabout</option>
+              <option value="uncontrolled">Uncontrolled</option>
+            </select>
+            <select class="rank-select" id="rank-int-road-class">
+              <option value="">Any Road Class</option>
+              <option value="highway">Highway</option>
+              <option value="arterial">Arterial</option>
+              <option value="collector">Collector</option>
+              <option value="local">Local</option>
+            </select>
+            <select class="rank-select" id="rank-int-speed">
+              <option value="">Any Speed</option>
+              <option value="<=25mph">≤25 mph</option>
+              <option value="26-40mph">26–40 mph</option>
+              <option value="41-55mph">41–55 mph</option>
+              <option value=">55mph">&gt;55 mph</option>
+            </select>
+            <select class="rank-select" id="rank-legs">
+              <option value="">Any Leg Count</option>
+              <option value="T-int">T-Intersection (3-leg)</option>
+              <option value="4-leg">4-Leg</option>
+              <option value="multi">Multi-Leg (5+)</option>
+            </select>
+          </div>
+
+          <!-- Segment filters -->
+          <div id="rank-seg-filters" class="hidden">
+            <select class="rank-select" id="rank-seg-road-class">
+              <option value="">Any Road Class</option>
+              <option value="highway">Highway</option>
+              <option value="arterial">Arterial</option>
+              <option value="collector">Collector</option>
+              <option value="local">Local</option>
+            </select>
+            <select class="rank-select" id="rank-seg-speed">
+              <option value="">Any Speed</option>
+              <option value="<=25mph">≤25 mph</option>
+              <option value="26-40mph">26–40 mph</option>
+              <option value="41-55mph">41–55 mph</option>
+              <option value=">55mph">&gt;55 mph</option>
+            </select>
+            <select class="rank-select" id="rank-lanes">
+              <option value="">Any Lane Count</option>
+              <option value="1-2">1–2 Lanes</option>
+              <option value="3-4">3–4 Lanes</option>
+              <option value="5+">5+ Lanes</option>
+            </select>
+          </div>
+
+          <button class="tool-btn" style="width:100%;margin-top:4px" onclick="loadSelectedRanking()">Load Rankings</button>
+
+          <div id="rank-status" class="hidden"></div>
+          <div id="rank-bin-label" class="hidden"></div>
+          <div id="rank-table-wrap" class="hidden">
+            <div>
+              <div class="rank-col-hdr worst">Worst 10</div>
+              <div id="rank-worst-list"></div>
+            </div>
+            <div>
+              <div class="rank-col-hdr best">Best 10</div>
+              <div id="rank-best-list"></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- County Data Status -->
+      <div class="layer-group">
+        <h3 style="cursor:pointer;user-select:none;display:flex;align-items:center;justify-content:space-between" onclick="toggleCountyPanel()">
+          County Data
+          <span id="county-panel-arrow" style="font-size:0.6rem">&#9658;</span>
+        </h3>
+        <div id="county-panel-body" class="hidden">
+          <div style="font-size:0.62rem;color:#6b7280;margin-bottom:4px">Green = analysis-ready &nbsp;·&nbsp; Yellow = partial &nbsp;·&nbsp; Gray = click to download</div>
+          <div id="county-grid"></div>
+        </div>
       </div>
 
       <!-- Statistics Analysis -->

@@ -26,6 +26,8 @@ build/
 data/crash_cache/
 data/osm_cache/
 data/mapillary_cache/
+data/rankings/
+data/enrichment/
 
 # Logs
 *.log

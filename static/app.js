@@ -108,6 +108,8 @@ const LAYER_IDS = {
   'asset-warning':    ['asset-warning-layer'],
   'asset-info':       ['asset-info-layer'],
   'asset-crosswalks': ['asset-crosswalks-layer'],
+  'rankings-worst':   ['rankings-worst-layer', 'rankings-worst-label'],
+  'rankings-best':    ['rankings-best-layer',  'rankings-best-label'],
 };
 
 // source id → owned layer IDs (must remove layers before source)
@@ -117,6 +119,8 @@ const SOURCE_LAYERS = {
   crashes:          ['heatmap-layer', 'crashes-layer'],
   'mly-signs-vt':   ['asset-regulatory-layer', 'asset-warning-layer', 'asset-info-layer'],
   'mly-objects-vt': ['asset-crosswalks-layer'],
+  'rankings-worst': ['rankings-worst-layer', 'rankings-worst-label'],
+  'rankings-best':  ['rankings-best-layer',  'rankings-best-label'],
 };
 
 // Tracks which Mapillary sources are currently in the active style.
@@ -357,6 +361,7 @@ function rebuildLayers() {
   addOsmLayers();
   addCrashLayers();
   addDrawLayers();
+  addRankingsLayers();
 
   if (G_hasMly && G_mlyToken) {
     try { map.addSprite('mly', SPRITE_URL); } catch (_) {}
@@ -1858,5 +1863,582 @@ function showDataInfo(key) {
 
 function closeDataInfo() {
   document.getElementById('data-info-modal').classList.add('hidden');
+}
+
+// ---------------------------------------------------------------------------
+// Safety Rankings
+// ---------------------------------------------------------------------------
+
+// Empty GeoJSON sources for worst/best ranked facilities
+const EMPTY_FC = { type: 'FeatureCollection', features: [] };
+
+function addRankingsLayers() {
+  removeSafe('rankings-worst');
+  removeSafe('rankings-best');
+
+  map.addSource('rankings-worst', { type: 'geojson', data: EMPTY_FC });
+  map.addSource('rankings-best',  { type: 'geojson', data: EMPTY_FC });
+
+  map.addLayer({
+    id: 'rankings-worst-layer', type: 'circle', source: 'rankings-worst', minzoom: 8,
+    paint: {
+      'circle-radius':       ['interpolate', ['linear'], ['zoom'], 10, 8, 16, 14],
+      'circle-color':        '#ef4444',
+      'circle-stroke-width': 2,
+      'circle-stroke-color': '#7f1d1d',
+      'circle-opacity':      0.85,
+    },
+  });
+  map.addLayer({
+    id: 'rankings-worst-label', type: 'symbol', source: 'rankings-worst', minzoom: 8,
+    layout: {
+      'text-field':  ['to-string', ['get', 'rank_worst']],
+      'text-size':   ['interpolate', ['linear'], ['zoom'], 10, 8, 16, 12],
+      'text-anchor': 'center',
+      'text-font':   ['Open Sans Bold', 'Arial Unicode MS Bold'],
+    },
+    paint: { 'text-color': '#fff' },
+  });
+
+  map.addLayer({
+    id: 'rankings-best-layer', type: 'circle', source: 'rankings-best', minzoom: 8,
+    paint: {
+      'circle-radius':       ['interpolate', ['linear'], ['zoom'], 10, 8, 16, 14],
+      'circle-color':        '#22c55e',
+      'circle-stroke-width': 2,
+      'circle-stroke-color': '#14532d',
+      'circle-opacity':      0.85,
+    },
+  });
+  map.addLayer({
+    id: 'rankings-best-label', type: 'symbol', source: 'rankings-best', minzoom: 8,
+    layout: {
+      'text-field':  ['to-string', ['get', 'rank_best']],
+      'text-size':   ['interpolate', ['linear'], ['zoom'], 10, 8, 16, 12],
+      'text-anchor': 'center',
+      'text-font':   ['Open Sans Bold', 'Arial Unicode MS Bold'],
+    },
+    paint: { 'text-color': '#fff' },
+  });
+
+  // Hover popup for ranked facilities
+  const rankPopup = new maplibregl.Popup({ closeButton: false, closeOnClick: false });
+
+  ['rankings-worst-layer', 'rankings-best-layer'].forEach(layerId => {
+    map.on('mouseenter', layerId, e => {
+      map.getCanvas().style.cursor = 'pointer';
+      const p = e.features[0]?.properties ?? {};
+      const fid = p.facility_id;
+      // Look up full props from stored features
+      const feat = G_rankWorstMap.get(fid) ?? G_rankBestMap.get(fid);
+      const props = feat?.properties ?? p;
+      rankPopup.setLngLat(e.lngLat)
+        .setHTML(_rankPopupHtml(props))
+        .addTo(map);
+    });
+    map.on('mouseleave', layerId, () => {
+      map.getCanvas().style.cursor = '';
+      rankPopup.remove();
+    });
+  });
+}
+
+// Stores for full feature props (needed because MapLibre truncates properties in tiles)
+const G_rankWorstMap = new Map();  // facility_id → GeoJSON Feature
+const G_rankBestMap  = new Map();
+
+function _rankPopupHtml(p) {
+  const name  = p.name || p.facility_id || '—';
+  const epdo  = typeof p.epdo_score === 'number' ? p.epdo_score.toFixed(1) : '—';
+  const fatal = p.fatal_5yr ?? '—';
+  const sev   = p.severe_5yr ?? '—';
+  const tot   = p.total_5yr ?? '—';
+  const cls   = p.road_class || '—';
+  const ctrl  = p.control_type || '—';
+  const county = p.county || '—';
+  return `<div style="font-size:0.72rem;line-height:1.6;min-width:160px">
+    <b style="color:#fff">${name}</b><br>
+    <span style="color:#6b7280">${county} · ${cls} · ${ctrl}</span><br>
+    <span style="color:#ef4444">EPDO: ${epdo}</span> &nbsp;
+    <span style="color:#fca5a5">Fatal: ${fatal}</span> &nbsp;
+    <span style="color:#fdba74">Severe: ${sev}</span><br>
+    <span style="color:#9ca3af">Crashes (5yr): ${tot}</span>
+  </div>`;
+}
+
+function toggleRankingsPanel() {
+  const body  = document.getElementById('rank-panel-body');
+  const arrow = document.getElementById('rank-panel-arrow');
+  const open  = body.classList.contains('hidden');
+  body.classList.toggle('hidden', !open);
+  arrow.innerHTML = open ? '&#9660;' : '&#9658;';
+  if (open) _loadRankingsConfig();
+}
+
+async function _loadRankingsConfig() {
+  try {
+    const [cfgResp, statusResp] = await Promise.all([
+      fetch('/api/rankings/config'),
+      fetch('/api/data/county_status'),
+    ]);
+    if (!cfgResp.ok) return;
+    const data = await cfgResp.json();
+
+    // Populate output dir placeholder
+    const dirInput = document.getElementById('rank-output-dir');
+    dirInput.placeholder = data.active_dir || '/data/rankings';
+
+    // Populate county dropdown with analysis-ready counties
+    const sel = document.getElementById('rank-county-scope');
+    sel.innerHTML = '<option value="all">All analysis-ready counties</option>';
+
+    let readyCount = 0;
+    if (statusResp.ok) {
+      const statusData = await statusResp.json();
+      Object.entries(statusData)
+        .filter(([, info]) => info.analysis_ready)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .forEach(([c]) => {
+          readyCount++;
+          const opt = document.createElement('option');
+          opt.value = c;
+          opt.textContent = c.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+          sel.appendChild(opt);
+        });
+    } else {
+      // Fallback: use crash-cached counties from config
+      (data.cached_counties || []).forEach(c => {
+        const opt = document.createElement('option');
+        opt.value = c;
+        opt.textContent = c.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+        sel.appendChild(opt);
+        readyCount++;
+      });
+    }
+
+    // Gate compute button: disabled if no analysis-ready county
+    const btn = document.getElementById('rank-compute-btn');
+    if (btn) {
+      btn.disabled = readyCount === 0;
+      btn.title = readyCount === 0
+        ? 'Download at least one county (crash + OSM) before computing'
+        : '';
+    }
+  } catch (_) {}
+}
+
+async function setRankingsDir() {
+  const dir = document.getElementById('rank-output-dir').value.trim();
+  if (!dir) return;
+  try {
+    const resp = await fetch('/api/rankings/set_dir', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ output_dir: dir }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      _rankStatus(`Cannot load: ${err.detail || resp.statusText}`);
+      return;
+    }
+    _rankStatus('Path set. Use Load Rankings to visualize.');
+  } catch (e) {
+    _rankStatus(`Error: ${e.message}`);
+  }
+}
+
+function onRankFacTypeChange() {
+  const isInt = document.getElementById('rank-fac-type').value === 'int';
+  document.getElementById('rank-int-filters').classList.toggle('hidden', !isInt);
+  document.getElementById('rank-seg-filters').classList.toggle('hidden', isInt);
+  clearRankings();
+}
+
+function _buildBinKey() {
+  const facType = document.getElementById('rank-fac-type').value;
+  if (facType === 'int') {
+    const ctrl  = document.getElementById('rank-control').value;
+    const cls   = document.getElementById('rank-int-road-class').value;
+    const speed = document.getElementById('rank-int-speed').value;
+    const legs  = document.getElementById('rank-legs').value;
+    // Build partial key — skip empty dimensions
+    const parts = [ctrl, cls, speed, legs].filter(Boolean);
+    if (!parts.length) return null;
+    return 'int|' + parts.join('|');
+  } else {
+    const cls   = document.getElementById('rank-seg-road-class').value;
+    const speed = document.getElementById('rank-seg-speed').value;
+    const lanes = document.getElementById('rank-lanes').value;
+    const parts = [cls, speed, lanes].filter(Boolean);
+    if (!parts.length) return null;
+    return 'seg|' + parts.join('|');
+  }
+}
+
+async function loadSelectedRanking() {
+  const binKey = _buildBinKey();
+  if (!binKey) {
+    _rankStatus('Select at least one filter to load rankings.');
+    return;
+  }
+
+  _rankStatus('Loading…');
+  document.getElementById('rank-table-wrap').classList.add('hidden');
+  document.getElementById('rank-bin-label').classList.add('hidden');
+
+  try {
+    const encoded = encodeURIComponent(binKey);
+    const resp = await fetch(`/api/rankings/bin/${encoded}`);
+    if (resp.status === 404) {
+      const err = await resp.json().catch(() => ({}));
+      if (err.detail?.includes('not found')) {
+        _rankStatus(`No bin matches "${binKey}". Try different filters.`);
+      } else {
+        _rankStatus('Rankings not computed yet. Run scripts/build_safety_rankings.py first.');
+      }
+      return;
+    }
+    if (!resp.ok) throw new Error(resp.statusText);
+    const data = await resp.json();
+
+    if (data.insufficient_data) {
+      _rankStatus(`Insufficient data (< 20 facilities) for bin: ${binKey}`);
+      return;
+    }
+
+    _rankStatus('');
+    _renderRankingsMap(data.worst || [], data.best || []);
+    _renderRankingsTable(data.worst || [], data.best || [], binKey, data.facility_count);
+  } catch (err) {
+    _rankStatus(`Error: ${err.message}`);
+  }
+}
+
+function _rankStatus(msg) {
+  const el = document.getElementById('rank-status');
+  if (msg) {
+    el.textContent = msg;
+    el.classList.remove('hidden');
+  } else {
+    el.classList.add('hidden');
+  }
+}
+
+function _renderRankingsMap(worst, best) {
+  G_rankWorstMap.clear();
+  G_rankBestMap.clear();
+  worst.forEach(f => G_rankWorstMap.set(f.properties?.facility_id, f));
+  best.forEach(f  => G_rankBestMap.set(f.properties?.facility_id, f));
+
+  const worstSrc = map.getSource('rankings-worst');
+  const bestSrc  = map.getSource('rankings-best');
+  if (worstSrc) worstSrc.setData({ type: 'FeatureCollection', features: worst });
+  if (bestSrc)  bestSrc.setData({ type: 'FeatureCollection', features: best });
+}
+
+function _renderRankingsTable(worst, best, binKey, facilityCount) {
+  document.getElementById('rank-bin-label').textContent =
+    `${binKey}  ·  ${facilityCount ?? '?'} facilities statewide`;
+  document.getElementById('rank-bin-label').classList.remove('hidden');
+
+  const maxRows = Math.max(worst.length, best.length);
+  if (!maxRows) { _rankStatus('No ranked facilities returned.'); return; }
+
+  function rowHtml(feat, rankProp, colorClass) {
+    if (!feat) return '<div class="rank-row" style="min-height:36px"></div>';
+    const p    = feat.properties ?? {};
+    const rank = p[rankProp] ?? '—';
+    const name = p.name || p.facility_id || '—';
+    const epdo = typeof p.epdo_score === 'number' ? p.epdo_score.toFixed(1) : '—';
+    const f    = p.fatal_5yr ?? 0;
+    const s    = p.severe_5yr ?? 0;
+    const fid  = p.facility_id;
+    return `<div class="rank-row" onclick="openRankDash('${fid}')">
+      <span class="rn">#${rank}</span> ${name}<br>
+      <span class="re ${colorClass}">EPDO ${epdo}</span>
+      <span class="re" style="color:#9ca3af"> ${f}K/${s}S</span>
+    </div>`;
+  }
+
+  let worstHtml = '', bestHtml = '';
+  for (let i = 0; i < maxRows; i++) {
+    worstHtml += rowHtml(worst[i], 'rank_worst', 'worst');
+    bestHtml  += rowHtml(best[i],  'rank_best',  'best');
+  }
+  document.getElementById('rank-worst-list').innerHTML = worstHtml;
+  document.getElementById('rank-best-list').innerHTML  = bestHtml;
+  document.getElementById('rank-table-wrap').classList.remove('hidden');
+}
+
+function _flyToRankFacility(facilityId) {
+  const feat = G_rankWorstMap.get(facilityId) ?? G_rankBestMap.get(facilityId);
+  if (!feat) return;
+  const coords = feat.geometry?.type === 'Point'
+    ? feat.geometry.coordinates
+    : feat.geometry?.coordinates?.[0];
+  if (coords) map.flyTo({ center: coords, zoom: Math.max(map.getZoom(), 14), duration: 800 });
+}
+
+// ---- Rankings compute + download -------------------------------------------
+
+let _rankPollTimer = null;
+
+async function pickRankingsDir() {
+  try {
+    const resp = await fetch('/api/system/pick_dir');
+    if (!resp.ok) return;
+    const { path } = await resp.json();
+    if (path) document.getElementById('rank-output-dir').value = path;
+  } catch (_) {}
+}
+
+async function startRankingsCompute() {
+  const btn       = document.getElementById('rank-compute-btn');
+  const outputDir = document.getElementById('rank-output-dir').value.trim();
+  const county    = document.getElementById('rank-county-scope').value;
+  const wFatal  = parseFloat(document.getElementById('rank-w-fatal').value)  || 10;
+  const wInjury = parseFloat(document.getElementById('rank-w-injury').value) || 2;
+  const wPdo    = parseFloat(document.getElementById('rank-w-pdo').value)    || 0.2;
+
+  btn.disabled = true;
+  btn.textContent = '⏳ Running…';
+  _setRankProgress(0, 'Starting computation…');
+  document.getElementById('rank-progress-wrap').classList.remove('hidden');
+
+  try {
+    const params = new URLSearchParams();
+    if (county && county !== 'all') params.set('county', county);
+    if (outputDir) params.set('output_dir', outputDir);
+    params.set('weights', `${wFatal},${wInjury},${wPdo}`);
+
+    const resp = await fetch('/api/rankings/compute?' + params, { method: 'POST' });
+    if (resp.status === 409) {
+      _setRankProgress(0, 'Already running — polling…');
+    } else if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.detail || resp.statusText);
+    }
+    _startRankPoll();
+  } catch (e) {
+    btn.disabled = false;
+    btn.textContent = '▶ Compute';
+    _setRankProgress(0, `Error: ${e.message}`);
+  }
+}
+
+function _startRankPoll() {
+  if (_rankPollTimer) return;
+  _rankPollTimer = setInterval(_pollRankStatus, 1500);
+}
+
+async function _pollRankStatus() {
+  try {
+    const resp = await fetch('/api/rankings/status');
+    if (!resp.ok) return;
+    const data = await resp.json();
+
+    _setRankProgress(data.progress ?? 0, data.message || '');
+
+    if (data.status === 'done') {
+      clearInterval(_rankPollTimer);
+      _rankPollTimer = null;
+      _setRankProgress(100, 'Done! Rankings ready.');
+      _resetComputeBtn();
+      _loadRankingsConfig();   // refresh active_dir placeholder + county list
+    } else if (data.status === 'error') {
+      clearInterval(_rankPollTimer);
+      _rankPollTimer = null;
+      _setRankProgress(0, `Error: ${data.message}`);
+      _resetComputeBtn();
+    }
+  } catch (_) {}
+}
+
+function _setRankProgress(pct, msg) {
+  document.getElementById('rank-progress-bar').style.width = pct + '%';
+  document.getElementById('rank-progress-msg').textContent = msg;
+}
+
+function _resetComputeBtn() {
+  const btn = document.getElementById('rank-compute-btn');
+  btn.disabled = false;
+  btn.textContent = '▶ Compute';
+}
+
+function downloadRankings() {
+  window.location.href = '/api/rankings/download';
+}
+
+function clearRankings() {
+  G_rankWorstMap.clear();
+  G_rankBestMap.clear();
+  const worstSrc = map.getSource('rankings-worst');
+  const bestSrc  = map.getSource('rankings-best');
+  if (worstSrc) worstSrc.setData(EMPTY_FC);
+  if (bestSrc)  bestSrc.setData(EMPTY_FC);
+  document.getElementById('rank-table-wrap').classList.add('hidden');
+  document.getElementById('rank-bin-label').classList.add('hidden');
+  _rankStatus('');
+}
+
+// ---------------------------------------------------------------------------
+// Crash Dashboard Panel
+// ---------------------------------------------------------------------------
+
+function openRankDash(facilityId) {
+  const feat = G_rankWorstMap.get(facilityId) ?? G_rankBestMap.get(facilityId);
+  if (!feat) return;
+  _flyToRankFacility(facilityId);
+
+  const p     = feat.properties ?? {};
+  const dists = typeof p.crash_dists === 'string'
+    ? JSON.parse(p.crash_dists)
+    : (p.crash_dists ?? {});
+  const total = p.total_5yr || 0;
+  const fatal = p.fatal_5yr || 0;
+  const sev   = p.severe_5yr || 0;
+  const pdo   = Math.max(0, total - fatal - sev);
+
+  const title = p.name || p.facility_id || 'Facility';
+  document.getElementById('rank-dash-title').textContent = title;
+
+  let html = `
+    <div class="dash-stat-row"><span class="dk">County</span><span class="dv">${p.county || '—'}</span></div>
+    <div class="dash-stat-row"><span class="dk">Road Class</span><span class="dv">${p.road_class || '—'}</span></div>
+    <div class="dash-stat-row"><span class="dk">Control</span><span class="dv">${p.control_type || p.road_type || '—'}</span></div>
+    <div class="dash-stat-row"><span class="dk">Speed</span><span class="dv">${p.speed_mph ? p.speed_mph + ' mph' : '—'}</span></div>
+    <div class="dash-stat-row"><span class="dk">EPDO Score</span><span class="dv" style="color:#ef4444">${typeof p.epdo_score === 'number' ? p.epdo_score.toFixed(1) : '—'}</span></div>
+    <div class="dash-stat-row"><span class="dk">Crashes (5yr)</span><span class="dv">${total}</span></div>
+    <div class="dash-chart-title">Severity</div>
+    ${_dashBar('Fatal',   fatal, total, '#ef4444')}
+    ${_dashBar('Severe',  sev,   total, '#f97316')}
+    ${_dashBar('PDO',     pdo,   total, '#6b7280')}`;
+
+  if (total > 0) {
+    html += `<div class="dash-chart-title">Special Conditions</div>
+    ${_dashBar('Pedestrian', dists.ped || 0, total, '#60a5fa')}
+    ${_dashBar('Cyclist',    dists.cyc || 0, total, '#a78bfa')}
+    ${_dashBar('Impaired',   dists.imp || 0, total, '#f59e0b')}`;
+
+    const lighting = dists.lighting || {};
+    if (Object.keys(lighting).length) {
+      html += `<div class="dash-chart-title">Lighting</div>`;
+      const lightTotal = Object.values(lighting).reduce((a, b) => a + b, 0);
+      Object.entries(lighting).slice(0, 5).forEach(([k, v]) => {
+        html += _dashBar(k, v, lightTotal, '#38bdf8');
+      });
+    }
+
+    const pcf = dists.pcf || {};
+    if (Object.keys(pcf).length) {
+      html += `<div class="dash-chart-title">Primary Collision Factor</div>`;
+      const pcfTotal = Object.values(pcf).reduce((a, b) => a + b, 0);
+      Object.entries(pcf).slice(0, 5).forEach(([k, v]) => {
+        html += _dashBar(k, v, pcfTotal, '#fb7185');
+      });
+    }
+  }
+
+  document.getElementById('rank-dash-body').innerHTML = html;
+  document.getElementById('rank-dash-panel').classList.add('open');
+}
+
+function _dashBar(label, count, total, color) {
+  const pct = total > 0 ? Math.round(count / total * 100) : 0;
+  return `<div class="dash-bar-row">
+    <span class="dash-bar-label" title="${label}">${label}</span>
+    <div class="dash-bar-bg"><div class="dash-bar-fill" style="width:${pct}%;background:${color}"></div></div>
+    <span class="dash-bar-count">${count}</span>
+  </div>`;
+}
+
+function closeRankDash() {
+  document.getElementById('rank-dash-panel').classList.remove('open');
+}
+
+// ---------------------------------------------------------------------------
+// County Status Panel
+// ---------------------------------------------------------------------------
+
+let _countyStatusData = null;
+
+async function toggleCountyPanel() {
+  const body  = document.getElementById('county-panel-body');
+  const arrow = document.getElementById('county-panel-arrow');
+  const open  = body.classList.contains('hidden');
+  body.classList.toggle('hidden', !open);
+  arrow.innerHTML = open ? '&#9660;' : '&#9658;';
+  if (open && !_countyStatusData) await _loadCountyStatus();
+}
+
+async function _loadCountyStatus() {
+  try {
+    const resp = await fetch('/api/data/county_status');
+    if (!resp.ok) return;
+    _countyStatusData = await resp.json();
+    _renderCountyGrid();
+  } catch (_) {}
+}
+
+function _countyChipClass(info) {
+  if (info.fetching_crash || info.fetching_osm) return 'loading';
+  if (info.analysis_ready) return 'ready';
+  if (info.crash_ready || info.osm_tile_cached > 0) return 'partial';
+  return 'uncached';
+}
+
+function _renderCountyGrid() {
+  if (!_countyStatusData) return;
+  const grid = document.getElementById('county-grid');
+  grid.innerHTML = Object.entries(_countyStatusData)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([name, info]) => {
+      const label   = name.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
+      const cls     = _countyChipClass(info);
+      const crashSt = info.crash_ready ? '✓ crash' : '– crash';
+      const osmSt   = info.osm_tile_total > 0
+        ? `OSM ${info.osm_tile_cached}/${info.osm_tile_total}`
+        : 'OSM –';
+      const title = `${label}: ${crashSt} | ${osmSt}`;
+      return `<div class="county-chip ${cls}" id="chip-${name}" title="${title}"
+                   onclick="_loadCountyData('${name}')">${label}</div>`;
+    }).join('');
+}
+
+async function _loadCountyData(countyName) {
+  const chip = document.getElementById(`chip-${countyName}`);
+  if (!chip || chip.classList.contains('ready') || chip.classList.contains('loading')) return;
+  chip.classList.remove('uncached', 'partial');
+  chip.classList.add('loading');
+
+  const info = _countyStatusData?.[countyName];
+  if (!info) return;
+  const [s, w, n, e] = info.bbox;
+  map.flyTo({ center: [(w + e) / 2, (s + n) / 2], zoom: 9, duration: 1200 });
+
+  try {
+    // Start crash + OSM downloads in parallel (each returns immediately, runs in background)
+    await Promise.all([
+      fetch(`/api/data/county/${countyName}/fetch_crash`, { method: 'POST' }),
+      fetch(`/api/data/county/${countyName}/fetch_osm`,   { method: 'POST' }),
+    ]);
+
+    // Poll until analysis_ready (crash done AND ≥95% OSM tiles)
+    const poll = setInterval(async () => {
+      try {
+        const r = await fetch('/api/data/county_status');
+        if (!r.ok) return;
+        const d = await r.json();
+        _countyStatusData = d;
+        _renderCountyGrid();  // update all chips (shows tile progress)
+        if (d[countyName]?.analysis_ready) {
+          clearInterval(poll);
+        }
+      } catch (_) {}
+    }, 5000);
+  } catch (_) {
+    chip.classList.remove('loading');
+    chip.classList.add('uncached');
+  }
 }
 
