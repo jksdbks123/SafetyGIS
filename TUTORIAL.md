@@ -1,7 +1,7 @@
 # GIS-Track — Complete Development & Deployment Tutorial
 
 > Author: Zhihui | Vibe Coding Exercise  
-> Last updated: 2026-04-08
+> Last updated: 2026-04-10
 
 This tutorial documents the full hands-on workflow for GIS-Track — from local development
 through Raspberry Pi deployment — including architecture explanations, data source details,
@@ -16,11 +16,12 @@ and troubleshooting guides.
 3. [Application Architecture](#3-application-architecture)
 4. [Running & Debugging](#4-running--debugging)
 5. [Data Sources & How They Are Fetched](#5-data-sources--how-they-are-fetched)
-6. [Docker Packaging](#6-docker-packaging)
-7. [Raspberry Pi 5 Deployment](#7-raspberry-pi-5-deployment)
-8. [Public Access via Cloudflare Tunnel](#8-public-access-via-cloudflare-tunnel)
-9. [Troubleshooting](#9-troubleshooting)
-10. [Code Update Workflow](#10-code-update-workflow)
+6. [Analysis Mode & Safety Rankings](#6-analysis-mode--safety-rankings)
+7. [Docker Packaging](#7-docker-packaging)
+8. [Raspberry Pi 5 Deployment](#8-raspberry-pi-5-deployment)
+9. [Public Access via Cloudflare Tunnel](#9-public-access-via-cloudflare-tunnel)
+10. [Troubleshooting](#10-troubleshooting)
+11. [Code Update Workflow](#11-code-update-workflow)
 
 ---
 
@@ -28,14 +29,21 @@ and troubleshooting guides.
 
 GIS-Track is a browser-based transportation safety GIS tool covering all of California.
 
+**Two operating modes:**
+
+| Mode | Purpose |
+|------|---------|
+| **Inspect** | Viewport-driven lazy loading; map exploration; selection tools; statistics; export |
+| **Analysis** | County-level downloads; EPDO safety rankings computation; bin browser; crash dashboard |
+
 **Data layers:**
 
 | Layer | Source | Loading strategy |
 |-------|--------|-----------------|
-| Crash points | CHP CCRS via data.ca.gov | Lazy-loaded per county, cached locally |
+| Crash points | CHP CCRS via data.ca.gov | Lazy-loaded per county in Inspect; bulk download in Analysis |
 | Road infrastructure | OpenStreetMap via Overpass API | Lazy-loaded per Z12 tile, cached locally |
 | Street sign detection | Mapillary API (Meta) | Live requests, server-side proxy |
-| Street View | Google Maps Platform | Live requests, optional API key |
+| Street View | Google Maps Platform | On-demand, optional API key |
 
 **Tech stack:**
 
@@ -97,14 +105,20 @@ cp .env.example .env
 ```
 Browser (MapLibre GL JS + app.js)
     │
-    ├── GET /api/osm/dynamic?bbox=      → Overpass tile fetch, Z12 cache
-    ├── GET /api/crashes/dynamic?bbox=  → CCRS per-county, returns fetching / features
-    ├── GET /api/crashes/stats          → Statistical aggregation (county/city/viewport)
-    ├── GET /api/counties               → List of all 58 California counties
-    ├── GET /api/mapillary/images       → Mapillary proxy (token never sent to browser)
-    ├── GET /api/mapillary/token        → Returns token availability only
-    ├── POST /api/ai/query              → AI placeholder (wire real LLM here)
-    └── GET /static/*                   → HTML / JS / CSS static files
+    ├── GET /api/osm/dynamic?bbox=             → Overpass tile fetch, Z12 cache
+    ├── GET /api/crashes/dynamic?bbox=         → CCRS per-county, returns fetching / features
+    ├── GET /api/crashes/stats                 → Statistical aggregation (county/city/viewport)
+    ├── GET /api/counties                      → List of all 58 California counties
+    ├── GET /api/data/county_status            → Per-county cache readiness (Analysis mode)
+    ├── POST /api/data/county/{name}/fetch_*   → Trigger background crash / OSM download
+    ├── POST /api/rankings/compute             → Start EPDO rankings computation
+    ├── GET /api/rankings/status               → Job progress 0–100
+    ├── GET /api/rankings/bins                 → Available ranking bin keys
+    ├── GET /api/rankings/bin/{key}            → Worst/best 10 facilities for a bin
+    ├── GET /api/mapillary/images              → Mapillary proxy (token never sent to browser)
+    ├── GET /api/mapillary/token               → Returns token availability only
+    ├── POST /api/ai/query                     → AI placeholder (wire real LLM here)
+    └── GET /static/*                          → HTML / JS / CSS static files
 
 FastAPI backend (main.py)
     │
@@ -225,7 +239,78 @@ python scripts/fetch_osm.py
 
 ---
 
-## 6. Docker Packaging
+## 6. Analysis Mode & Safety Rankings
+
+Analysis mode computes EPDO (Equivalent Property Damage Only) safety scores for every intersection and road segment in the cached counties, then ranks them worst-to-best within peer groups (same road class, speed range, control type, etc.).
+
+### Step 1 — Download county data
+
+Click the **Analysis** button in the header. The county grid shows all 58 counties.
+
+- **Green chip** — crash data + OSM tiles both ready; can be ranked immediately
+- **Yellow chip** — partial data (crash only, or OSM < 100%); may still be rankable
+- **Gray chip** — no data; click to trigger download
+
+Click any gray/yellow chip to start a background download. The chip animates while downloading and turns green when complete. Data cached during Inspect-mode browsing carries over automatically.
+
+### Step 2 — Configure and compute
+
+1. In the **Compute Rankings** section, check/uncheck counties to include
+2. Optionally adjust EPDO weights (default: fatal = 10, injury = 2, PDO = 0.2)
+3. Check **Allow incomplete OSM** if you want to rank counties with crash data but partial OSM coverage
+4. Click **Compute Rankings** — a progress bar tracks the subprocess
+
+Computation runs `scripts/build_safety_rankings.py` as a subprocess. Runtime scales with the number of facilities: Sacramento (~20k OSM nodes/ways + 86k crashes) takes roughly 2–3 minutes.
+
+You can also run rankings from the command line:
+
+```bash
+# All cached counties
+python scripts/build_safety_rankings.py
+
+# Specific counties
+python scripts/build_safety_rankings.py --counties sacramento,alameda,los_angeles
+
+# Override EPDO weights (fatal, injury, pdo)
+python scripts/build_safety_rankings.py --weights 9,3,1
+
+# Allow partial OSM coverage
+python scripts/build_safety_rankings.py --min-osm-pct 0
+
+# Output to a custom directory
+RANKINGS_DIR=/path/to/output python scripts/build_safety_rankings.py
+```
+
+### Step 3 — Browse results
+
+After computation, the **Browse Rankings** section auto-opens with bin chips:
+
+- **Intersections** tab — filtered by control type (signal/stop/roundabout/…), road class, speed range, leg count
+- **Segments** tab — filtered by road class, speed range, lane count
+- **Purple chip** — at least 20 facilities ranked in this bin; click to load
+- **Gray chip** — fewer than 20 facilities (insufficient for reliable ranking)
+
+Clicking a chip loads the worst/best 10 facilities and draws red/green circles on the map.
+
+### Step 4 — Crash dashboard
+
+Click any circle on the map or any row in the worst/best table to open the **Crash Dashboard**:
+
+- EPDO score and 5-year crash counts (fatal / severe / total)
+- Distribution charts: lighting conditions, primary collision factor, weather, day of week, collision type, road condition
+- Individual crash points overlaid on the map at the facility location
+
+### How EPDO scoring works
+
+```
+EPDO score = Σ (fatal × w_fatal) + (severe_injury × w_injury) + (other_injury × w_injury×0.5) + (pdo × w_pdo)
+```
+
+Facilities are ranked within peer groups (bins) so that a rural two-lane road is not compared against a signalized urban arterial. The bin key encodes the filter dimensions, e.g. `int|signal|arterial|26-40mph`.
+
+---
+
+## 7. Docker Packaging
 
 ### File overview
 
@@ -292,7 +377,7 @@ docker compose down
 
 ---
 
-## 7. Raspberry Pi 5 Deployment
+## 8. Raspberry Pi 5 Deployment
 
 ### Compatibility summary
 
@@ -393,7 +478,7 @@ cd ~/SafetyGIS && git pull && sudo docker compose up -d --build
 
 ---
 
-## 8. Public Access via Cloudflare Tunnel
+## 9. Public Access via Cloudflare Tunnel
 
 Cloudflare Tunnel exposes your local service to the public internet without a public IP,
 port forwarding, or firewall changes. The free tier requires no account registration.
@@ -428,7 +513,7 @@ sudo docker logs cloudflared 2>&1 | grep trycloudflare
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 ### Crash data not loading
 
@@ -501,7 +586,7 @@ link-local address when connected via USB-C.
 
 ---
 
-## 10. Code Update Workflow
+## 11. Code Update Workflow
 
 ### Mac → GitHub → Pi pipeline
 
@@ -533,24 +618,28 @@ ssh -i ~/.ssh/id_pi pi@192.168.1.157 \
 
 ```
 SafetyGIS/
-├── main.py                  # FastAPI backend — all API endpoints
-├── requirements.txt         # Python dependencies
-├── .env.example             # Environment variable template
-├── .env                     # Actual keys (gitignored)
-├── Dockerfile               # Docker image definition
-├── docker-compose.yml       # Service orchestration
-├── .dockerignore            # Docker build exclusions
-├── Plan.md                  # Project roadmap (Phases 1–3)
-├── TUTORIAL.md              # This file — development & deployment guide
-├── DEVLOG.md                # Session-by-session development history
+├── main.py                       # FastAPI backend — all API endpoints (~1,170 lines)
+├── requirements.txt              # Python dependencies
+├── .env.example                  # Environment variable template
+├── .env                          # Actual keys (gitignored)
+├── Dockerfile                    # Docker image definition
+├── docker-compose.yml            # Service orchestration
+├── .dockerignore                 # Docker build exclusions
+├── Makefile                      # Dev shortcuts: make dev, make fetch-crashes, …
+├── CLAUDE.md                     # AI coding partner instructions
+├── Plan.md                       # Project roadmap (Phases 1–3)
+├── TUTORIAL.md                   # This file — development & deployment guide
+├── DEVLOG.md                     # Session-by-session development history
 ├── static/
-│   ├── index.html           # Single-page app HTML + CSS (~700 lines)
-│   └── app.js               # All frontend logic (~1,800 lines)
+│   ├── index.html                # Single-page app HTML + CSS (~950 lines)
+│   └── app.js                    # All frontend logic — Inspect + Analysis modes (~3,040 lines)
 ├── scripts/
-│   ├── fetch_crash_data.py  # Manual pre-fetch: CCRS crash data
-│   └── fetch_osm.py         # Manual pre-fetch: OSM infrastructure
-└── data/                    # Runtime cache (gitignored)
-    ├── crash_cache/         # {county}.geojson — generated on demand
-    ├── osm_cache/           # {z}_{x}_{y}.json — generated on demand
-    └── mapillary_cache/     # Mapillary response cache
+│   ├── build_safety_rankings.py  # EPDO safety rankings computation (~890 lines)
+│   ├── fetch_crash_data.py       # Manual pre-fetch: CCRS crash data
+│   └── fetch_osm.py              # Manual pre-fetch: OSM infrastructure
+└── data/                         # Runtime cache (gitignored, mounted as Docker volume)
+    ├── crash_cache/              # {county}.geojson — generated on demand
+    ├── osm_cache/                # {z}_{x}_{y}.json — generated on demand
+    ├── rankings/                 # Rankings GeoJSON output from build_safety_rankings.py
+    └── mapillary_cache/          # Mapillary response cache
 ```

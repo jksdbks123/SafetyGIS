@@ -1,40 +1,46 @@
 # SafetyGIS
 
-**SafetyGIS** is an open-source web GIS platform for visualizing transportation safety infrastructure and crash data across California. It combines real CHP crash records, OpenStreetMap road infrastructure, and Mapillary street-level imagery into an interactive map for researchers, planners, and the public.
-
-![SafetyGIS screenshot](docs/screenshot.png)
+**SafetyGIS** is an open-source web GIS platform for visualizing transportation safety infrastructure and crash data across California. It combines real CHP crash records, OpenStreetMap road infrastructure, Mapillary street-level imagery, and a statewide safety rankings engine into an interactive map for researchers, planners, and the public.
 
 ## Features
 
-- **Real CHP crash data** — pulls live records from the California CHP Crash Records System (CCRS) via the [data.ca.gov](https://data.ca.gov) open data API; all 60+ raw attributes preserved
-- **OSM infrastructure layers** — traffic signals, crossings, bus stops, bike lanes, footways, sidewalks, traffic calming devices, and street lamps fetched dynamically via Overpass API
-- **Crash heatmap + individual point popups** — heatmap at low zoom; click individual crashes at zoom ≥ 13 for the full attribute sheet
-- **Street-level imagery** — Mapillary photo coverage rendered as vector tiles; click any photo point for thumbnail + metadata; drag the pegman to open Google Street View at any location
-- **Viewport-driven data loading** — OSM and crash data auto-load as you pan/zoom; z12 tile caching keeps re-fetches minimal
-- **Polygon & rectangle selection tool** — draw a shape to download all selected crash / OSM features as GeoJSON
-- **Basemap switching** — OpenFreeMap vector tiles (default, no API key) + Esri World Imagery satellite toggle
-- **Stats ribbon** — collapsible bottom bar with live layer statistics
+### Inspect Mode
+- **Real CHP crash data** — pulls live records from the California CHP Crash Records System (CCRS) via the [data.ca.gov](https://data.ca.gov) open data API; all 60+ raw attributes preserved; all 58 counties supported
+- **OSM infrastructure layers** — traffic signals, crossings, bus stops, bike lanes, footways, sidewalks, traffic calming devices, and street lamps fetched dynamically via Overpass API (3-mirror fallback)
+- **Crash heatmap + individual point popups** — heatmap at low zoom; click individual crashes at zoom ≥ 13 for the full attribute sheet including parties and victims data
+- **Street-level imagery** — Mapillary photo coverage as vector tiles; click any photo point for thumbnail + metadata; sign detection layers (regulatory, warning, info) with Mapillary sprite icons
+- **Google Street View** — drag the yellow pegman to any map location to open an embedded Street View panorama
+- **Polygon & rectangle selection tool** — draw a shape to select crash / OSM features; export as CSV or GeoJSON
+- **Statistics panel** — analyze crash patterns by severity, year, collision type, weather, road condition, lighting, or day of week; bar and donut charts via Chart.js; scopes: viewport, selection, county, city
+- **Basemap switching** — OpenFreeMap vector tiles (default, free, no key) + Esri World Imagery satellite
+
+### Analysis Mode
+- **County data manager** — click any of California's 58 counties to trigger background download of crash data + OSM tiles; per-county progress chips show readiness state
+- **Safety rankings computation** — EPDO (Equivalent Property Damage Only) weighted scoring across all cached counties; configurable fatal/injury/PDO weights
+- **Bin browser** — browse ranked facilities by type (intersection vs segment) and filter combinations (road class, speed, control type, leg count, lane count); purple chips = data available
+- **Crash dashboard** — click any ranked facility to open a detailed panel: EPDO score, 5-year fatal/severe/total counts, severity breakdown bar chart, lighting/weather/day distributions, and crash point overlay on the map
 
 ## Stack
 
 | Layer | Technology |
 |-------|-----------|
-| Backend | Python · FastAPI · Uvicorn |
-| Frontend | Vanilla JS · MapLibre GL JS 4.7.1 |
+| Backend | Python 3.12 · FastAPI · Uvicorn |
+| Frontend | Vanilla JS · MapLibre GL JS 4.7.1 · Chart.js 4.4.3 |
 | Basemap | OpenFreeMap (free, no key) |
 | Crash data | CCRS / data.ca.gov CKAN API |
 | OSM data | Overpass API (3-mirror fallback) |
 | Street imagery | Mapillary vector tiles + REST API |
 | Street View | Google Maps JavaScript API (optional) |
+| Deployment | Docker · Raspberry Pi 5 · Cloudflare Tunnel |
 
-No database required for Phase 1 — all data is fetched on-demand and cached as local GeoJSON files.
+No database required — all data is fetched on-demand and cached as local GeoJSON files.
 
 ## Quick Start
 
 ### 1. Clone & install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/SafetyGIS.git
+git clone https://github.com/jksdbks123/SafetyGIS.git
 cd SafetyGIS
 
 python3 -m venv .venv
@@ -55,7 +61,7 @@ Open `.env` and fill in your keys:
 | `MAPILLARY_TOKEN` | Optional | [mapillary.com/app](https://www.mapillary.com/app/?pKey=signup) — free developer account |
 | `GOOGLE_MAPS_KEY` | Optional | [Google Cloud Console](https://console.cloud.google.com/) — Maps JavaScript API |
 
-The app runs fully without either key; Mapillary layers and Street View will simply be unavailable.
+The app runs fully without either key; Mapillary layers and Street View will be unavailable.
 
 ### 3. Run
 
@@ -68,21 +74,43 @@ Open **http://localhost:8000**.
 
 ### 4. Load data
 
-On first run the map is empty. Data loads automatically as you pan/zoom California. To pre-seed specific counties:
+Data loads automatically as you pan/zoom in Inspect mode. To pre-seed or compute rankings:
 
 ```bash
-# Fetch real CHP crash data (Sacramento + Humboldt by default)
-make fetch-crashes
+# Switch to Analysis mode in the app (header toggle) and click any county chip
+# to trigger downloads, then click Compute Rankings.
 
-# Fetch OSM infrastructure for a viewport
-make fetch-osm
+# Or pre-fetch from the command line:
+python scripts/fetch_crash_data.py      # CCRS crash data (Sacramento + Humboldt)
+python scripts/fetch_osm.py             # OSM infrastructure tiles
+
+# Run rankings standalone (after data is cached):
+python scripts/build_safety_rankings.py
+python scripts/build_safety_rankings.py --counties sacramento,alameda --min-osm-pct 0
 ```
+
+## Docker Deployment
+
+```bash
+# Build and start
+docker compose up -d
+
+# View logs
+docker compose logs -f
+
+# Update and rebuild
+git pull && docker compose up -d --build
+```
+
+API keys are read from `.env` (never baked into the image). The `data/` cache directory is mounted as a volume so it persists across rebuilds.
+
+See [TUTORIAL.md](TUTORIAL.md) for Raspberry Pi 5 deployment, Cloudflare Tunnel setup, and the full deployment guide.
 
 ## Data Sources
 
 | Source | License | Notes |
 |--------|---------|-------|
-| [CCRS / data.ca.gov](https://data.ca.gov/dataset/california-chp-traffic-crash-data) | CC BY | California CHP crash records 2015–present |
+| [CCRS / data.ca.gov](https://data.ca.gov/dataset/california-chp-traffic-crash-data) | CC BY | California CHP crash records 2019–2024 |
 | [OpenStreetMap](https://www.openstreetmap.org/copyright) | ODbL | Road infrastructure via Overpass API |
 | [OpenFreeMap](https://openfreemap.org) | MIT | Vector basemap tiles |
 | [Mapillary](https://www.mapillary.com/developer/api-documentation) | CC BY-SA | Street-level photos — requires free API key |
@@ -92,20 +120,24 @@ make fetch-osm
 
 ```
 SafetyGIS/
-├── main.py               # FastAPI app — all API endpoints
+├── main.py                      # FastAPI backend — all API endpoints (~1,170 lines)
 ├── static/
-│   ├── index.html        # Single-page app shell + CSS
-│   └── app.js            # All map logic (MapLibre, layers, popups, UI)
+│   ├── index.html               # Single-page app shell + CSS (~950 lines)
+│   └── app.js                   # All map logic — layers, UI, Analysis mode (~3,040 lines)
 ├── scripts/
-│   ├── fetch_crash_data.py   # Pull CCRS crash records by county
-│   └── fetch_osm.py          # Pre-fetch OSM for a bounding box
-├── data/
-│   ├── crash_cache/      # Per-county crash GeoJSON (gitignored)
-│   ├── osm_cache/        # z12 tile OSM JSON (gitignored)
-│   └── mapillary_cache/  # Mapillary tile/image cache (gitignored)
+│   ├── build_safety_rankings.py # Compute EPDO safety rankings from cached data (~890 lines)
+│   ├── fetch_crash_data.py      # Pre-fetch CCRS crash data by county
+│   └── fetch_osm.py             # Pre-fetch OSM infrastructure tiles
+├── data/                        # Runtime cache — gitignored, mounted as Docker volume
+│   ├── crash_cache/             # {county}.geojson — generated on demand
+│   ├── osm_cache/               # {z}_{x}_{y}.json — generated on demand
+│   ├── rankings/                # Statewide rankings GeoJSON output
+│   └── mapillary_cache/         # Mapillary tile/image cache
+├── Dockerfile
+├── docker-compose.yml
+├── .env.example
 ├── requirements.txt
-├── Makefile
-└── .env.example
+└── Makefile
 ```
 
 ## API Endpoints
@@ -114,26 +146,22 @@ SafetyGIS/
 |----------|-------------|
 | `GET /api/osm/dynamic?bbox=W,S,E,N` | OSM features for viewport (z12 tile cache) |
 | `GET /api/crashes/dynamic?bbox=W,S,E,N` | CCRS crashes — triggers background county download |
+| `GET /api/crashes/stats` | Aggregated crash statistics (county/city/viewport/selection) |
+| `GET /api/counties` | All 58 CA county names |
+| `GET /api/data/county_status` | Per-county cache readiness: `{crash_ready, osm_pct, analysis_ready, …}` |
+| `POST /api/data/county/{name}/fetch_crash` | Trigger background crash download for one county |
+| `POST /api/data/county/{name}/fetch_osm` | Trigger background OSM tile download for one county |
+| `POST /api/rankings/compute` | Start safety rankings computation (EPDO weights, county list) |
+| `GET /api/rankings/status` | Rankings job status: `{status, progress 0-100, message}` |
+| `GET /api/rankings/bins` | Available ranking bin keys |
+| `GET /api/rankings/bin/{bin_key}` | Worst/best 10 facilities for a bin |
 | `GET /api/mapillary/images?bbox=…` | Mapillary image metadata (proxied + cached) |
 | `GET /api/mapillary/token` | Returns whether a Mapillary token is configured |
-| `POST /api/ai/query` | AI assistant placeholder — wire your LLM here |
-
-## Roadmap
-
-### Phase 2 (planned)
-- [ ] PostGIS database (SQLAlchemy + GeoAlchemy2)
-- [ ] Drawing tools (`@mapbox/mapbox-gl-draw`) for project polygons
-- [ ] Attribute forms + project persistence
-- [ ] Status-driven dynamic layer styling
-
-### Phase 3 (future)
-- [ ] Statewide crash coverage (all 58 California counties)
-- [ ] Before/after safety analysis tools
-- [ ] Shareable project links
+| `POST /api/ai/query` | AI assistant placeholder |
 
 ## Contributing
 
-Contributions are welcome! Please open an issue to discuss proposed changes before submitting a pull request. For large features, describe the use case so we can coordinate.
+Contributions are welcome. Open an issue to discuss proposed changes before submitting a pull request.
 
 1. Fork the repo
 2. Create a feature branch: `git checkout -b feature/your-feature`

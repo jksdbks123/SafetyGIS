@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
@@ -13,7 +14,7 @@ from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-load_dotenv()
+load_dotenv(override=True)   # always prefer .env over any inherited OS env vars
 
 app = FastAPI(title="GIS-Track Phase 1")
 
@@ -444,15 +445,27 @@ def _osm_tile_features(x: int, y: int) -> list:
 
     raw = None
     for url in OVERPASS_URLS:
-        try:
-            resp = requests.post(url, data={"data": query}, timeout=60)
-            resp.raise_for_status()
-            raw = resp.json()
+        for attempt in range(2):   # retry once on 429
+            try:
+                resp = requests.post(url, data={"data": query}, timeout=60)
+                if resp.status_code == 429:
+                    if attempt == 0:
+                        time.sleep(8)   # back off before retry
+                        continue
+                    raise requests.HTTPError("429 Too Many Requests", response=resp)
+                resp.raise_for_status()
+                raw = resp.json()
+                break
+            except Exception as e:
+                print(f"  [osm] overpass {url} failed: {e}")
+                break
+        if raw is not None:
             break
-        except Exception as e:
-            print(f"  [osm] overpass {url} failed: {e}")
 
     if raw is None:
+        # Write empty cache so this tile counts as attempted and osm_pct advances
+        with open(cache_path, "w") as f:
+            json.dump([], f)
         return []
 
     # out geom; returns coordinates directly on each element — no node resolution needed.
@@ -893,21 +906,28 @@ def _get_rankings_path() -> str:
 
 
 def _run_rankings_script(county: str | None, output_dir: str,
-                         weights: str | None = None) -> None:
+                         weights: str | None = None,
+                         counties: str | None = None,
+                         min_osm_pct: float = 80.0) -> None:
     global _active_rankings_dir
     cmd = [sys.executable, _SCRIPT_PATH]
-    if county and county != "all":
+    if counties:
+        cmd += ["--counties", counties]
+    elif county and county != "all":
         cmd += ["--county", county]
     if weights:
         cmd += ["--weights", weights]
+    if min_osm_pct != 80.0:
+        cmd += ["--min-osm-pct", str(min_osm_pct)]
     env = os.environ.copy()
     env["RANKINGS_DIR"] = output_dir
+    env["PYTHONIOENCODING"] = "utf-8"   # prevent UnicodeEncodeError on Windows cp1252
 
     try:
         os.makedirs(output_dir, exist_ok=True)
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, env=env, cwd=BASE_DIR,
+            text=True, encoding="utf-8", env=env, cwd=BASE_DIR,
         )
     except Exception as e:
         with _rank_job_lock:
@@ -1056,21 +1076,34 @@ def get_rankings_config():
 @app.post("/api/rankings/compute")
 def start_rankings_compute(
     county: str | None = None,
+    counties: str | None = None,
     output_dir: str | None = None,
     weights: str | None = None,
+    min_osm_pct: float = 80.0,
 ):
-    """Start build_safety_rankings.py. county='all' or a county name. output_dir overrides RANKINGS_DIR."""
+    """Start build_safety_rankings.py.
+    counties: comma-separated list of county names to include.
+    county: legacy single-county param (ignored when counties is set).
+    min_osm_pct: minimum OSM tile coverage required (0 = allow any).
+    output_dir: overrides RANKINGS_DIR.
+    """
     if county and county != "all" and county not in _CA_COUNTY_NAMES:
         raise HTTPException(400, f"Unknown county '{county}'")
+    if counties:
+        unknown = [c for c in counties.split(",") if c.strip() and c.strip() not in _CA_COUNTY_NAMES]
+        if unknown:
+            raise HTTPException(400, f"Unknown counties: {', '.join(unknown)}")
     effective_dir = output_dir.strip() if output_dir and output_dir.strip() else _active_rankings_dir
     with _rank_job_lock:
         if _rank_job["status"] == "running":
             raise HTTPException(409, "Computation already running")
         _rank_job.update({"status": "running", "progress": 0,
-                          "message": "Starting…", "log": [],
+                          "message": "Starting...", "log": [],
                           "output_dir": effective_dir})
     threading.Thread(
-        target=_run_rankings_script, args=(county, effective_dir, weights), daemon=True
+        target=_run_rankings_script,
+        args=(county, effective_dir, weights, counties, min_osm_pct),
+        daemon=True,
     ).start()
     return JSONResponse({"status": "started", "output_dir": effective_dir})
 

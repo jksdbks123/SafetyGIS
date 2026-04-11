@@ -63,6 +63,9 @@ const CRASH_FEATURE_MAP = new Map();   // String(id) → feature
 // Viewport load timers
 let _crashPollTimer = null;    // polls after background county fetch
 
+// App mode
+let G_appMode = 'inspect';     // 'inspect' | 'analysis'
+
 // Draw tool state
 let G_drawMode      = null;    // null | 'rect' | 'poly'
 let G_drawActive    = false;
@@ -90,6 +93,8 @@ const LAYER_VISIBILITY = {
   'asset-warning':    false,
   'asset-info':       false,
   'asset-crosswalks': false,
+  'rankings-worst':   false,
+  'rankings-best':    false,
 };
 
 // toggle key → MapLibre layer IDs it controls
@@ -108,8 +113,8 @@ const LAYER_IDS = {
   'asset-warning':    ['asset-warning-layer'],
   'asset-info':       ['asset-info-layer'],
   'asset-crosswalks': ['asset-crosswalks-layer'],
-  'rankings-worst':   ['rankings-worst-layer', 'rankings-worst-label'],
-  'rankings-best':    ['rankings-best-layer',  'rankings-best-label'],
+  'rankings-worst':   ['rankings-worst-layer', 'rankings-worst-line', 'rankings-worst-label'],
+  'rankings-best':    ['rankings-best-layer',  'rankings-best-line',  'rankings-best-label'],
 };
 
 // source id → owned layer IDs (must remove layers before source)
@@ -119,8 +124,10 @@ const SOURCE_LAYERS = {
   crashes:          ['heatmap-layer', 'crashes-layer'],
   'mly-signs-vt':   ['asset-regulatory-layer', 'asset-warning-layer', 'asset-info-layer'],
   'mly-objects-vt': ['asset-crosswalks-layer'],
-  'rankings-worst': ['rankings-worst-layer', 'rankings-worst-label'],
-  'rankings-best':  ['rankings-best-layer',  'rankings-best-label'],
+  'rankings-worst':   ['rankings-worst-line', 'rankings-worst-layer', 'rankings-worst-label'],
+  'rankings-best':    ['rankings-best-line',  'rankings-best-layer',  'rankings-best-label'],
+  'facility-overlay': ['fac-buffer-fill', 'fac-buffer-outline', 'fac-seg-hl'],
+  'facility-crashes': ['fac-crashes-layer'],
 };
 
 // Tracks which Mapillary sources are currently in the active style.
@@ -181,6 +188,7 @@ map.on('load', async () => {
   setupPopups();
   setupDraw();
   setupPegman();
+  setupRankingInteractions();
   // Wire up AI input Enter key
   document.getElementById('ai-input').addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendAiQuery(); }
@@ -201,15 +209,20 @@ async function loadData() {
     fetch('/api/googlemaps/config').then(r => r.json()),
   ]);
 
-  // Seed OSM with pre-fetched area files (fast initial load)
-  const [sacOsm, humOsm] = await Promise.all([
-    fetch('/api/osm/sacramento').then(r => r.json()),
-    fetch('/api/osm/humboldt').then(r => r.json()),
-  ]);
-  for (const f of [...sacOsm.features, ...humOsm.features]) {
-    OSM_FEATURE_MAP.set(String(f.properties.id), f);
+  // Seed OSM with pre-fetched area files (fast initial load — optional, non-fatal)
+  try {
+    const [sacOsm, humOsm] = await Promise.all([
+      fetch('/api/osm/sacramento').then(r => { if (!r.ok) throw new Error(r.status); return r.json(); }),
+      fetch('/api/osm/humboldt').then(r => { if (!r.ok) throw new Error(r.status); return r.json(); }),
+    ]);
+    for (const f of [...(sacOsm.features || []), ...(humOsm.features || [])]) {
+      OSM_FEATURE_MAP.set(String(f.properties.id), f);
+    }
+    G_osmData = { type: 'FeatureCollection', features: [...OSM_FEATURE_MAP.values()] };
+  } catch (_) {
+    // Preload unavailable — viewport loading will populate OSM data on first pan
+    G_osmData = { type: 'FeatureCollection', features: [] };
   }
-  G_osmData = { type: 'FeatureCollection', features: [...OSM_FEATURE_MAP.values()] };
 
   // Crash data starts empty — dynamically loaded by loadCrashesForViewport()
   G_crashData = { type: 'FeatureCollection', features: [] };
@@ -227,9 +240,8 @@ async function loadData() {
   G_googleMapsKey = gmConfig.key || '';
   if (G_hasGoogleMaps) {
     loadGoogleMapsAPI(G_googleMapsKey);
-  } else {
-    document.getElementById('sv-hint').textContent = 'Add GOOGLE_MAPS_KEY to .env';
   }
+  // Pegman is always shown — iframe fallback works without API key
 
   // Load county list for Statistics panel
   try {
@@ -245,6 +257,7 @@ async function loadData() {
 let _viewportTimer = null;
 
 function scheduleViewportLoad() {
+  if (G_appMode === 'analysis') return;   // Analysis mode manages its own data
   clearTimeout(_viewportTimer);
   clearTimeout(_crashPollTimer);   // cancel any pending poll when user moves
   _viewportTimer = setTimeout(() => {
@@ -378,6 +391,9 @@ function rebuildLayers() {
   }
 
   applyVisibilityState();
+
+  // Restore rankings data that was wiped when sources were re-created
+  _restoreRankingsData();
 }
 
 // ---- Safe layer/source removal -----------------------------------------------
@@ -1035,19 +1051,10 @@ let G_pegmanMode        = false;
 let G_pegmanClickHandler = null;
 
 function loadGoogleMapsAPI(key) {
-  document.getElementById('sv-hint').textContent = 'Loading Google Maps…';
-  window._onGoogleMapsLoaded = () => {
-    G_googleMapsReady = true;
-    const btn = document.getElementById('pegman-btn');
-    if (btn) btn.style.display = 'flex';
-    document.getElementById('sv-hint').textContent = 'Drag 🟡 person to map for Street View';
-  };
+  window._onGoogleMapsLoaded = () => { G_googleMapsReady = true; };
   const s = document.createElement('script');
-  s.src = `https://maps.googleapis.com/maps/api/js?key=${key}&callback=_onGoogleMapsLoaded`;
-  s.async = true;
-  s.onerror = () => {
-    document.getElementById('sv-hint').textContent = 'Google Maps failed to load';
-  };
+  s.src   = `https://maps.googleapis.com/maps/api/js?key=${key}&callback=_onGoogleMapsLoaded&v=weekly`;
+  s.defer = true;   // defer (not async) per API docs — ensures callback fires after DOM ready
   document.head.appendChild(s);
 }
 
@@ -1057,14 +1064,12 @@ function setupPegman() {
 
   // Click pegman to toggle placement mode
   btn.addEventListener('click', () => {
-    if (!G_hasGoogleMaps || !G_googleMapsReady) return;
     G_pegmanMode ? cancelPegmanMode() : activatePegmanMode();
   });
 
   // HTML5 drag: drag pegman onto map canvas
   btn.setAttribute('draggable', 'true');
   btn.addEventListener('dragstart', e => {
-    if (!G_hasGoogleMaps || !G_googleMapsReady) { e.preventDefault(); return; }
     e.dataTransfer.setData('text/plain', 'pegman');
     e.dataTransfer.effectAllowed = 'copy';
     activatePegmanMode();
@@ -1110,7 +1115,7 @@ function cancelPegmanMode() {
   const btn = document.getElementById('pegman-btn');
   if (btn) { btn.classList.remove('active'); btn.title = 'Drag or click to place Street View'; }
   const hint = document.getElementById('sv-hint');
-  if (hint) hint.textContent = G_googleMapsReady ? 'Drag 🟡 person to map for Street View' : 'Add GOOGLE_MAPS_KEY to .env';
+  if (hint) hint.textContent = 'Drag 🟡 person to map for Street View';
 }
 
 function showStreetView(lat, lng) {
@@ -1123,6 +1128,23 @@ function showStreetView(lat, lng) {
   placeholder.style.display = 'flex';
   placeholder.textContent   = 'Loading Street View…';
 
+  if (!G_googleMapsReady) {
+    // API not yet loaded — wait up to 8 s then retry
+    placeholder.textContent = 'Waiting for Google Maps API…';
+    const deadline = Date.now() + 8000;
+    const poll = setInterval(() => {
+      if (G_googleMapsReady) {
+        clearInterval(poll);
+        showStreetView(lat, lng);
+      } else if (Date.now() > deadline) {
+        clearInterval(poll);
+        placeholder.textContent = 'Google Maps API unavailable — check API key or network';
+      }
+    }, 200);
+    return;
+  }
+
+  // Use StreetViewService to find nearest panorama within 50 m
   const sv = new google.maps.StreetViewService();
   sv.getPanorama({ location: { lat, lng }, radius: 50 }, (data, status) => {
     if (status === google.maps.StreetViewStatus.OK) {
@@ -1136,7 +1158,7 @@ function showStreetView(lat, lng) {
         fullscreenControl:     false,
       });
     } else {
-      placeholder.textContent = 'No Street View available at this location';
+      placeholder.textContent = 'No Street View imagery at this location';
     }
   });
 }
@@ -1526,8 +1548,16 @@ function switchBasemap(mode) {
   map.once('idle', () => {
     if (G_dataReady && !map.getSource('osm')) rebuildLayers();
   });
-  document.getElementById('btn-basemap-map').classList.toggle('active',       mode === 'map');
-  document.getElementById('btn-basemap-satellite').classList.toggle('active', mode === 'satellite');
+  // Sync all basemap toggle buttons (panel + header)
+  ['btn-basemap-map', 'hdr-basemap-map'].forEach(id =>
+    document.getElementById(id)?.classList.toggle('active', mode === 'map'));
+  ['btn-basemap-satellite', 'hdr-basemap-satellite'].forEach(id =>
+    document.getElementById(id)?.classList.toggle('active', mode === 'satellite'));
+  // Sync inline-styled header buttons
+  const hM = document.getElementById('hdr-basemap-map');
+  const hS = document.getElementById('hdr-basemap-satellite');
+  if (hM) { hM.style.background = mode === 'map' ? '#374151' : 'transparent'; hM.style.color = mode === 'map' ? '#fff' : '#6b7280'; }
+  if (hS) { hS.style.background = mode === 'satellite' ? '#374151' : 'transparent'; hS.style.color = mode === 'satellite' ? '#fff' : '#6b7280'; }
 }
 
 // ---- Statistics Analysis Panel -----------------------------------------------
@@ -1875,71 +1905,160 @@ const EMPTY_FC = { type: 'FeatureCollection', features: [] };
 function addRankingsLayers() {
   removeSafe('rankings-worst');
   removeSafe('rankings-best');
+  removeSafe('facility-overlay');
+  removeSafe('facility-crashes');
 
-  map.addSource('rankings-worst', { type: 'geojson', data: EMPTY_FC });
-  map.addSource('rankings-best',  { type: 'geojson', data: EMPTY_FC });
+  map.addSource('rankings-worst',   { type: 'geojson', data: EMPTY_FC });
+  map.addSource('rankings-best',    { type: 'geojson', data: EMPTY_FC });
+  map.addSource('facility-overlay', { type: 'geojson', data: EMPTY_FC });
+  map.addSource('facility-crashes', { type: 'geojson', data: EMPTY_FC });
 
+  // Layer order (bottom to top):
+  // 1. buffer fill polygon      — translucent blue area around selected facility
+  // 2. buffer outline           — dashed blue border
+  // 3. ranking lines (worst/best) — red/green road segments
+  // 4. ranking circles (worst/best) — red/green intersection dots
+  // 5. fac-seg-hl               — amber highlight on the SELECTED segment (above rank lines)
+  // 6. fac-crashes-layer        — individual crash dots (above all ranking markers)
+  // 7. ranking labels           — rank numbers (top-most)
+
+  // ── 1–2. Facility buffer (polygon) ───────────────────────────────────────
   map.addLayer({
-    id: 'rankings-worst-layer', type: 'circle', source: 'rankings-worst', minzoom: 8,
+    id: 'fac-buffer-fill', type: 'fill', source: 'facility-overlay',
+    filter: ['==', ['geometry-type'], 'Polygon'],
+    paint: { 'fill-color': '#3b82f6', 'fill-opacity': 0.12 },
+  });
+  map.addLayer({
+    id: 'fac-buffer-outline', type: 'line', source: 'facility-overlay',
+    filter: ['==', ['geometry-type'], 'Polygon'],
+    paint: { 'line-color': '#60a5fa', 'line-width': 1.5, 'line-dasharray': [4, 2] },
+  });
+
+  // ── 3. Ranking lines (segments) ───────────────────────────────────────────
+  map.addLayer({
+    id: 'rankings-worst-line', type: 'line', source: 'rankings-worst',
+    minzoom: 6,
+    filter: ['==', ['geometry-type'], 'LineString'],
+    layout: { visibility: 'none', 'line-cap': 'round', 'line-join': 'round' },
     paint: {
-      'circle-radius':       ['interpolate', ['linear'], ['zoom'], 10, 8, 16, 14],
+      'line-color':   '#ef4444',
+      'line-width':   ['interpolate', ['linear'], ['zoom'], 8, 4, 14, 8],
+      'line-opacity': 0.9,
+    },
+  });
+  map.addLayer({
+    id: 'rankings-best-line', type: 'line', source: 'rankings-best',
+    minzoom: 6,
+    filter: ['==', ['geometry-type'], 'LineString'],
+    layout: { visibility: 'none', 'line-cap': 'round', 'line-join': 'round' },
+    paint: {
+      'line-color':   '#22c55e',
+      'line-width':   ['interpolate', ['linear'], ['zoom'], 8, 4, 14, 8],
+      'line-opacity': 0.9,
+    },
+  });
+
+  // ── 4. Ranking circles (intersections) ───────────────────────────────────
+  map.addLayer({
+    id: 'rankings-worst-layer', type: 'circle', source: 'rankings-worst',
+    minzoom: 6,
+    filter: ['==', ['geometry-type'], 'Point'],
+    layout: { visibility: 'none' },
+    paint: {
+      'circle-radius':       ['interpolate', ['linear'], ['zoom'], 8, 10, 14, 18],
       'circle-color':        '#ef4444',
-      'circle-stroke-width': 2,
-      'circle-stroke-color': '#7f1d1d',
-      'circle-opacity':      0.85,
+      'circle-stroke-width': 2.5,
+      'circle-stroke-color': '#fff',
+      'circle-opacity':      0.92,
     },
   });
   map.addLayer({
-    id: 'rankings-worst-label', type: 'symbol', source: 'rankings-worst', minzoom: 8,
-    layout: {
-      'text-field':  ['to-string', ['get', 'rank_worst']],
-      'text-size':   ['interpolate', ['linear'], ['zoom'], 10, 8, 16, 12],
-      'text-anchor': 'center',
-      'text-font':   ['Open Sans Bold', 'Arial Unicode MS Bold'],
-    },
-    paint: { 'text-color': '#fff' },
-  });
-
-  map.addLayer({
-    id: 'rankings-best-layer', type: 'circle', source: 'rankings-best', minzoom: 8,
+    id: 'rankings-best-layer', type: 'circle', source: 'rankings-best',
+    minzoom: 6,
+    filter: ['==', ['geometry-type'], 'Point'],
+    layout: { visibility: 'none' },
     paint: {
-      'circle-radius':       ['interpolate', ['linear'], ['zoom'], 10, 8, 16, 14],
+      'circle-radius':       ['interpolate', ['linear'], ['zoom'], 8, 10, 14, 18],
       'circle-color':        '#22c55e',
-      'circle-stroke-width': 2,
-      'circle-stroke-color': '#14532d',
-      'circle-opacity':      0.85,
+      'circle-stroke-width': 2.5,
+      'circle-stroke-color': '#fff',
+      'circle-opacity':      0.92,
     },
   });
+
+  // ── 5. Selected segment highlight (above rank lines, below crash dots) ───
   map.addLayer({
-    id: 'rankings-best-label', type: 'symbol', source: 'rankings-best', minzoom: 8,
+    id: 'fac-seg-hl', type: 'line', source: 'facility-overlay',
+    filter: ['==', ['geometry-type'], 'LineString'],
+    layout: { 'line-cap': 'round', 'line-join': 'round' },
+    paint: { 'line-color': '#fbbf24', 'line-width': 8, 'line-opacity': 0.9 },
+  });
+
+  // ── 6. Crash dots for selected facility ──────────────────────────────────
+  map.addLayer({
+    id: 'fac-crashes-layer', type: 'circle', source: 'facility-crashes',
+    paint: {
+      'circle-radius': ['interpolate', ['linear'], ['zoom'], 10, 5, 16, 9],
+      'circle-color':  ['match', ['get', 'sev'], 'f', '#ef4444', 's', '#f97316', '#9ca3af'],
+      'circle-stroke-width': 1.5,
+      'circle-stroke-color': ['match', ['get', 'sev'], 'f', '#7f1d1d', 's', '#7c2d12', '#374151'],
+      'circle-opacity': 0.95,
+    },
+  });
+
+  // ── 7. Rank number labels (top of stack) ─────────────────────────────────
+  map.addLayer({
+    id: 'rankings-worst-label', type: 'symbol', source: 'rankings-worst',
+    minzoom: 8,
+    filter: ['==', ['geometry-type'], 'Point'],
     layout: {
-      'text-field':  ['to-string', ['get', 'rank_best']],
-      'text-size':   ['interpolate', ['linear'], ['zoom'], 10, 8, 16, 12],
+      visibility:    'none',
+      'text-field':  ['to-string', ['get', 'rank_worst']],
+      'text-size':   ['interpolate', ['linear'], ['zoom'], 8, 9, 14, 13],
       'text-anchor': 'center',
       'text-font':   ['Open Sans Bold', 'Arial Unicode MS Bold'],
     },
-    paint: { 'text-color': '#fff' },
+    paint: { 'text-color': '#fff', 'text-halo-color': '#7f1d1d', 'text-halo-width': 1 },
+  });
+  map.addLayer({
+    id: 'rankings-best-label', type: 'symbol', source: 'rankings-best',
+    minzoom: 8,
+    filter: ['==', ['geometry-type'], 'Point'],
+    layout: {
+      visibility:    'none',
+      'text-field':  ['to-string', ['get', 'rank_best']],
+      'text-size':   ['interpolate', ['linear'], ['zoom'], 8, 9, 14, 13],
+      'text-anchor': 'center',
+      'text-font':   ['Open Sans Bold', 'Arial Unicode MS Bold'],
+    },
+    paint: { 'text-color': '#fff', 'text-halo-color': '#14532d', 'text-halo-width': 1 },
   });
 
-  // Hover popup for ranked facilities
-  const rankPopup = new maplibregl.Popup({ closeButton: false, closeOnClick: false });
+}
 
-  ['rankings-worst-layer', 'rankings-best-layer'].forEach(layerId => {
-    map.on('mouseenter', layerId, e => {
-      map.getCanvas().style.cursor = 'pointer';
-      const p = e.features[0]?.properties ?? {};
-      const fid = p.facility_id;
-      // Look up full props from stored features
-      const feat = G_rankWorstMap.get(fid) ?? G_rankBestMap.get(fid);
-      const props = feat?.properties ?? p;
-      rankPopup.setLngLat(e.lngLat)
-        .setHTML(_rankPopupHtml(props))
-        .addTo(map);
+// One-time click/hover interaction setup for ranking layers (called after map.on('load'))
+function setupRankingInteractions() {
+  const clickLayers = ['rankings-worst-layer', 'rankings-worst-line',
+                       'rankings-best-layer',  'rankings-best-line'];
+  clickLayers.forEach(layerId => {
+    map.on('mouseenter', layerId, () => { map.getCanvas().style.cursor = 'pointer'; });
+    map.on('mouseleave', layerId, () => { map.getCanvas().style.cursor = ''; });
+    map.on('click', layerId, e => {
+      const p   = e.features[0]?.properties ?? {};
+      openRankDash(p.facility_id);
+      e.stopPropagation();
     });
-    map.on('mouseleave', layerId, () => {
-      map.getCanvas().style.cursor = '';
-      rankPopup.remove();
-    });
+  });
+  // Crash dot tooltip
+  map.on('mouseenter', 'fac-crashes-layer', e => {
+    map.getCanvas().style.cursor = 'help';
+    const sev = e.features[0]?.properties?.sev ?? 'p';
+    const label = sev === 'f' ? 'Fatal' : sev === 's' ? 'Severe injury' : 'PDO';
+    map.getCanvas().title = label;
+  });
+  map.on('mouseleave', 'fac-crashes-layer', () => {
+    map.getCanvas().style.cursor = '';
+    map.getCanvas().title = '';
   });
 }
 
@@ -1948,181 +2067,63 @@ const G_rankWorstMap = new Map();  // facility_id → GeoJSON Feature
 const G_rankBestMap  = new Map();
 
 function _rankPopupHtml(p) {
-  const name  = p.name || p.facility_id || '—';
-  const epdo  = typeof p.epdo_score === 'number' ? p.epdo_score.toFixed(1) : '—';
-  const fatal = p.fatal_5yr ?? '—';
-  const sev   = p.severe_5yr ?? '—';
-  const tot   = p.total_5yr ?? '—';
-  const cls   = p.road_class || '—';
-  const ctrl  = p.control_type || '—';
-  const county = p.county || '—';
-  return `<div style="font-size:0.72rem;line-height:1.6;min-width:160px">
-    <b style="color:#fff">${name}</b><br>
-    <span style="color:#6b7280">${county} · ${cls} · ${ctrl}</span><br>
-    <span style="color:#ef4444">EPDO: ${epdo}</span> &nbsp;
-    <span style="color:#fca5a5">Fatal: ${fatal}</span> &nbsp;
-    <span style="color:#fdba74">Severe: ${sev}</span><br>
-    <span style="color:#9ca3af">Crashes (5yr): ${tot}</span>
+  const name   = p.name || (p.facility_id ? '#' + p.facility_id.replace(/^[nw]/, '') : '—');
+  const county = p.county   || '—';
+  const cls    = p.road_class || p.road_type || '—';
+  const ctrl   = p.road_type || p.control_type || '—';
+  const ftype  = p.facility_type || '—';
+  const speed  = p.speed_mph != null ? p.speed_mph + ' mph' : '—';
+  const lanes  = p.lanes != null ? p.lanes : '—';
+  const aadt   = p.aadt != null ? Number(p.aadt).toLocaleString() : '—';
+  const len_m  = p.length_m != null ? (p.length_m / 1000).toFixed(2) + ' km' : null;
+  const turn   = p.turn_channelization || null;
+  const median = p.median_type || null;
+
+  const epdo   = typeof p.epdo_score === 'number' ? p.epdo_score.toFixed(1) : '—';
+  const fatal  = p.fatal_5yr  ?? '—';
+  const sev    = p.severe_5yr ?? '—';
+  const oth    = (p.total_5yr != null && p.fatal_5yr != null && p.severe_5yr != null)
+                   ? (p.total_5yr - p.fatal_5yr - p.severe_5yr) : '—';
+  const tot    = p.total_5yr  ?? '—';
+  const rate   = p.crash_rate_yr != null ? p.crash_rate_yr.toFixed(2) + '/yr' : '—';
+
+  const rankW  = p.rank_worst != null ? `<span style="color:#f87171">#${p.rank_worst} worst</span>` : '';
+  const rankB  = p.rank_best  != null ? `<span style="color:#4ade80">#${p.rank_best} best</span>` : '';
+  const rankStr = [rankW, rankB].filter(Boolean).join(' &nbsp; ');
+
+  function row(label, val) {
+    if (val == null || val === '—') return '';
+    return `<tr><td style="color:#6b7280;padding-right:8px;white-space:nowrap">${label}</td>
+                <td style="color:#d1d5db">${val}</td></tr>`;
+  }
+
+  return `<div style="font-size:0.72rem;line-height:1.5;font-family:inherit">
+    <div style="font-weight:600;color:#fff;margin-bottom:4px;font-size:0.78rem">${name}</div>
+    <div style="color:#9ca3af;margin-bottom:6px;font-size:0.65rem">${county} · ${ftype}</div>
+    ${rankStr ? `<div style="margin-bottom:6px">${rankStr}</div>` : ''}
+    <table style="width:100%;border-collapse:collapse;margin-bottom:6px">
+      ${row('Road class', cls)}
+      ${row('Control', ctrl)}
+      ${row('Speed limit', speed)}
+      ${row('Lanes', lanes)}
+      ${row('AADT', aadt)}
+      ${len_m ? row('Length', len_m) : ''}
+      ${turn  ? row('Turn chan.', turn) : ''}
+      ${median ? row('Median', median) : ''}
+    </table>
+    <div style="border-top:1px solid #374151;padding-top:5px">
+      <span style="color:#ef4444;font-weight:600">EPDO ${epdo}</span>
+      &nbsp;·&nbsp; <span style="color:#9ca3af">Rate ${rate}</span><br>
+      <span style="color:#fca5a5">Fatal: ${fatal}</span>
+      &nbsp; <span style="color:#fdba74">Severe: ${sev}</span>
+      &nbsp; <span style="color:#9ca3af">Other: ${oth}</span>
+      &nbsp; <span style="color:#6b7280">Total: ${tot}</span>
+    </div>
+    <div style="margin-top:5px;font-size:0.65rem;color:#6b7280">Click row in panel for full stats</div>
   </div>`;
 }
 
-function toggleRankingsPanel() {
-  const body  = document.getElementById('rank-panel-body');
-  const arrow = document.getElementById('rank-panel-arrow');
-  const open  = body.classList.contains('hidden');
-  body.classList.toggle('hidden', !open);
-  arrow.innerHTML = open ? '&#9660;' : '&#9658;';
-  if (open) _loadRankingsConfig();
-}
-
-async function _loadRankingsConfig() {
-  try {
-    const [cfgResp, statusResp] = await Promise.all([
-      fetch('/api/rankings/config'),
-      fetch('/api/data/county_status'),
-    ]);
-    if (!cfgResp.ok) return;
-    const data = await cfgResp.json();
-
-    // Populate output dir placeholder
-    const dirInput = document.getElementById('rank-output-dir');
-    dirInput.placeholder = data.active_dir || '/data/rankings';
-
-    // Populate county dropdown with analysis-ready counties
-    const sel = document.getElementById('rank-county-scope');
-    sel.innerHTML = '<option value="all">All analysis-ready counties</option>';
-
-    let readyCount = 0;
-    if (statusResp.ok) {
-      const statusData = await statusResp.json();
-      Object.entries(statusData)
-        .filter(([, info]) => info.analysis_ready)
-        .sort(([a], [b]) => a.localeCompare(b))
-        .forEach(([c]) => {
-          readyCount++;
-          const opt = document.createElement('option');
-          opt.value = c;
-          opt.textContent = c.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-          sel.appendChild(opt);
-        });
-    } else {
-      // Fallback: use crash-cached counties from config
-      (data.cached_counties || []).forEach(c => {
-        const opt = document.createElement('option');
-        opt.value = c;
-        opt.textContent = c.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-        sel.appendChild(opt);
-        readyCount++;
-      });
-    }
-
-    // Gate compute button: disabled if no analysis-ready county
-    const btn = document.getElementById('rank-compute-btn');
-    if (btn) {
-      btn.disabled = readyCount === 0;
-      btn.title = readyCount === 0
-        ? 'Download at least one county (crash + OSM) before computing'
-        : '';
-    }
-  } catch (_) {}
-}
-
-async function setRankingsDir() {
-  const dir = document.getElementById('rank-output-dir').value.trim();
-  if (!dir) return;
-  try {
-    const resp = await fetch('/api/rankings/set_dir', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ output_dir: dir }),
-    });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      _rankStatus(`Cannot load: ${err.detail || resp.statusText}`);
-      return;
-    }
-    _rankStatus('Path set. Use Load Rankings to visualize.');
-  } catch (e) {
-    _rankStatus(`Error: ${e.message}`);
-  }
-}
-
-function onRankFacTypeChange() {
-  const isInt = document.getElementById('rank-fac-type').value === 'int';
-  document.getElementById('rank-int-filters').classList.toggle('hidden', !isInt);
-  document.getElementById('rank-seg-filters').classList.toggle('hidden', isInt);
-  clearRankings();
-}
-
-function _buildBinKey() {
-  const facType = document.getElementById('rank-fac-type').value;
-  if (facType === 'int') {
-    const ctrl  = document.getElementById('rank-control').value;
-    const cls   = document.getElementById('rank-int-road-class').value;
-    const speed = document.getElementById('rank-int-speed').value;
-    const legs  = document.getElementById('rank-legs').value;
-    // Build partial key — skip empty dimensions
-    const parts = [ctrl, cls, speed, legs].filter(Boolean);
-    if (!parts.length) return null;
-    return 'int|' + parts.join('|');
-  } else {
-    const cls   = document.getElementById('rank-seg-road-class').value;
-    const speed = document.getElementById('rank-seg-speed').value;
-    const lanes = document.getElementById('rank-lanes').value;
-    const parts = [cls, speed, lanes].filter(Boolean);
-    if (!parts.length) return null;
-    return 'seg|' + parts.join('|');
-  }
-}
-
-async function loadSelectedRanking() {
-  const binKey = _buildBinKey();
-  if (!binKey) {
-    _rankStatus('Select at least one filter to load rankings.');
-    return;
-  }
-
-  _rankStatus('Loading…');
-  document.getElementById('rank-table-wrap').classList.add('hidden');
-  document.getElementById('rank-bin-label').classList.add('hidden');
-
-  try {
-    const encoded = encodeURIComponent(binKey);
-    const resp = await fetch(`/api/rankings/bin/${encoded}`);
-    if (resp.status === 404) {
-      const err = await resp.json().catch(() => ({}));
-      if (err.detail?.includes('not found')) {
-        _rankStatus(`No bin matches "${binKey}". Try different filters.`);
-      } else {
-        _rankStatus('Rankings not computed yet. Run scripts/build_safety_rankings.py first.');
-      }
-      return;
-    }
-    if (!resp.ok) throw new Error(resp.statusText);
-    const data = await resp.json();
-
-    if (data.insufficient_data) {
-      _rankStatus(`Insufficient data (< 20 facilities) for bin: ${binKey}`);
-      return;
-    }
-
-    _rankStatus('');
-    _renderRankingsMap(data.worst || [], data.best || []);
-    _renderRankingsTable(data.worst || [], data.best || [], binKey, data.facility_count);
-  } catch (err) {
-    _rankStatus(`Error: ${err.message}`);
-  }
-}
-
-function _rankStatus(msg) {
-  const el = document.getElementById('rank-status');
-  if (msg) {
-    el.textContent = msg;
-    el.classList.remove('hidden');
-  } else {
-    el.classList.add('hidden');
-  }
-}
+let G_lastFacilityId = null;  // last facility opened via openRankDash, for overlay restore
 
 function _renderRankingsMap(worst, best) {
   G_rankWorstMap.clear();
@@ -2136,149 +2137,62 @@ function _renderRankingsMap(worst, best) {
   if (bestSrc)  bestSrc.setData({ type: 'FeatureCollection', features: best });
 }
 
-function _renderRankingsTable(worst, best, binKey, facilityCount) {
-  document.getElementById('rank-bin-label').textContent =
-    `${binKey}  ·  ${facilityCount ?? '?'} facilities statewide`;
-  document.getElementById('rank-bin-label').classList.remove('hidden');
-
-  const maxRows = Math.max(worst.length, best.length);
-  if (!maxRows) { _rankStatus('No ranked facilities returned.'); return; }
-
-  function rowHtml(feat, rankProp, colorClass) {
-    if (!feat) return '<div class="rank-row" style="min-height:36px"></div>';
-    const p    = feat.properties ?? {};
-    const rank = p[rankProp] ?? '—';
-    const name = p.name || p.facility_id || '—';
-    const epdo = typeof p.epdo_score === 'number' ? p.epdo_score.toFixed(1) : '—';
-    const f    = p.fatal_5yr ?? 0;
-    const s    = p.severe_5yr ?? 0;
-    const fid  = p.facility_id;
-    return `<div class="rank-row" onclick="openRankDash('${fid}')">
-      <span class="rn">#${rank}</span> ${name}<br>
-      <span class="re ${colorClass}">EPDO ${epdo}</span>
-      <span class="re" style="color:#9ca3af"> ${f}K/${s}S</span>
-    </div>`;
+// After a basemap style switch, sources are recreated empty. Re-populate from in-memory Maps.
+function _restoreRankingsData() {
+  if (G_rankWorstMap.size > 0) {
+    map.getSource('rankings-worst')?.setData({
+      type: 'FeatureCollection', features: [...G_rankWorstMap.values()],
+    });
+    LAYER_VISIBILITY['rankings-worst'] = true;
+    _syncLayerVisibility('rankings-worst');
   }
-
-  let worstHtml = '', bestHtml = '';
-  for (let i = 0; i < maxRows; i++) {
-    worstHtml += rowHtml(worst[i], 'rank_worst', 'worst');
-    bestHtml  += rowHtml(best[i],  'rank_best',  'best');
+  if (G_rankBestMap.size > 0) {
+    map.getSource('rankings-best')?.setData({
+      type: 'FeatureCollection', features: [...G_rankBestMap.values()],
+    });
+    LAYER_VISIBILITY['rankings-best'] = true;
+    _syncLayerVisibility('rankings-best');
   }
-  document.getElementById('rank-worst-list').innerHTML = worstHtml;
-  document.getElementById('rank-best-list').innerHTML  = bestHtml;
-  document.getElementById('rank-table-wrap').classList.remove('hidden');
+  // Restore facility overlay if a facility was open
+  if (G_lastFacilityId) {
+    const feat = G_rankWorstMap.get(G_lastFacilityId) ?? G_rankBestMap.get(G_lastFacilityId);
+    if (feat) _renderFacilityOverlay(feat);
+  }
 }
 
 function _flyToRankFacility(facilityId) {
   const feat = G_rankWorstMap.get(facilityId) ?? G_rankBestMap.get(facilityId);
   if (!feat) return;
-  const coords = feat.geometry?.type === 'Point'
-    ? feat.geometry.coordinates
-    : feat.geometry?.coordinates?.[0];
-  if (coords) map.flyTo({ center: coords, zoom: Math.max(map.getZoom(), 14), duration: 800 });
-}
-
-// ---- Rankings compute + download -------------------------------------------
-
-let _rankPollTimer = null;
-
-async function pickRankingsDir() {
-  try {
-    const resp = await fetch('/api/system/pick_dir');
-    if (!resp.ok) return;
-    const { path } = await resp.json();
-    if (path) document.getElementById('rank-output-dir').value = path;
-  } catch (_) {}
-}
-
-async function startRankingsCompute() {
-  const btn       = document.getElementById('rank-compute-btn');
-  const outputDir = document.getElementById('rank-output-dir').value.trim();
-  const county    = document.getElementById('rank-county-scope').value;
-  const wFatal  = parseFloat(document.getElementById('rank-w-fatal').value)  || 10;
-  const wInjury = parseFloat(document.getElementById('rank-w-injury').value) || 2;
-  const wPdo    = parseFloat(document.getElementById('rank-w-pdo').value)    || 0.2;
-
-  btn.disabled = true;
-  btn.textContent = '⏳ Running…';
-  _setRankProgress(0, 'Starting computation…');
-  document.getElementById('rank-progress-wrap').classList.remove('hidden');
-
-  try {
-    const params = new URLSearchParams();
-    if (county && county !== 'all') params.set('county', county);
-    if (outputDir) params.set('output_dir', outputDir);
-    params.set('weights', `${wFatal},${wInjury},${wPdo}`);
-
-    const resp = await fetch('/api/rankings/compute?' + params, { method: 'POST' });
-    if (resp.status === 409) {
-      _setRankProgress(0, 'Already running — polling…');
-    } else if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err.detail || resp.statusText);
-    }
-    _startRankPoll();
-  } catch (e) {
-    btn.disabled = false;
-    btn.textContent = '▶ Compute';
-    _setRankProgress(0, `Error: ${e.message}`);
+  const geom = feat.geometry;
+  if (!geom) return;
+  if (geom.type === 'Point') {
+    map.flyTo({ center: geom.coordinates, zoom: Math.max(map.getZoom(), 15), duration: 800 });
+  } else if (geom.type === 'LineString' && geom.coordinates?.length) {
+    const allLngs = geom.coordinates.map(c => c[0]);
+    const allLats = geom.coordinates.map(c => c[1]);
+    map.fitBounds(
+      [[Math.min(...allLngs), Math.min(...allLats)], [Math.max(...allLngs), Math.max(...allLats)]],
+      { padding: 120, maxZoom: 16, duration: 800 }
+    );
   }
 }
 
-function _startRankPoll() {
-  if (_rankPollTimer) return;
-  _rankPollTimer = setInterval(_pollRankStatus, 1500);
+// Build a GeoJSON Polygon approximating a circle around [lon, lat] with radius in metres
+function _circlePolygon(lon, lat, radiusM, steps = 64) {
+  const latR = radiusM / 111320;
+  const lonR = radiusM / (111320 * Math.cos(lat * Math.PI / 180));
+  const coords = [];
+  for (let i = 0; i <= steps; i++) {
+    const a = (i / steps) * 2 * Math.PI;
+    coords.push([lon + lonR * Math.cos(a), lat + latR * Math.sin(a)]);
+  }
+  return { type: 'Feature', properties: {}, geometry: { type: 'Polygon', coordinates: [coords] } };
 }
 
-async function _pollRankStatus() {
-  try {
-    const resp = await fetch('/api/rankings/status');
-    if (!resp.ok) return;
-    const data = await resp.json();
 
-    _setRankProgress(data.progress ?? 0, data.message || '');
-
-    if (data.status === 'done') {
-      clearInterval(_rankPollTimer);
-      _rankPollTimer = null;
-      _setRankProgress(100, 'Done! Rankings ready.');
-      _resetComputeBtn();
-      _loadRankingsConfig();   // refresh active_dir placeholder + county list
-    } else if (data.status === 'error') {
-      clearInterval(_rankPollTimer);
-      _rankPollTimer = null;
-      _setRankProgress(0, `Error: ${data.message}`);
-      _resetComputeBtn();
-    }
-  } catch (_) {}
-}
-
-function _setRankProgress(pct, msg) {
-  document.getElementById('rank-progress-bar').style.width = pct + '%';
-  document.getElementById('rank-progress-msg').textContent = msg;
-}
-
-function _resetComputeBtn() {
-  const btn = document.getElementById('rank-compute-btn');
-  btn.disabled = false;
-  btn.textContent = '▶ Compute';
-}
-
-function downloadRankings() {
-  window.location.href = '/api/rankings/download';
-}
-
-function clearRankings() {
-  G_rankWorstMap.clear();
-  G_rankBestMap.clear();
-  const worstSrc = map.getSource('rankings-worst');
-  const bestSrc  = map.getSource('rankings-best');
-  if (worstSrc) worstSrc.setData(EMPTY_FC);
-  if (bestSrc)  bestSrc.setData(EMPTY_FC);
-  document.getElementById('rank-table-wrap').classList.add('hidden');
-  document.getElementById('rank-bin-label').classList.add('hidden');
-  _rankStatus('');
+function _clearFacilityOverlay() {
+  map.getSource('facility-overlay')?.setData(EMPTY_FC);
+  map.getSource('facility-crashes')?.setData(EMPTY_FC);
 }
 
 // ---------------------------------------------------------------------------
@@ -2288,7 +2202,9 @@ function clearRankings() {
 function openRankDash(facilityId) {
   const feat = G_rankWorstMap.get(facilityId) ?? G_rankBestMap.get(facilityId);
   if (!feat) return;
+  G_lastFacilityId = facilityId;
   _flyToRankFacility(facilityId);
+  _renderFacilityOverlay(feat);
 
   const p     = feat.properties ?? {};
   const dists = typeof p.crash_dists === 'string'
@@ -2299,43 +2215,156 @@ function openRankDash(facilityId) {
   const sev   = p.severe_5yr || 0;
   const pdo   = Math.max(0, total - fatal - sev);
 
+  const rankWorst = p.rank_worst != null ? `#${p.rank_worst} worst` : null;
+  const rankBest  = p.rank_best  != null ? `#${p.rank_best} safest` : null;
+  const rankBadge = rankWorst
+    ? `<span style="background:#7f1d1d;color:#fca5a5;padding:1px 6px;border-radius:3px">${rankWorst}</span>`
+    : rankBest
+      ? `<span style="background:#14532d;color:#86efac;padding:1px 6px;border-radius:3px">${rankBest}</span>`
+      : '';
+
   const title = p.name || p.facility_id || 'Facility';
   document.getElementById('rank-dash-title').textContent = title;
 
-  let html = `
-    <div class="dash-stat-row"><span class="dk">County</span><span class="dv">${p.county || '—'}</span></div>
-    <div class="dash-stat-row"><span class="dk">Road Class</span><span class="dv">${p.road_class || '—'}</span></div>
-    <div class="dash-stat-row"><span class="dk">Control</span><span class="dv">${p.control_type || p.road_type || '—'}</span></div>
-    <div class="dash-stat-row"><span class="dk">Speed</span><span class="dv">${p.speed_mph ? p.speed_mph + ' mph' : '—'}</span></div>
-    <div class="dash-stat-row"><span class="dk">EPDO Score</span><span class="dv" style="color:#ef4444">${typeof p.epdo_score === 'number' ? p.epdo_score.toFixed(1) : '—'}</span></div>
-    <div class="dash-stat-row"><span class="dk">Crashes (5yr)</span><span class="dv">${total}</span></div>
-    <div class="dash-chart-title">Severity</div>
-    ${_dashBar('Fatal',   fatal, total, '#ef4444')}
-    ${_dashBar('Severe',  sev,   total, '#f97316')}
-    ${_dashBar('PDO',     pdo,   total, '#6b7280')}`;
+  // Crash overlay legend
+  const crashOverlayNote = `<div style="font-size:0.6rem;color:#4b5563;margin-bottom:8px;line-height:1.5">
+    <span style="color:#60a5fa">&#9632;</span> Buffer zone &nbsp;
+    <span style="color:#ef4444">&#9679;</span> Fatal &nbsp;
+    <span style="color:#f97316">&#9679;</span> Severe &nbsp;
+    <span style="color:#6b7280">&#9679;</span> PDO &nbsp;&mdash; shown on map
+  </div>`;
+
+  // ── Summary grid ──────────────────────────────────────────────────
+  let html = crashOverlayNote + `<div class="dash-summary-grid">
+    <div class="dash-sg-cell"><span class="dk">County</span><span class="dv">${p.county || '—'}</span></div>
+    <div class="dash-sg-cell"><span class="dk">Road Class</span><span class="dv">${p.road_class || '—'}</span></div>
+    <div class="dash-sg-cell"><span class="dk">Type</span><span class="dv">${p.control_type || p.road_type || '—'}</span></div>
+    <div class="dash-sg-cell"><span class="dk">Speed</span><span class="dv">${p.speed_mph ? p.speed_mph + ' mph' : '—'}</span></div>
+    ${p.lanes  ? `<div class="dash-sg-cell"><span class="dk">Lanes</span><span class="dv">${p.lanes}</span></div>` : ''}
+    ${p.length_m ? `<div class="dash-sg-cell"><span class="dk">Length</span><span class="dv">${p.length_m}m</span></div>` : ''}
+  </div>`;
+
+  // ── Score + rank strip ─────────────────────────────────────────────
+  const epdo  = typeof p.epdo_score === 'number' ? p.epdo_score.toFixed(1) : '—';
+  const rate  = typeof p.crash_rate_yr === 'number' ? p.crash_rate_yr.toFixed(2) : '—';
+  html += `<div class="dash-score-strip">
+    <div class="dash-score-cell"><div class="dash-score-val" style="color:#ef4444">${epdo}</div><div class="dash-score-lbl">EPDO score</div></div>
+    <div class="dash-score-cell"><div class="dash-score-val">${total}</div><div class="dash-score-lbl">crashes / 5yr</div></div>
+    <div class="dash-score-cell"><div class="dash-score-val">${rate}</div><div class="dash-score-lbl">crashes / yr</div></div>
+    <div class="dash-score-cell"><div class="dash-score-val">${rankBadge || '—'}</div><div class="dash-score-lbl">rank</div></div>
+  </div>`;
+
+  // ── Severity ───────────────────────────────────────────────────────
+  html += `<div class="dash-chart-title">Crash Severity</div>
+    ${_dashBar('Fatal',   fatal, total, '#ef4444', true)}
+    ${_dashBar('Severe',  sev,   total, '#f97316', true)}
+    ${_dashBar('PDO',     pdo,   total, '#6b7280',  true)}`;
 
   if (total > 0) {
-    html += `<div class="dash-chart-title">Special Conditions</div>
-    ${_dashBar('Pedestrian', dists.ped || 0, total, '#60a5fa')}
-    ${_dashBar('Cyclist',    dists.cyc || 0, total, '#a78bfa')}
-    ${_dashBar('Impaired',   dists.imp || 0, total, '#f59e0b')}`;
-
-    const lighting = dists.lighting || {};
-    if (Object.keys(lighting).length) {
-      html += `<div class="dash-chart-title">Lighting</div>`;
-      const lightTotal = Object.values(lighting).reduce((a, b) => a + b, 0);
-      Object.entries(lighting).slice(0, 5).forEach(([k, v]) => {
-        html += _dashBar(k, v, lightTotal, '#38bdf8');
+    // ── Collision type ─────────────────────────────────────────────
+    const ctypes = dists.collision_type || {};
+    if (Object.keys(ctypes).length) {
+      html += `<div class="dash-chart-title">Collision Type</div>`;
+      const ctTotal = Object.values(ctypes).reduce((a, b) => a + b, 0);
+      Object.entries(ctypes).slice(0, 7).forEach(([k, v]) => {
+        html += _dashBar(k, v, ctTotal, '#818cf8', true);
       });
     }
 
+    // ── Motor vehicle involved ─────────────────────────────────────
+    const mveh = dists.mveh || {};
+    if (Object.keys(mveh).length) {
+      html += `<div class="dash-chart-title">Involved Party</div>`;
+      const mvTotal = Object.values(mveh).reduce((a, b) => a + b, 0);
+      Object.entries(mveh).slice(0, 6).forEach(([k, v]) => {
+        html += _dashBar(k, v, mvTotal, '#34d399', true);
+      });
+    }
+
+    // ── Vulnerable users ───────────────────────────────────────────
+    const ped = dists.ped || 0;
+    const cyc = dists.cyc || 0;
+    const imp = dists.imp || 0;
+    if (ped + cyc + imp > 0) {
+      html += `<div class="dash-chart-title">Vulnerable / Impaired</div>
+      ${_dashBar('Pedestrian', ped, total, '#60a5fa', true)}
+      ${_dashBar('Cyclist',    cyc, total, '#a78bfa', true)}
+      ${imp > 0 ? _dashBar('Impaired', imp, total, '#f59e0b', true) : ''}`;
+    }
+
+    // ── Time of day histogram ──────────────────────────────────────
+    const hourDist = dists.hour || {};
+    if (Object.keys(hourDist).length) {
+      html += `<div class="dash-chart-title">Time of Day</div>${_dashHourChart(hourDist)}`;
+    }
+
+    // ── Day of week ────────────────────────────────────────────────
+    const dayDist = dists.day || {};
+    if (Object.keys(dayDist).length) {
+      html += `<div class="dash-chart-title">Day of Week</div>`;
+      const DAY_ORDER = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
+      const dayTotal  = Object.values(dayDist).reduce((a, b) => a + b, 0);
+      const daysSorted = DAY_ORDER.filter(d => dayDist[d] != null)
+        .concat(Object.keys(dayDist).filter(d => !DAY_ORDER.includes(d)));
+      daysSorted.forEach(k => {
+        const v = dayDist[k] || 0;
+        if (v) html += _dashBar(k.slice(0, 3), v, dayTotal, '#facc15', true);
+      });
+    }
+
+    // ── Lighting ───────────────────────────────────────────────────
+    const lighting = dists.lighting || {};
+    if (Object.keys(lighting).length) {
+      html += `<div class="dash-chart-title">Lighting Conditions</div>`;
+      const lightTotal = Object.values(lighting).reduce((a, b) => a + b, 0);
+      Object.entries(lighting).slice(0, 5).forEach(([k, v]) => {
+        html += _dashBar(k, v, lightTotal, '#38bdf8', true);
+      });
+    }
+
+    // ── Weather ────────────────────────────────────────────────────
+    const weather = dists.weather || {};
+    if (Object.keys(weather).length) {
+      html += `<div class="dash-chart-title">Weather</div>`;
+      const wxTotal = Object.values(weather).reduce((a, b) => a + b, 0);
+      Object.entries(weather).slice(0, 5).forEach(([k, v]) => {
+        html += _dashBar(k, v, wxTotal, '#7dd3fc', true);
+      });
+    }
+
+    // ── Road condition ─────────────────────────────────────────────
+    const roadCond = dists.road_cond || {};
+    if (Object.keys(roadCond).length) {
+      html += `<div class="dash-chart-title">Road Condition</div>`;
+      const rcTotal = Object.values(roadCond).reduce((a, b) => a + b, 0);
+      Object.entries(roadCond).slice(0, 5).forEach(([k, v]) => {
+        html += _dashBar(k, v, rcTotal, '#86efac', true);
+      });
+    }
+
+    // ── Primary Collision Factor ───────────────────────────────────
     const pcf = dists.pcf || {};
     if (Object.keys(pcf).length) {
-      html += `<div class="dash-chart-title">Primary Collision Factor</div>`;
+      html += `<div class="dash-chart-title">Primary Collision Factor (CVC)</div>`;
       const pcfTotal = Object.values(pcf).reduce((a, b) => a + b, 0);
       Object.entries(pcf).slice(0, 5).forEach(([k, v]) => {
-        html += _dashBar(k, v, pcfTotal, '#fb7185');
+        html += _dashBar(k, v, pcfTotal, '#fb7185', true);
       });
+    }
+
+    // ── Similar safe facilities ────────────────────────────────────
+    const similar = Array.isArray(p.similar_best) ? p.similar_best
+      : (typeof p.similar_best === 'string' ? JSON.parse(p.similar_best || '[]') : []);
+    if (similar.length) {
+      html += `<div class="dash-chart-title">Similar Safe Facilities</div>
+      <div style="font-size:0.62rem;color:#6b7280;line-height:1.6">`;
+      similar.forEach(fid => {
+        const sf = G_rankBestMap.get(fid);
+        const sn = sf?.properties?.name || fid;
+        const se = sf?.properties?.epdo_score != null ? ` · EPDO ${sf.properties.epdo_score.toFixed(1)}` : '';
+        html += `<div style="cursor:pointer;color:#86efac" onclick="openRankDash('${fid}')">${sn}${se}</div>`;
+      });
+      html += `</div>`;
     }
   }
 
@@ -2343,17 +2372,87 @@ function openRankDash(facilityId) {
   document.getElementById('rank-dash-panel').classList.add('open');
 }
 
-function _dashBar(label, count, total, color) {
+function _dashBar(label, count, total, color, showPct = false) {
   const pct = total > 0 ? Math.round(count / total * 100) : 0;
+  const pctLabel = showPct && total > 0 ? `<span style="color:#4b5563;font-size:0.58rem;margin-left:2px">${pct}%</span>` : '';
   return `<div class="dash-bar-row">
     <span class="dash-bar-label" title="${label}">${label}</span>
     <div class="dash-bar-bg"><div class="dash-bar-fill" style="width:${pct}%;background:${color}"></div></div>
-    <span class="dash-bar-count">${count}</span>
+    <span class="dash-bar-count">${count}${pctLabel}</span>
   </div>`;
 }
 
+function _dashHourChart(hourDist) {
+  // 24-slot sparkline grouped by 4 periods: night 0-5, morning 6-11, afternoon 12-17, evening 18-23
+  const max = Math.max(1, ...Object.values(hourDist));
+  const periodColors = ['#1e40af','#f97316','#facc15','#7c3aed'];
+  const periodLabels = ['Night (0-5)','Morning (6-11)','Afternoon (12-17)','Evening (18-23)'];
+  const periodTotals = [0, 0, 0, 0];
+  let bars = '';
+  for (let h = 0; h < 24; h++) {
+    const v   = hourDist[`${h < 10 ? '0' : ''}${h}`] || 0;
+    const pct = Math.round(v / max * 100);
+    const period = h < 6 ? 0 : h < 12 ? 1 : h < 18 ? 2 : 3;
+    periodTotals[period] += v;
+    bars += `<div title="${h}:00 — ${v} crashes" style="
+      flex:1;height:${Math.max(2, pct)}%;background:${periodColors[period]};
+      opacity:0.85;border-radius:1px 1px 0 0;align-self:flex-end"></div>`;
+  }
+  let periodSummary = `<div style="display:flex;gap:6px;flex-wrap:wrap;margin-top:4px">`;
+  periodLabels.forEach((lbl, i) => {
+    periodSummary += `<span style="font-size:0.58rem;color:${periodColors[i]}">${lbl}: ${periodTotals[i]}</span>`;
+  });
+  periodSummary += `</div>`;
+  return `<div style="display:flex;gap:1px;height:40px;align-items:flex-end;padding:2px 0">${bars}</div>
+    <div style="display:flex;justify-content:space-between;font-size:0.55rem;color:#4b5563;margin-top:1px">
+      <span>0h</span><span>6h</span><span>12h</span><span>18h</span><span>23h</span>
+    </div>${periodSummary}`;
+}
+
+function _renderFacilityOverlay(feat) {
+  const p     = feat.properties ?? {};
+  const geom  = feat.geometry;
+  if (!geom) return;
+
+  // ── Buffer / geometry overlay ─────────────────────────────────────────────
+  let overlayFeatures = [];
+  const isNode = geom.type === 'Point';
+
+  if (isNode) {
+    const [lon, lat] = geom.coordinates;
+    // Draw 50m buffer circle (INTERSECTION_R)
+    overlayFeatures.push(_circlePolygon(lon, lat, 50));
+  } else if (geom.type === 'LineString') {
+    // Draw the segment itself as a highlighted line feature
+    overlayFeatures.push({ type: 'Feature', properties: {}, geometry: geom });
+  }
+
+  map.getSource('facility-overlay')?.setData({
+    type: 'FeatureCollection', features: overlayFeatures,
+  });
+
+  // ── Crash points ──────────────────────────────────────────────────────────
+  let crashCoords = [];
+  try {
+    const raw = p.crash_coords;
+    crashCoords = typeof raw === 'string' ? JSON.parse(raw) : (raw || []);
+  } catch (_) {}
+
+  const crashFeatures = crashCoords.map(([lon, lat, sev]) => ({
+    type: 'Feature',
+    geometry: { type: 'Point', coordinates: [lon, lat] },
+    properties: { sev: sev || 'p' },
+  }));
+
+  map.getSource('facility-crashes')?.setData({
+    type: 'FeatureCollection', features: crashFeatures,
+  });
+}
+
 function closeRankDash() {
+  G_lastFacilityId = null;
   document.getElementById('rank-dash-panel').classList.remove('open');
+  _clearFacilityOverlay();
 }
 
 // ---------------------------------------------------------------------------
@@ -2440,5 +2539,505 @@ async function _loadCountyData(countyName) {
     chip.classList.remove('loading');
     chip.classList.add('uncached');
   }
+}
+
+// ============================================================================
+//  ANALYSIS MODE
+// ============================================================================
+
+// ---- State -----------------------------------------------------------------
+let _anaCountyData       = null;   // { county_name: { crash_ready, osm_pct, ... } }
+let _anaCountyPollTimers = {};     // { county_name: intervalId } — per-county download polls
+let _anaComputePollTimer = null;
+let _anaHandoffShown     = false;
+let _anaBinsData         = null;   // cached result of /api/rankings/bins
+let _anaActiveBinKey     = null;   // currently selected bin key
+let _anaBinTab           = 'int';  // 'int' | 'seg'
+let _anaComputeCounties  = new Set(); // counties selected for computation
+
+// ---- Mode switch -----------------------------------------------------------
+function setAppMode(mode) {
+  if (G_appMode === mode) return;
+  G_appMode = mode;
+  const isAnalysis = mode === 'analysis';
+
+  // Header mode buttons
+  const btnI = document.getElementById('btn-mode-inspect');
+  const btnA = document.getElementById('btn-mode-analysis');
+  if (btnI) { btnI.style.background = isAnalysis ? 'transparent' : '#1d4ed8'; btnI.style.color = isAnalysis ? '#6b7280' : '#fff'; }
+  if (btnA) { btnA.style.background = isAnalysis ? '#7c3aed' : 'transparent'; btnA.style.color = isAnalysis ? '#fff' : '#6b7280'; }
+
+  // Side panels
+  const inspPanel = document.getElementById('panel');
+  const anaPanel  = document.getElementById('analysis-panel');
+  if (inspPanel) inspPanel.style.display = isAnalysis ? 'none' : 'block';
+  if (anaPanel)  anaPanel.classList.toggle('hidden', !isAnalysis);
+
+
+  if (isAnalysis) {
+    clearTimeout(_viewportTimer);
+    clearTimeout(_crashPollTimer);
+    if (G_drawMode) cancelDraw();
+    if (G_pegmanMode) cancelPegmanMode();
+    _loadAnalysisCountyStatus();
+  } else {
+    // Stop any running county download polls
+    Object.keys(_anaCountyPollTimers).forEach(name => {
+      clearInterval(_anaCountyPollTimers[name]);
+      delete _anaCountyPollTimers[name];
+    });
+    // Stop rankings compute poll if running
+    if (_anaComputePollTimer) { clearInterval(_anaComputePollTimer); _anaComputePollTimer = null; }
+    // Clear facility overlay when returning to Inspect
+    _clearFacilityOverlay();
+    document.getElementById('rank-dash-panel')?.classList.remove('open');
+    G_lastFacilityId = null;
+    if (G_dataReady) scheduleViewportLoad();
+  }
+}
+
+// ---- County grid -----------------------------------------------------------
+async function _loadAnalysisCountyStatus() {
+  try {
+    const resp = await fetch('/api/data/county_status');
+    if (!resp.ok) return;
+    _anaCountyData = await resp.json();
+
+    // First open: show handoff banner if cached data exists from Inspect session
+    if (!_anaHandoffShown) {
+      _anaHandoffShown = true;
+      const hasData = Object.values(_anaCountyData).some(i => i.crash_ready || i.osm_pct >= 20);
+      if (hasData) {
+        const readyCt = Object.values(_anaCountyData).filter(i => i.analysis_ready).length;
+        const partCt  = Object.values(_anaCountyData).filter(i => !i.analysis_ready && (i.crash_ready || i.osm_pct >= 20)).length;
+        const parts = [];
+        if (readyCt)  parts.push(`${readyCt} ready`);
+        if (partCt)   parts.push(`${partCt} partial`);
+        const banner = document.getElementById('ana-handoff-banner');
+        const msg    = document.getElementById('ana-handoff-msg');
+        if (banner && msg) {
+          msg.textContent = `\u2191 Session data carried over \u2014 ${parts.join(', ')} from Inspect mode.`;
+          banner.classList.remove('hidden');
+        }
+      }
+    }
+
+    _renderAnaCountyGrid();
+    // Seed compute-county selection with any county that has crash data
+    if (_anaComputeCounties.size === 0) {
+      Object.entries(_anaCountyData).forEach(([name, info]) => {
+        if (info.crash_ready) _anaComputeCounties.add(name);
+      });
+    }
+    _renderAnaComputeCountyPicker();
+    _updateAnaComputeBtn();
+  } catch (_) {}
+}
+
+function _renderAnaCountyGrid() {
+  const grid = document.getElementById('ana-county-grid');
+  if (!grid || !_anaCountyData) return;
+
+  // Sort: analysis_ready first, then partial, then rest — alphabetical within group
+  const entries = Object.entries(_anaCountyData).sort(([an, ai], [bn, bi]) => {
+    const aScore = ai.analysis_ready ? 2 : (ai.crash_ready || ai.osm_pct > 0 ? 1 : 0);
+    const bScore = bi.analysis_ready ? 2 : (bi.crash_ready || bi.osm_pct > 0 ? 1 : 0);
+    return bScore - aScore || an.localeCompare(bn);
+  });
+
+  grid.innerHTML = entries.map(([name, info]) => {
+    const label     = name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+    const chipClass = _countyChipClass(info);
+    const remaining = Math.max(0, (info.osm_tile_total || 0) - (info.osm_tile_cached || 0));
+    let titleText;
+    if (chipClass === 'ready')   titleText = `${label}: analysis-ready (crash \u2713, OSM ${info.osm_pct}%)`;
+    else if (chipClass === 'loading') titleText = `${label}: downloading\u2026 OSM ${info.osm_pct}% (${remaining} tiles left)`;
+    else if (chipClass === 'partial') titleText = `${label}: partial \u2014 crash ${info.crash_ready ? '\u2713' : '\u2717'}, OSM ${info.osm_pct}% \u2014 click to complete`;
+    else                         titleText = `${label}: no data \u2014 click to download`;
+
+    // Ready counties are not clickable (nothing to do)
+    const clickAttr = info.analysis_ready
+      ? ''
+      : `onclick="_anaClickCounty('${name}')"`;
+
+    return `<span class="county-chip ${chipClass}" id="ana-chip-${name}"
+               title="${titleText}" ${clickAttr}>${label}</span>`;
+  }).join('');
+}
+
+async function _anaClickCounty(name) {
+  if (!_anaCountyData) return;
+  const info = _anaCountyData[name];
+  if (!info || info.analysis_ready) return;
+
+  // Update chip to loading state immediately
+  const chip = document.getElementById(`ana-chip-${name}`);
+  if (chip) { chip.className = 'county-chip loading'; chip.onclick = null; }
+
+  try {
+    await Promise.all([
+      fetch(`/api/data/county/${name}/fetch_crash`, { method: 'POST' }).catch(() => {}),
+      fetch(`/api/data/county/${name}/fetch_osm`,   { method: 'POST' }).catch(() => {}),
+    ]);
+  } catch (_) {}
+
+  // Poll until this county is ready
+  if (_anaCountyPollTimers[name]) clearInterval(_anaCountyPollTimers[name]);
+  _anaCountyPollTimers[name] = setInterval(() => _pollAnaCounty(name), 4000);
+}
+
+async function _pollAnaCounty(name) {
+  try {
+    const resp = await fetch('/api/data/county_status');
+    if (!resp.ok) return;
+    const fresh = await resp.json();
+    // Only re-render if this county's state actually changed
+    const prev = _anaCountyData?.[name];
+    const next = fresh[name];
+    const changed = !prev
+      || prev.analysis_ready !== next?.analysis_ready
+      || prev.osm_pct       !== next?.osm_pct
+      || prev.crash_ready   !== next?.crash_ready
+      || prev.fetching_crash !== next?.fetching_crash
+      || prev.fetching_osm  !== next?.fetching_osm;
+    _anaCountyData = fresh;
+    if (changed) { _renderAnaCountyGrid(); _updateAnaComputeBtn(); }
+
+    const info = _anaCountyData[name];
+    // Stop polling when download fully completes (success or stalled) — not still actively fetching
+    if (!info || info.analysis_ready || (!info.fetching_crash && !info.fetching_osm)) {
+      clearInterval(_anaCountyPollTimers[name]);
+      delete _anaCountyPollTimers[name];
+    }
+  } catch (_) {}
+}
+
+function _updateAnaComputeBtn() {
+  const btn = document.getElementById('ana-compute-btn');
+  if (!btn || !_anaCountyData) return;
+  const hasSelection = [..._anaComputeCounties].some(n => _anaCountyData[n]?.crash_ready);
+  btn.disabled = !hasSelection;
+  btn.title = hasSelection ? '' : 'Select at least one county with crash data above';
+}
+
+// ---- Compute rankings ------------------------------------------------------
+async function anaComputeRankings() {
+  const btn = document.getElementById('ana-compute-btn');
+  if (btn) { btn.disabled = true; btn.textContent = '\u23f3 Computing\u2026'; }
+  _anaShowProgress(0, 'Starting rankings computation\u2026');
+
+  const wF = parseFloat(document.getElementById('ana-w-fatal')?.value)  || 10;
+  const wI = parseFloat(document.getElementById('ana-w-injury')?.value) || 2;
+  const wP = parseFloat(document.getElementById('ana-w-pdo')?.value)    || 0.2;
+
+  const allowIncomplete = document.getElementById('ana-allow-incomplete')?.checked;
+  const minOsm = allowIncomplete ? 0 : 80;
+
+  // Build selected county list (only those with crash data)
+  const countyList = [..._anaComputeCounties].filter(n => _anaCountyData?.[n]?.crash_ready).join(',');
+
+  const params = new URLSearchParams({ weights: `${wF},${wI},${wP}`, min_osm_pct: minOsm });
+  if (countyList) params.set('counties', countyList);
+
+  try {
+    const resp = await fetch(`/api/rankings/compute?${params}`, { method: 'POST' });
+    if (resp.status === 409) { _anaSetProgress(0, 'Already running \u2014 polling\u2026'); }
+    else if (!resp.ok) { const e = await resp.json().catch(() => ({})); throw new Error(e.detail || resp.statusText); }
+    if (_anaComputePollTimer) clearInterval(_anaComputePollTimer);
+    _anaComputePollTimer = setInterval(_pollAnaCompute, 1500);
+  } catch (e) {
+    if (btn) { btn.disabled = false; btn.textContent = '\u25b6 Compute Rankings'; }
+    _anaSetProgress(0, `Error: ${e.message}`);
+  }
+}
+
+async function _pollAnaCompute() {
+  try {
+    const resp = await fetch('/api/rankings/status');
+    if (!resp.ok) return;
+    const data = await resp.json();
+    _anaSetProgress(data.progress ?? 0, data.message || '');
+
+    if (data.status === 'done') {
+      clearInterval(_anaComputePollTimer);
+      _anaComputePollTimer = null;
+      _anaSetProgress(100, 'Done! Loading available bins\u2026');
+      const btn = document.getElementById('ana-compute-btn');
+      if (btn) { btn.disabled = false; btn.textContent = '\u2713 Recompute'; }
+      await _anaLoadBins();
+    } else if (data.status === 'error') {
+      clearInterval(_anaComputePollTimer);
+      _anaComputePollTimer = null;
+      _anaSetProgress(0, `Error: ${data.message}`);
+      const btn = document.getElementById('ana-compute-btn');
+      if (btn) { btn.disabled = false; btn.textContent = '\u25b6 Compute Rankings'; }
+    }
+  } catch (_) {}
+}
+
+function _anaShowProgress(pct, msg) {
+  document.getElementById('ana-progress-wrap')?.classList.remove('hidden');
+  _anaSetProgress(pct, msg);
+}
+
+function _anaSetProgress(pct, msg) {
+  const bar = document.getElementById('ana-progress-bar');
+  const msgEl = document.getElementById('ana-progress-msg');
+  if (bar)   bar.style.width = Math.min(100, pct) + '%';
+  if (msgEl) msgEl.textContent = msg;
+}
+
+// ---- Bin browser -----------------------------------------------------------
+async function _anaLoadBins() {
+  try {
+    const resp = await fetch('/api/rankings/bins');
+    if (!resp.ok) return;
+    _anaBinsData = await resp.json();
+    _anaRenderBinChips();
+
+    const section = document.getElementById('ana-bins-section');
+    if (section) section.style.display = 'block';
+
+    // Update meta label
+    const meta = document.getElementById('ana-bins-meta');
+    if (meta && _anaBinsData) {
+      const total  = Object.keys(_anaBinsData.bins || {}).length;
+      const avail  = Object.values(_anaBinsData.bins || {}).filter(b => b.has_data).length;
+      meta.textContent = `${avail}/${total} bins with data`;
+    }
+  } catch (_) {}
+}
+
+function _anaSetBinTab(tab) {
+  _anaBinTab = tab;
+  document.getElementById('ana-tab-int')?.classList.toggle('active', tab === 'int');
+  document.getElementById('ana-tab-seg')?.classList.toggle('active', tab === 'seg');
+  document.getElementById('ana-bins-int')?.classList.toggle('hidden', tab !== 'int');
+  document.getElementById('ana-bins-seg')?.classList.toggle('hidden', tab !== 'seg');
+}
+
+function _anaBinLabel(key) {
+  // Convert bin_key to human-readable label
+  // int|signal|arterial|26-40mph|4-leg  →  Signal · Arterial · 26-40mph · 4-leg
+  // seg|arterial|26-40mph|1-2           →  Arterial · 26-40mph · 1-2 lanes
+  const parts = key.split('|');
+  const type  = parts[0];
+  const attrs = parts.slice(1);
+  const labelMap = {
+    signal: 'Signal', stop: 'All-Way Stop', give_way: 'Yield', uncontrolled: 'Uncontrolled',
+    highway: 'Highway', arterial: 'Arterial', collector: 'Collector', local: 'Local',
+    'T-int': '3-leg', '4-leg': '4-leg', multi: '5+-leg',
+    '1-2': '1-2 lanes', '3-4': '3-4 lanes', '5+': '5+ lanes',
+  };
+  return attrs.map(a => labelMap[a] || a).join(' \u00b7 ');
+}
+
+function _anaRenderBinChips() {
+  if (!_anaBinsData?.bins) return;
+
+  const intEl = document.getElementById('ana-bins-int');
+  const segEl = document.getElementById('ana-bins-seg');
+  if (!intEl || !segEl) return;
+
+  // Group bins by: control type (for int) or road class (for seg), sorted by count desc
+  const intBins = Object.entries(_anaBinsData.bins)
+    .filter(([k]) => k.startsWith('int|'))
+    .sort(([,a],[,b]) => (b.count||0) - (a.count||0));
+
+  const segBins = Object.entries(_anaBinsData.bins)
+    .filter(([k]) => k.startsWith('seg|'))
+    .sort(([,a],[,b]) => (b.count||0) - (a.count||0));
+
+  function chipsHtml(bins) {
+    if (!bins.length) return '<div style="font-size:0.65rem;color:#4b5563">No bins computed yet.</div>';
+    return bins.map(([key, info]) => {
+      const available = info.has_data;
+      const isActive  = key === _anaActiveBinKey;
+      const cls = available ? `available${isActive ? ' selected' : ''}` : 'sparse';
+      const onclick = available ? `onclick="anaLoadRanking('${key}')"` : '';
+      const label = _anaBinLabel(key);
+      const count = info.count ? `<span class="bin-count">${info.count} facilities</span>` : '';
+      return `<span class="ana-bin-chip ${cls}" title="${key}" ${onclick}>${label}${count}</span>`;
+    }).join('');
+  }
+
+  intEl.innerHTML = intBins.length
+    ? `<div class="ana-bin-group-hdr">Intersections</div>${chipsHtml(intBins)}`
+    : '<div style="font-size:0.65rem;color:#4b5563">No intersection bins.</div>';
+
+  segEl.innerHTML = segBins.length
+    ? `<div class="ana-bin-group-hdr">Road Segments</div>${chipsHtml(segBins)}`
+    : '<div style="font-size:0.65rem;color:#4b5563">No segment bins.</div>';
+}
+
+// ---- Load a specific bin's rankings ----------------------------------------
+async function anaLoadRanking(binKey) {
+  if (!binKey) return;
+  _anaActiveBinKey = binKey;
+
+  // Re-render chips so selected state updates
+  _anaRenderBinChips();
+
+  // Switch to correct tab
+  const tab = binKey.startsWith('int|') ? 'int' : 'seg';
+  if (_anaBinTab !== tab) _anaSetBinTab(tab);
+
+  // Show loading state
+  const wrap = document.getElementById('ana-rank-results-wrap');
+  const results = document.getElementById('ana-rank-results');
+  const binLabel = document.getElementById('ana-bin-label');
+  if (wrap) wrap.classList.remove('hidden');
+  if (results) results.innerHTML = '<div style="font-size:0.65rem;color:#6b7280;padding:8px 0">Loading\u2026</div>';
+  if (binLabel) binLabel.textContent = binKey;
+
+  try {
+    const resp = await fetch(`/api/rankings/bin/${encodeURIComponent(binKey)}`);
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      if (results) results.innerHTML = `<div style="font-size:0.65rem;color:#f87171;padding:8px 0">${err.detail || 'Error loading rankings.'}</div>`;
+      return;
+    }
+    const data = await resp.json();
+
+    if (data.insufficient_data) {
+      if (results) results.innerHTML = '<div style="font-size:0.65rem;color:#6b7280;padding:8px 0">Not enough facilities (&lt;20) for this bin.</div>';
+      return;
+    }
+
+    // Render on map
+    _renderRankingsMap(data.worst || [], data.best || []);
+    if (typeof LAYER_VISIBILITY !== 'undefined') {
+      LAYER_VISIBILITY['rankings-worst'] = true;
+      LAYER_VISIBILITY['rankings-best']  = true;
+      if (typeof _syncLayerVisibility === 'function') {
+        _syncLayerVisibility('rankings-worst');
+        _syncLayerVisibility('rankings-best');
+      }
+    }
+
+    // Fly to bounding box of all ranked facilities
+    const allFeats = [...(data.worst || []), ...(data.best || [])];
+    if (allFeats.length) {
+      const lngs = allFeats.map(f => f.geometry?.coordinates?.[0]).filter(Number.isFinite);
+      const lats = allFeats.map(f => f.geometry?.coordinates?.[1]).filter(Number.isFinite);
+      if (lngs.length) {
+        map.fitBounds(
+          [[Math.min(...lngs), Math.min(...lats)], [Math.max(...lngs), Math.max(...lats)]],
+          { padding: 60, maxZoom: 13, duration: 900 }
+        );
+      }
+    }
+
+    // Render table
+    _anaRenderRankTable(data.worst || [], data.best || []);
+
+    // Update bin label with count
+    if (binLabel && data.facility_count) {
+      binLabel.textContent = `${binKey}  \u00b7  ${data.facility_count} facilities`;
+    }
+
+    // Scroll the results into view within the analysis panel
+    setTimeout(() => {
+      document.getElementById('ana-rank-results-wrap')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }, 200);
+  } catch (err) {
+    if (results) results.innerHTML = `<div style="font-size:0.65rem;color:#f87171;padding:8px 0">Error: ${err.message}</div>`;
+  }
+}
+
+function _anaRenderRankTable(worst, best) {
+  const el = document.getElementById('ana-rank-results');
+  if (!el) return;
+
+  function rowHtml(feat, rankProp, side) {
+    if (!feat) return '';
+    const p    = feat.properties ?? {};
+    const rank = p[rankProp] ?? '—';
+    const name = p.name || (p.facility_id ? p.facility_id.replace(/^[nw]/, '#') : '—');
+    const epdo = typeof p.epdo_score === 'number' ? p.epdo_score.toFixed(1) : '—';
+    const f    = p.fatal_5yr ?? 0;
+    const s    = p.severe_5yr ?? 0;
+    const fid  = p.facility_id || '';
+    return `<div class="ana-rank-row" onclick="openRankDash('${fid}')" title="Click to inspect on map">
+      <span class="ana-rank-num">#${rank}</span> ${name}<br>
+      <span class="ana-rank-epdo ${side}">EPDO ${epdo}</span>
+      <span style="color:#6b7280;font-size:0.58rem"> ${f}K ${s}S</span>
+    </div>`;
+  }
+
+  el.innerHTML = `<div class="ana-rank-grid">
+    <div>
+      <div class="ana-rank-col-hdr worst">Worst 10</div>
+      ${worst.map(f => rowHtml(f, 'rank_worst', 'worst')).join('')}
+    </div>
+    <div>
+      <div class="ana-rank-col-hdr best">Best 10</div>
+      ${best.map(f => rowHtml(f, 'rank_best', 'best')).join('')}
+    </div>
+  </div>`;
+}
+
+// ---- Compute county picker --------------------------------------------------
+function _renderAnaComputeCountyPicker() {
+  const el = document.getElementById('ana-compute-county-list');
+  if (!el || !_anaCountyData) return;
+
+  // Only counties that have crash data are eligible
+  const eligible = Object.entries(_anaCountyData)
+    .filter(([, info]) => info.crash_ready)
+    .sort(([an, ai], [bn, bi]) => {
+      // Sort: analysis_ready first, then by osm_pct desc, then alpha
+      if (ai.analysis_ready !== bi.analysis_ready) return ai.analysis_ready ? -1 : 1;
+      return (bi.osm_pct - ai.osm_pct) || an.localeCompare(bn);
+    });
+
+  if (!eligible.length) {
+    el.innerHTML = '<div style="font-size:0.62rem;color:#6b7280">No counties with crash data yet. Download crash data above first.</div>';
+    const cntEl = document.getElementById('ana-compute-county-count');
+    if (cntEl) cntEl.textContent = '0 selected';
+    return;
+  }
+
+  el.innerHTML = eligible.map(([name, info]) => {
+    const label   = name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+    const checked = _anaComputeCounties.has(name) ? 'checked' : '';
+    const osmTxt  = info.analysis_ready
+      ? '<span style="color:#4ade80">ready</span>'
+      : `<span style="color:#f59e0b">${info.osm_pct.toFixed(0)}% OSM</span>`;
+    return `<label class="ana-compute-county-row">
+      <input type="checkbox" ${checked} onchange="_anaToggleComputeCounty('${name}',this.checked)">
+      <span class="ana-compute-county-name">${label}</span>
+      ${osmTxt}
+    </label>`;
+  }).join('');
+
+  _updateAnaComputeCountyCount();
+}
+
+function _anaToggleComputeCounty(name, checked) {
+  if (checked) _anaComputeCounties.add(name);
+  else _anaComputeCounties.delete(name);
+  _updateAnaComputeCountyCount();
+  _updateAnaComputeBtn();
+}
+
+function _updateAnaComputeCountyCount() {
+  const el = document.getElementById('ana-compute-county-count');
+  if (el) el.textContent = `${_anaComputeCounties.size} selected`;
+}
+
+function _anaComputeSelectAll() {
+  if (!_anaCountyData) return;
+  Object.entries(_anaCountyData).forEach(([name, info]) => {
+    if (info.crash_ready) _anaComputeCounties.add(name);
+  });
+  _renderAnaComputeCountyPicker();
+  _updateAnaComputeBtn();
+}
+
+function _anaComputeClearAll() {
+  _anaComputeCounties.clear();
+  _renderAnaComputeCountyPicker();
+  _updateAnaComputeBtn();
 }
 

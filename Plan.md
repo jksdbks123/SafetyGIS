@@ -1,9 +1,9 @@
-# GIS-Track — Project Plan
+# SafetyGIS — Project Plan
 
 **Core Architecture:**
 - **Frontend:** Plain HTML + Vanilla JavaScript + MapLibre GL JS
 - **Backend:** Python 3 + FastAPI
-- **Database:** PostgreSQL + PostGIS (Phase 2)
+- **Database:** None (Phase 1); PostgreSQL + PostGIS (Phase 2)
 - **AI Coding Partner:** Claude Code
 
 ---
@@ -17,18 +17,33 @@
 
 ---
 
-## Phase 1 — Urban Digital Base (Background & Data Layers) ✅ Complete
+## Phase 1 — Urban Digital Base ✅ Complete
 
 **Goal:** A read-only "god view" that aggregates multiple data sources onto a single interactive map.
 
-- **Task 1.1 — Base map & server skeleton**
-  FastAPI serves `index.html`; MapLibre GL JS renders OpenFreeMap vector tiles (free, no API key).
-- **Task 1.2 — OSM infrastructure layers**
-  Python script calls Overpass API; result converted to GeoJSON and rendered as independent layers (signals, crossings, bus stops, bike lanes, footways, street lamps, traffic calming).
-- **Task 1.3 — Crash data layer**
-  Real CHP CCRS data via data.ca.gov CKAN API; all 58 counties supported; per-county lazy loading with local GeoJSON cache.
-- **Task 1.4 — Mapillary integration**
-  Street-level imagery coverage as vector tiles; sign detection layers; side-panel popup with thumbnail + metadata.
+### Inspect Mode (read-only map exploration)
+- ✅ FastAPI server + MapLibre base map (OpenFreeMap, free)
+- ✅ OSM infrastructure layers — traffic signals, crossings, bus stops, bike lanes, footways, sidewalks, street lamps, traffic calming
+- ✅ Real CHP CCRS crash data — all 58 counties, lazy viewport loading, local GeoJSON cache
+- ✅ Crash heatmap + individual popups with parties/victims data
+- ✅ Mapillary integration — vector tile coverage, photo popups, sign detection layers
+- ✅ Google Street View — pegman drag-and-drop
+- ✅ Polygon/rectangle selection tool — CSV/GeoJSON export
+- ✅ Statistics panel — Chart.js bar/donut, 8 group-by fields, 4 scopes
+- ✅ Basemap switching — OpenFreeMap / Esri satellite
+- ✅ Data source info modals + disclaimer
+
+### Analysis Mode (rankings computation)
+- ✅ County data manager — click to trigger download, per-county progress chips
+- ✅ Safety rankings computation — EPDO-weighted scoring via `build_safety_rankings.py`
+- ✅ Configurable EPDO weights (fatal / injury / PDO)
+- ✅ Bin browser — intersections and segments, multi-dimension filter chips
+- ✅ Crash dashboard — EPDO score, severity charts, crash coords overlay on map
+- ✅ Worst / best 10 ranked facilities per bin, map visualization
+
+### Deployment
+- ✅ Docker packaging (arm64-compatible, Raspberry Pi 5 tested)
+- ✅ Cloudflare Tunnel for public access
 
 ---
 
@@ -36,14 +51,10 @@
 
 **Goal:** Make the map interactive — support drawing, editing, and persisting infrastructure project records.
 
-- **Task 2.1 — PostGIS database design**
-  SQLAlchemy + GeoAlchemy2 models for project geometries and attributes.
-- **Task 2.2 — Frontend drawing tools**
-  `@mapbox/mapbox-gl-draw` for points, lines, and polygons.
-- **Task 2.3 — Attribute forms & API**
-  Native HTML forms submit project metadata via `fetch` to FastAPI → stored in PostGIS.
-- **Task 2.4 — Status-driven styling**
-  Layer colors driven by project phase/status field.
+- [ ] 2.1 PostGIS database design — SQLAlchemy + GeoAlchemy2 models for project geometries and attributes
+- [ ] 2.2 Frontend drawing tools — `@mapbox/mapbox-gl-draw` for points, lines, and polygons
+- [ ] 2.3 Attribute forms & API — HTML forms submit project metadata via `fetch` → FastAPI → PostGIS
+- [ ] 2.4 Status-driven styling — layer colors driven by project phase/status field
 
 ---
 
@@ -51,10 +62,9 @@
 
 **Goal:** Refine UX and explore AI-powered capabilities.
 
-- **Task 3.1 — UI/UX polish**
-  Tailwind CSS via CDN; refined layer control panel.
-- **Task 3.2 — Performance optimization**
-  Backend vector tile serving for large datasets.
-- **Task 3.3 — AI features (exploratory)**
-  - Dangerous intersection detection using crash density analysis.
-  - Natural language map queries ("show me all sidewalks under construction").
+- [ ] 3.1 UI/UX polish — Tailwind CSS via CDN; refined layer control panel
+- [ ] 3.2 Performance optimization — backend vector tile serving for large datasets
+- [ ] 3.3 AI features (exploratory)
+  - AADT integration from Caltrans PeMS for exposure-normalized rankings
+  - Natural language map queries ("show me all uncontrolled intersections in Sacramento")
+  - Before/after safety analysis tools

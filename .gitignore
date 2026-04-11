@@ -35,3 +35,6 @@ data/enrichment/
 
 # Claude Code internal files
 .claude/
+
+# Uvicorn/watchfiles config (local dev only)
+.watchfilesignore

@@ -158,6 +158,83 @@ uvicorn main:app --reload
 
 ---
 
+## Session 2026-04-10 — Analysis Mode, Safety Rankings, Street View & Code Quality
+
+### Added: Analysis Mode (Inspect / Analysis toggle)
+
+A new `Analysis` button in the header switches the left panel from Inspect mode (viewport lazy loading) to Analysis mode (controlled county-level downloads + rankings). Key design:
+
+- `G_appMode = 'inspect' | 'analysis'` guards `scheduleViewportLoad()` so panning does not trigger data loads while in Analysis mode
+- The Inspect panel and Analysis panel are independent DOM elements; toggling hides/shows each
+- All polling timers (county download + rankings compute) are correctly cancelled on mode switch
+
+### Added: County Data Manager (Analysis Mode)
+
+- County chip grid shows all 58 California counties with color-coded readiness state (ready / partial / downloading / no data)
+- Click any chip to trigger parallel background download of crash + OSM data for that county
+- Per-county polling (`_pollAnaCounty`) updates chip state every 4 seconds; stops when download completes
+- Session handoff: counties cached during Inspect mode browsing are pre-seeded — entering Analysis mode shows their state immediately
+- `GET /api/data/county_status` is the single source of truth: returns `{crash_ready, osm_pct, osm_tile_cached, osm_tile_total, analysis_ready, fetching_crash, fetching_osm}` per county
+
+### Added: Safety Rankings Computation (Analysis Mode)
+
+- Compute button fires `POST /api/rankings/compute?weights=F,I,P&counties=…&min_osm_pct=N`
+- Progress bar polls `GET /api/rankings/status` at 1.5 s intervals
+- On completion, auto-loads `GET /api/rankings/bins` and renders the bin browser
+- EPDO weights configurable (fatal default 10, injury 2, PDO 0.2)
+- "Allow incomplete OSM" checkbox sets `min_osm_pct=0` for counties with crash data only
+
+### Added: Bin Browser (Analysis Mode)
+
+- `GET /api/rankings/bins` returns all available bin keys with facility counts
+- Chips grouped by intersection vs segment; purple = data available, gray = sparse (<20 facilities)
+- Clicking a chip calls `GET /api/rankings/bin/{key}` and renders worst/best 10 tables
+- Map layers `rankings-worst` (red circles) and `rankings-best` (green circles) are updated via shared `_renderRankingsMap()`
+
+### Added: Crash Dashboard (`openRankDash`)
+
+Clicking any ranked facility (from map circle or table row) opens a detail panel:
+- EPDO score, 5-year fatal / severe / total counts in a 4-cell score strip
+- Lighting, PCF, weather, day-of-week, collision type, road condition distribution bars
+- Crash point overlay on the main map (facility buffer + individual crash coords)
+- `crash_coords` stored in rankings GeoJSON as a JSON-encoded string (max 200 per facility) to minimize GeoJSON size; decoded with `JSON.parse()` on the frontend
+
+### Added: `build_safety_rankings.py` enhancements
+
+- New crash fields: `collision_type`, `road_cond`, `mveh` (motor vehicle involved), `hour` (derived from `crash_time_description`)
+- Hour-of-day distribution (24 bins) added to EPDO output
+- `--counties` flag accepts comma-separated list; `--min-osm-pct` sets readiness threshold
+- `PYTHONIOENCODING=utf-8` set for Windows `cp1252` compatibility
+- Empty cache written for failed Overpass tiles so `osm_pct` advances correctly
+
+### Fixed: Google Street View showing world map instead of Street View
+
+Root cause: an iframe fallback I had added earlier used `https://maps.google.com/maps?layer=c&…&output=embed`, which opens a regular map embed, not a Street View panorama.
+
+Fix: removed iframe fallback entirely; reverted to `StreetViewService.getPanorama()` approach. Added a poll-wait (200 ms intervals, 8 s timeout) for the edge case where the user drags the pegman before the Google Maps JS API finishes loading.
+
+### Fixed: Mapillary layers permanently grayed out on page load
+
+Root cause: `fetch('/api/osm/sacramento')` returned 404 (endpoint removed in an earlier refactor). The error was not caught; it propagated up through `loadData()`, aborting config loading, the Mapillary token fetch, and the Google Maps API initialization before they ran. Result: `G_hasMly` stayed `false`, `rebuildLayers()` applied `.disabled` CSS and `pointerEvents:none` to all Mapillary toggles permanently.
+
+Fix: wrapped the non-critical OSM preload in an isolated try-catch. Failures silently fall through to an empty `G_osmData`; viewport loading populates OSM on first pan as normal.
+
+### Fixed: `load_dotenv()` not overriding inherited OS environment variables
+
+Fix: `load_dotenv(override=True)` in `main.py` so `.env` values always win over any inherited process environment.
+
+### Removed: Inspect-mode Rankings panel (dead code)
+
+The old Inspect-mode Rankings panel (compute button, county scope dropdown, output dir picker, rankings table) was moved to Analysis mode in a prior session but its JS functions were left behind. Removed 299 lines of dead code: `toggleRankingsPanel`, `_loadRankingsConfig`, `setRankingsDir`, `onRankFacTypeChange`, `_buildBinKey`, `loadSelectedRanking`, `_rankStatus`, `_renderRankingsTable`, `pickRankingsDir`, `startRankingsCompute`, `_startRankPoll`, `_pollRankStatus`, `_setRankProgress`, `_resetComputeBtn`, `downloadRankings`, `clearRankings`.
+
+### Simplified: Code quality pass
+
+- `_renderAnaCountyGrid()` now reuses `_countyChipClass()` instead of inlining duplicate chip class logic
+- `_pollAnaCounty()` now compares previous vs fresh county state before re-rendering the grid (avoids unnecessary DOM repaints every 4 seconds)
+- `_anaComputePollTimer` now correctly cancelled when switching back to Inspect mode
+
+---
+
 ## Session 2026-04-08 — Metadata, Disclaimer, Docker, Raspberry Pi 5 Deployment
 
 ### Added: Data metadata & disclaimer

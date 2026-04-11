@@ -211,11 +211,11 @@ def get_county_tiles(county_name: str) -> list:
     return [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
 
 
-def check_county_readiness(county_name: str) -> tuple[bool, str]:
+def check_county_readiness(county_name: str, min_osm_pct: float = 80.0) -> tuple[bool, str]:
     """Return (ok, message).
 
-    ok=False  → skip this county entirely (crash data missing or OSM < 80%)
-    ok=True   → process, but may print a warning if OSM is between 80-95%
+    ok=False  → skip this county entirely (crash data missing or OSM below threshold)
+    ok=True   → process; prints a warning if OSM is below 95%
     """
     crash_path = os.path.join(CRASH_CACHE, f"{county_name}.geojson")
     if not os.path.exists(crash_path):
@@ -229,10 +229,10 @@ def check_county_readiness(county_name: str) -> tuple[bool, str]:
     )
     pct = cached / total * 100 if total else 0.0
 
-    if pct < 80:
+    if pct < min_osm_pct:
         return False, (
             f"OSM tiles only {pct:.0f}% complete ({cached}/{total}) — "
-            "use the County Data panel to download all tiles first"
+            f"below required {min_osm_pct:.0f}%"
         )
     if pct < 95:
         print(f"  WARNING {county_name}: OSM {pct:.0f}% complete ({cached}/{total} tiles)"
@@ -299,17 +299,24 @@ def load_crashes(county_name: str) -> list:
         lon, lat = coords[0], coords[1]
         if not (-180 <= lon <= 180 and -90 <= lat <= 90):
             continue
+        time_raw = p.get("crash_time_description") or ""
+        time_str = str(time_raw).zfill(4) if time_raw else ""
+        hour = int(time_str[:2]) if len(time_str) >= 2 and time_str[:2].isdigit() else -1
         result.append({
-            "lon":      lon,
-            "lat":      lat,
-            "severity": p.get("severity", "pdo"),
-            "lighting": (p.get("lightingdescription") or "Unknown")[:40],
-            "pcf":      (p.get("primary_collision_factor_violation") or "Unknown")[:40],
-            "weather":  (p.get("weather_1") or "Unknown")[:30],
-            "day":      p.get("day_of_week", ""),
-            "ped":      bool(p.get("has_pedestrian")),
-            "cyc":      bool(p.get("has_cyclist")),
-            "imp":      bool(p.get("has_impaired")),
+            "lon":            lon,
+            "lat":            lat,
+            "severity":       p.get("severity", "pdo"),
+            "lighting":       (p.get("lightingdescription") or "Unknown")[:40],
+            "pcf":            (p.get("primary_collision_factor_violation") or "Unknown")[:40],
+            "weather":        (p.get("weather_1") or "Unknown")[:30],
+            "day":            p.get("day_of_week", ""),
+            "ped":            bool(p.get("has_pedestrian")),
+            "cyc":            bool(p.get("has_cyclist")),
+            "imp":            bool(p.get("has_impaired")),
+            "collision_type": (p.get("collision_type_description") or "Unknown")[:40],
+            "road_cond":      (p.get("road_condition_1") or "Unknown")[:40],
+            "mveh":           (p.get("motorvehicleinvolvedwithdesc") or "Unknown")[:40],
+            "hour":           hour,
         })
     return result
 
@@ -521,14 +528,25 @@ def compute_epdo(crashes: list) -> tuple:
     severe = sum(1 for c in crashes if c["severity"] == "severe_injury")
     total  = len(crashes)
     score  = sum(EPDO.get(c["severity"], EPDO["pdo"]) for c in crashes)
+    # Hour-of-day distribution: 24 bins, key = "00".."23"
+    hour_dist: dict = {}
+    for c in crashes:
+        h = c.get("hour", -1)
+        if 0 <= h <= 23:
+            k = f"{h:02d}"
+            hour_dist[k] = hour_dist.get(k, 0) + 1
     dists = {
-        "lighting": _count_dist(crashes, "lighting"),
-        "pcf":      _count_dist(crashes, "pcf"),
-        "weather":  _count_dist(crashes, "weather"),
-        "day":      _count_dist(crashes, "day"),
-        "ped":      sum(1 for c in crashes if c.get("ped")),
-        "cyc":      sum(1 for c in crashes if c.get("cyc")),
-        "imp":      sum(1 for c in crashes if c.get("imp")),
+        "lighting":       _count_dist(crashes, "lighting"),
+        "pcf":            _count_dist(crashes, "pcf"),
+        "weather":        _count_dist(crashes, "weather"),
+        "day":            _count_dist(crashes, "day"),
+        "ped":            sum(1 for c in crashes if c.get("ped")),
+        "cyc":            sum(1 for c in crashes if c.get("cyc")),
+        "imp":            sum(1 for c in crashes if c.get("imp")),
+        "collision_type": _count_dist(crashes, "collision_type"),
+        "road_cond":      _count_dist(crashes, "road_cond"),
+        "mveh":           _count_dist(crashes, "mveh"),
+        "hour":           hour_dist,
     }
     return round(score, 2), fatal, severe, total, dists
 
@@ -547,7 +565,7 @@ def process_county(county_name: str, global_stats: dict, dry_run: bool = False) 
         return {"county": county_name, "skipped": "no_crash_cache"}
 
     # 1. Load crashes
-    print(f"\n[{county_name}] Loading crashes…", flush=True)
+    print(f"\n[{county_name}] Loading crashes...", flush=True)
     crashes      = load_crashes(county_name)
     n_crashes    = len(crashes)
     print(f"  {n_crashes:,} crashes in {YEAR_WINDOW}-year window", flush=True)
@@ -558,7 +576,7 @@ def process_county(county_name: str, global_stats: dict, dry_run: bool = False) 
     project, _   = make_projector((south + north) / 2)
 
     # 3. Build facility registry
-    print(f"  Building facility registry ({len(tiles)} tiles)…", flush=True)
+    print(f"  Building facility registry ({len(tiles)} tiles)...", flush=True)
     registry     = build_facility_registry(tiles, project)
     if not registry:
         del crashes
@@ -580,11 +598,11 @@ def process_county(county_name: str, global_stats: dict, dry_run: bool = False) 
           flush=True)
 
     # 5. Spatial join
-    print(f"  Matching crashes…", flush=True)
+    print(f"  Matching crashes...", flush=True)
     crash_map    = match_crashes(crashes, node_geoms, node_ids, node_tree,
                                  way_geoms,  way_ids,  way_tree,  project)
     n_matched    = sum(1 for v in crash_map.values() if v)
-    print(f"  {n_matched:,} facilities with ≥1 crash", flush=True)
+    print(f"  {n_matched:,} facilities with >=1 crash", flush=True)
 
     # 6. Classify and accumulate
     way_reg = {fid: registry[fid] for fid in way_ids}  # quick lookup subset
@@ -623,6 +641,7 @@ def process_county(county_name: str, global_stats: dict, dry_run: bool = False) 
                 "length_m":      fac.get("length_m", 0),
                 "facility_type": "intersection" if is_node else "segment",
                 "geometry":      fac["geometry"],
+                "crash_list":    sevs,
             }
         new_facs += 1
 
@@ -638,9 +657,17 @@ def process_county(county_name: str, global_stats: dict, dry_run: bool = False) 
 # Statewide ranking
 # ---------------------------------------------------------------------------
 
+_SEV_CODE = {"fatal": "f", "severe_injury": "s"}  # default = "p" (PDO)
+
 def _make_feature(fid: str, stats: dict,
                   rank_worst: int | None, rank_best: int | None,
                   similar_best: list) -> dict:
+    # Compact crash coords: [[lon, lat, sev_code], ...]  (max 200 crashes stored)
+    crash_list = stats.get("crash_list", [])
+    crash_coords = json.dumps([
+        [round(c["lon"], 6), round(c["lat"], 6), _SEV_CODE.get(c.get("severity", ""), "p")]
+        for c in crash_list[:200]
+    ])
     return {
         "type":     "Feature",
         "geometry": stats["geometry"],
@@ -664,6 +691,7 @@ def _make_feature(fid: str, stats: dict,
             "length_m":      stats["length_m"],
             "similar_best":  similar_best,
             "crash_dists":   stats.get("dists", {}),
+            "crash_coords":  crash_coords,
             # Future enrichment (None until fetch_enrichment.py is run):
             "aadt":              None,
             "turn_channelization": None,
@@ -736,7 +764,11 @@ def get_cached_counties() -> list:
 def main():
     parser = argparse.ArgumentParser(
         description="Build statewide safety rankings from OSM + crash cache")
-    parser.add_argument("--county", help="Process only this county")
+    parser.add_argument("--county", help="Process only this county (legacy, use --counties)")
+    parser.add_argument("--counties", default="",
+                        help="Comma-separated list of counties to include, e.g. alameda,sacramento")
+    parser.add_argument("--min-osm-pct", type=float, default=80.0,
+                        help="Minimum OSM tile completeness %% required to include a county (default 80)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print stats only, do not write output")
     parser.add_argument("--weights", default="",
@@ -750,27 +782,35 @@ def main():
                 set_epdo_weights(*parts)
                 print(f"EPDO weights: fatal={parts[0]}, injury={parts[1]}, pdo={parts[2]}")
         except ValueError:
-            print(f"⚠  Invalid --weights '{args.weights}', using defaults")
+            print(f"WARNING: Invalid --weights '{args.weights}', using defaults")
 
     if not args.dry_run:
         os.makedirs(RANKINGS_DIR, exist_ok=True)
         free_gb = shutil.disk_usage(RANKINGS_DIR).free / 1024**3
         if RANKINGS_DIR.startswith(os.path.join(BASE_DIR, "data")) and free_gb < 2:
-            print(f"⚠  Only {free_gb:.1f} GB free on internal drive.")
+            print(f"WARNING: Only {free_gb:.1f} GB free on internal drive.")
             print(f"   Set RANKINGS_DIR=/Volumes/<SSD>/rankings to use external SSD.")
-        print(f"Output → {RANKINGS_DIR}")
+        print(f"Output -> {RANKINGS_DIR}")
 
-    counties = [args.county] if args.county else get_cached_counties()
+    # Determine county list: --counties list > --county (legacy) > all cached
+    if args.counties:
+        counties = [c.strip() for c in args.counties.split(",") if c.strip()]
+    elif args.county:
+        counties = [args.county]
+    else:
+        counties = get_cached_counties()
+
     if not counties:
         print("No cached counties found. Browse the map in the app to cache crash data.")
         sys.exit(1)
 
-    print(f"Processing {len(counties)} county/counties: {', '.join(counties)}")
+    min_osm = args.min_osm_pct
+    print(f"Processing {len(counties)} county/counties (min OSM {min_osm:.0f}%): {', '.join(counties)}")
     global_stats: dict = {}
     summaries    = []
 
     for county_name in counties:
-        ok, msg = check_county_readiness(county_name)
+        ok, msg = check_county_readiness(county_name, min_osm_pct=min_osm)
         if not ok:
             print(f"  Skipping {county_name}: {msg}")
             continue
@@ -795,7 +835,7 @@ def main():
             print(f"  {n:>5}  {bk}{tag}")
         return
 
-    print("Ranking statewide…")
+    print("Ranking statewide...")
     rankings  = rank_statewide(global_stats)
     n_ranked  = sum(1 for v in rankings.values() if not v.get("insufficient_data"))
     n_sparse  = sum(1 for v in rankings.values() if v.get("insufficient_data"))

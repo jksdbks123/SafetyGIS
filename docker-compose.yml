@@ -6,5 +6,12 @@ services:
     env_file:
       - .env
     volumes:
+      # Cache persists on host filesystem across container rebuilds
       - ./data:/app/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/mapillary/token')"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
