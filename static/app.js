@@ -59,6 +59,11 @@ let G_googleMapsReady = false;
 // Accumulators — deduplicated feature stores
 const OSM_FEATURE_MAP   = new Map();   // String(id) → feature
 const CRASH_FEATURE_MAP = new Map();   // String(id) → feature
+const AADT_FEATURE_MAP  = new Map();   // Number(index) → feature
+
+// AADT data (lazy-loaded on first toggle ON)
+let G_aadtData    = null;
+let G_aadtLoading = false;
 
 // Viewport load timers
 let _crashPollTimer = null;    // polls after background county fetch
@@ -89,6 +94,7 @@ const LAYER_VISIBILITY = {
   streetlamp:         false,
   heatmap:            true,
   crashes:            true,
+  aadt:               false,
   'asset-regulatory': false,
   'asset-warning':    false,
   'asset-info':       false,
@@ -109,6 +115,7 @@ const LAYER_IDS = {
   streetlamp:         ['streetlamp-layer'],
   heatmap:            ['heatmap-layer'],
   crashes:            ['crashes-layer'],
+  aadt:               ['aadt-layer'],
   'asset-regulatory': ['asset-regulatory-layer'],
   'asset-warning':    ['asset-warning-layer'],
   'asset-info':       ['asset-info-layer'],
@@ -122,6 +129,7 @@ const SOURCE_LAYERS = {
   osm:              ['signals-layer', 'crossings-layer', 'bus-layer', 'bike-layer',
                      'roads-layer', 'footway-layer', 'calming-layer', 'streetlamp-layer'],
   crashes:          ['heatmap-layer', 'crashes-layer'],
+  aadt:             ['aadt-layer'],
   'mly-signs-vt':   ['asset-regulatory-layer', 'asset-warning-layer', 'asset-info-layer'],
   'mly-objects-vt': ['asset-crosswalks-layer'],
   'rankings-worst':   ['rankings-worst-line', 'rankings-worst-layer', 'rankings-worst-label'],
@@ -373,6 +381,7 @@ function rebuildLayers() {
 
   addOsmLayers();
   addCrashLayers();
+  addAadtLayers();
   addDrawLayers();
   addRankingsLayers();
 
@@ -570,6 +579,31 @@ function addCrashLayers() {
       'circle-stroke-width': 1.5,
       'circle-stroke-color': '#1f2937',
       'circle-opacity':      ['interpolate', ['linear'], ['zoom'], 12, 0.5, 14, 0.9],
+    },
+  });
+}
+
+// ---- Caltrans AADT layer -----------------------------------------------------
+
+function addAadtLayers() {
+  removeSafe('aadt');
+  if (!G_aadtData) return;   // not loaded yet; will be called again after fetch
+  map.addSource('aadt', { type: 'geojson', data: G_aadtData, generateId: true });
+  map.addLayer({
+    id: 'aadt-layer', type: 'circle', source: 'aadt',
+    paint: {
+      'circle-radius': ['interpolate', ['linear'], ['zoom'], 7, 3, 13, 6, 16, 9],
+      // Color by AADT value: blue(low) → green → amber → red(high)
+      'circle-color': [
+        'step', ['to-number', ['get', 'aadt'], 0],
+        '#60a5fa',         // < 5,000
+        5000,  '#34d399',  // 5,000–25,000
+        25000, '#f59e0b',  // 25,000–60,000
+        60000, '#ef4444',  // > 60,000
+      ],
+      'circle-stroke-width': 1,
+      'circle-stroke-color': '#111827',
+      'circle-opacity': 0.85,
     },
   });
 }
@@ -1482,6 +1516,71 @@ function setupPopups() {
   });
   map.on('mouseenter', 'asset-crosswalks-layer', () => { map.getCanvas().style.cursor = 'pointer'; });
   map.on('mouseleave', 'asset-crosswalks-layer', () => { map.getCanvas().style.cursor = ''; });
+
+  // Caltrans AADT station popup
+  const AADT_SOURCE_LABEL = { mainline: 'Mainline', truck: 'Truck Count', ramp: 'Ramp' };
+  map.on('click', 'aadt-layer', e => {
+    if (G_drawActive) return;
+    // Use in-memory map for full properties (avoids MapLibre truncation of unused props)
+    const renderedId = e.features[0]?.id ?? e.features[0]?.properties?._id;
+    const feat = AADT_FEATURE_MAP.get(Number(renderedId));
+    const p = feat ? feat.properties : (e.features[0]?.properties ?? {});
+
+    const src     = p.source || 'mainline';
+    const route   = `CA-${p.route || '?'}${p.route_sfx || ''}`;
+    const aadtRaw = parseInt(p.aadt || '0');
+    const aadtFmt = aadtRaw > 0 ? aadtRaw.toLocaleString() : '—';
+    const pm      = `${p.pm_pfx || ''}${p.pm != null ? Number(p.pm).toFixed(3) : '—'}${p.pm_sfx || ''}`;
+
+    // AADT color badge
+    const color = aadtRaw >= 60000 ? '#ef4444'
+                : aadtRaw >= 25000 ? '#f59e0b'
+                : aadtRaw >=  5000 ? '#34d399'
+                :                    '#60a5fa';
+
+    let extraRows = '';
+    if (src === 'mainline') {
+      const back  = parseInt(p.back_aadt  || '0');
+      const ahead = parseInt(p.ahead_aadt || '0');
+      if (back  > 0) extraRows += `<div class="popup-row"><span class="popup-key">Back AADT</span><span>${back.toLocaleString()}</span></div>`;
+      if (ahead > 0) extraRows += `<div class="popup-row"><span class="popup-key">Ahead AADT</span><span>${ahead.toLocaleString()}</span></div>`;
+      const bph = parseInt(p.back_peak_hour || '0');
+      const aph = parseInt(p.ahead_peak_hour || '0');
+      const peak = Math.max(bph, aph);
+      if (peak > 0) extraRows += `<div class="popup-row"><span class="popup-key">Peak Hour</span><span>${peak.toLocaleString()} veh/hr</span></div>`;
+    }
+    if (src === 'truck' && p.truck_aadt) {
+      extraRows += `<div class="popup-row"><span class="popup-key">Truck AADT</span><span>${parseInt(p.truck_aadt).toLocaleString()}</span></div>`;
+      extraRows += `<div class="popup-row"><span class="popup-key">Truck %</span><span>${p.truck_pct || '—'}%</span></div>`;
+    }
+
+    popup.setLngLat(e.lngLat).setHTML(`
+      <div class="popup-title">📊 Traffic Volume Station</div>
+      <div class="popup-scroll">
+        <div class="popup-row">
+          <span class="popup-key">Route</span>
+          <span style="font-weight:600">${_esc(route)}</span>
+        </div>
+        <div class="popup-row"><span class="popup-key">County</span><span>${_esc(p.county || '—')}</span></div>
+        <div class="popup-row"><span class="popup-key">Postmile</span><span>${_esc(pm)}</span></div>
+        <div class="popup-row">
+          <span class="popup-key">Location</span>
+          <span style="font-size:0.7rem">${_esc(p.description || '—')}</span>
+        </div>
+        <div class="popup-row" style="margin-top:6px">
+          <span class="popup-key">AADT (2023)</span>
+          <span style="font-weight:700;color:${color}">${aadtFmt} veh/day</span>
+        </div>
+        ${extraRows}
+        <div class="popup-row" style="opacity:0.45;font-size:0.65rem;margin-top:6px">
+          <span class="popup-key">Source</span>
+          <span>Caltrans 2023 · ${_esc(AADT_SOURCE_LABEL[src] || src)}</span>
+        </div>
+      </div>
+    `).addTo(map);
+  });
+  map.on('mouseenter', 'aadt-layer', () => { map.getCanvas().style.cursor = 'pointer'; });
+  map.on('mouseleave', 'aadt-layer', () => { map.getCanvas().style.cursor = ''; });
 }
 
 // ---- Mapillary status --------------------------------------------------------
@@ -1497,6 +1596,36 @@ function setMlyStatus(msg, type) {
 function toggleLayer(key) {
   if (!LAYER_IDS[key]) return;
   LAYER_VISIBILITY[key] = !LAYER_VISIBILITY[key];
+
+  // Lazy-load AADT GeoJSON on first toggle ON
+  if (key === 'aadt' && LAYER_VISIBILITY['aadt'] && !G_aadtData && !G_aadtLoading) {
+    G_aadtLoading = true;
+    const btn = document.getElementById('toggle-aadt');
+    if (btn) btn.textContent = '…';
+    fetch('/api/aadt')
+      .then(r => {
+        if (!r.ok) throw new Error(`AADT fetch failed: ${r.status}`);
+        return r.json();
+      })
+      .then(fc => {
+        // Assign synthetic IDs for in-memory lookup (avoids MapLibre property truncation)
+        fc.features.forEach((f, i) => {
+          f.properties._id = i;
+          AADT_FEATURE_MAP.set(i, f);
+        });
+        G_aadtData = fc;
+        G_aadtLoading = false;
+        if (map.isStyleLoaded()) { addAadtLayers(); applyVisibilityState(); }
+      })
+      .catch(err => {
+        console.error('AADT load failed:', err);
+        G_aadtLoading = false;
+        LAYER_VISIBILITY['aadt'] = false;
+        document.getElementById('row-aadt')?.classList.add('off');
+        if (btn) btn.classList.remove('on');
+      });
+    return;  // UI update happens after fetch completes
+  }
 
   if (LAYER_VISIBILITY[key] && G_hasMly && G_mlyToken) {
     if (['asset-regulatory', 'asset-warning', 'asset-info'].includes(key) && !MLY_ADDED['mly-signs-vt']) {
@@ -2038,13 +2167,37 @@ function addRankingsLayers() {
 
 // One-time click/hover interaction setup for ranking layers (called after map.on('load'))
 function setupRankingInteractions() {
-  const clickLayers = ['rankings-worst-layer', 'rankings-worst-line',
+  const rankPopup = new maplibregl.Popup({
+    closeButton: false,
+    closeOnClick: false,
+    maxWidth: '300px',
+    className: 'rank-hover-popup',
+  });
+
+  const hoverLayers = ['rankings-worst-layer', 'rankings-worst-line',
                        'rankings-best-layer',  'rankings-best-line'];
-  clickLayers.forEach(layerId => {
-    map.on('mouseenter', layerId, () => { map.getCanvas().style.cursor = 'pointer'; });
-    map.on('mouseleave', layerId, () => { map.getCanvas().style.cursor = ''; });
+
+  hoverLayers.forEach(layerId => {
+    map.on('mouseenter', layerId, e => {
+      map.getCanvas().style.cursor = 'pointer';
+      const rawId  = e.features[0]?.properties?.facility_id;
+      const feat   = G_rankWorstMap.get(rawId) ?? G_rankBestMap.get(rawId);
+      const p      = feat ? feat.properties : (e.features[0]?.properties ?? {});
+      rankPopup
+        .setLngLat(e.lngLat)
+        .setHTML(_rankPopupHtml(p))
+        .addTo(map);
+    });
+    map.on('mousemove', layerId, e => {
+      rankPopup.setLngLat(e.lngLat);
+    });
+    map.on('mouseleave', layerId, () => {
+      map.getCanvas().style.cursor = '';
+      rankPopup.remove();
+    });
     map.on('click', layerId, e => {
-      const p   = e.features[0]?.properties ?? {};
+      rankPopup.remove();
+      const p = e.features[0]?.properties ?? {};
       openRankDash(p.facility_id);
       e.stopPropagation();
     });
@@ -2067,59 +2220,68 @@ const G_rankWorstMap = new Map();  // facility_id → GeoJSON Feature
 const G_rankBestMap  = new Map();
 
 function _rankPopupHtml(p) {
-  const name   = p.name || (p.facility_id ? '#' + p.facility_id.replace(/^[nw]/, '') : '—');
-  const county = p.county   || '—';
-  const cls    = p.road_class || p.road_type || '—';
-  const ctrl   = p.road_type || p.control_type || '—';
-  const ftype  = p.facility_type || '—';
-  const speed  = p.speed_mph != null ? p.speed_mph + ' mph' : '—';
-  const lanes  = p.lanes != null ? p.lanes : '—';
-  const aadt   = p.aadt != null ? Number(p.aadt).toLocaleString() : '—';
-  const len_m  = p.length_m != null ? (p.length_m / 1000).toFixed(2) + ' km' : null;
+  const isInt  = (p.facility_type || '') === 'intersection';
+  const name   = p.name || (p.facility_id ? (isInt ? 'Intersection ' : 'Segment ') + '#' + p.facility_id.replace(/^[nw]/, '') : '—');
+  const county = (p.county || '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) || '—';
+  const ftype  = isInt ? 'Intersection' : 'Road Segment';
+
+  // Control label for intersections; raw OSM type for segments
+  const CTRL_LABELS = { traffic_signals: 'Signalized', stop: 'All-Way Stop', give_way: 'Yield',
+                        mini_roundabout: 'Roundabout', uncontrolled: 'Uncontrolled' };
+  const ctrl   = isInt ? (CTRL_LABELS[p.road_type] || p.road_type || '—') : null;
+  const cls    = (p.road_class || '').replace(/\b\w/g, c => c.toUpperCase()) || '—';
+  const speed  = p.speed_mph  > 0  ? p.speed_mph + ' mph' : '—';
+  const lanes  = p.lanes      > 0  ? p.lanes + ' lanes'   : '—';
+  const len_m  = p.length_m   > 0  ? (p.length_m / 1000).toFixed(2) + ' km' : null;
+  const aadt   = p.aadt != null     ? Number(p.aadt).toLocaleString() + ' veh/day' : null;
   const turn   = p.turn_channelization || null;
   const median = p.median_type || null;
 
   const epdo   = typeof p.epdo_score === 'number' ? p.epdo_score.toFixed(1) : '—';
-  const fatal  = p.fatal_5yr  ?? '—';
-  const sev    = p.severe_5yr ?? '—';
-  const oth    = (p.total_5yr != null && p.fatal_5yr != null && p.severe_5yr != null)
-                   ? (p.total_5yr - p.fatal_5yr - p.severe_5yr) : '—';
-  const tot    = p.total_5yr  ?? '—';
+  const fatal  = p.fatal_5yr  ?? 0;
+  const sev    = p.severe_5yr ?? 0;
+  const tot    = p.total_5yr  ?? 0;
+  const oth    = Math.max(0, tot - fatal - sev);
   const rate   = p.crash_rate_yr != null ? p.crash_rate_yr.toFixed(2) + '/yr' : '—';
 
-  const rankW  = p.rank_worst != null ? `<span style="color:#f87171">#${p.rank_worst} worst</span>` : '';
-  const rankB  = p.rank_best  != null ? `<span style="color:#4ade80">#${p.rank_best} best</span>` : '';
-  const rankStr = [rankW, rankB].filter(Boolean).join(' &nbsp; ');
+  const rankW  = p.rank_worst != null ? `<span style="color:#f87171;font-weight:600">#${p.rank_worst} worst</span>` : '';
+  const rankB  = p.rank_best  != null ? `<span style="color:#4ade80;font-weight:600">#${p.rank_best} best</span>` : '';
+  const rankStr = [rankW, rankB].filter(Boolean).join(' &nbsp;·&nbsp; ');
 
   function row(label, val) {
-    if (val == null || val === '—') return '';
-    return `<tr><td style="color:#6b7280;padding-right:8px;white-space:nowrap">${label}</td>
-                <td style="color:#d1d5db">${val}</td></tr>`;
+    if (val == null || val === '—' || val === '') return '';
+    return `<tr>
+      <td style="color:#6b7280;padding-right:10px;white-space:nowrap;vertical-align:top">${label}</td>
+      <td style="color:#d1d5db">${val}</td>
+    </tr>`;
   }
 
-  return `<div style="font-size:0.72rem;line-height:1.5;font-family:inherit">
-    <div style="font-weight:600;color:#fff;margin-bottom:4px;font-size:0.78rem">${name}</div>
-    <div style="color:#9ca3af;margin-bottom:6px;font-size:0.65rem">${county} · ${ftype}</div>
-    ${rankStr ? `<div style="margin-bottom:6px">${rankStr}</div>` : ''}
-    <table style="width:100%;border-collapse:collapse;margin-bottom:6px">
+  return `<div style="font-size:0.72rem;line-height:1.6;font-family:inherit;min-width:200px">
+    <div style="font-weight:700;color:#fff;margin-bottom:2px;font-size:0.8rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:240px">${name}</div>
+    <div style="color:#6b7280;margin-bottom:6px;font-size:0.63rem">${county} &nbsp;·&nbsp; ${ftype}</div>
+    ${rankStr ? `<div style="margin-bottom:6px;font-size:0.72rem">${rankStr}</div>` : ''}
+    <table style="width:100%;border-collapse:collapse;margin-bottom:7px">
+      ${isInt ? row('Control', ctrl) : ''}
       ${row('Road class', cls)}
-      ${row('Control', ctrl)}
       ${row('Speed limit', speed)}
-      ${row('Lanes', lanes)}
-      ${row('AADT', aadt)}
-      ${len_m ? row('Length', len_m) : ''}
-      ${turn  ? row('Turn chan.', turn) : ''}
-      ${median ? row('Median', median) : ''}
+      ${!isInt ? row('Lanes', lanes) : ''}
+      ${len_m  ? row('Length', len_m)  : ''}
+      ${aadt   ? row('AADT',   aadt)   : ''}
+      ${turn   ? row('Turn channelization', turn)  : ''}
+      ${median ? row('Median type', median) : ''}
     </table>
-    <div style="border-top:1px solid #374151;padding-top:5px">
-      <span style="color:#ef4444;font-weight:600">EPDO ${epdo}</span>
-      &nbsp;·&nbsp; <span style="color:#9ca3af">Rate ${rate}</span><br>
-      <span style="color:#fca5a5">Fatal: ${fatal}</span>
-      &nbsp; <span style="color:#fdba74">Severe: ${sev}</span>
-      &nbsp; <span style="color:#9ca3af">Other: ${oth}</span>
-      &nbsp; <span style="color:#6b7280">Total: ${tot}</span>
+    <div style="background:#0f1117;border-radius:4px;padding:6px 8px;border:1px solid #1f2937">
+      <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:3px">
+        <span style="color:#ef4444;font-weight:700;font-size:0.82rem">EPDO ${epdo}</span>
+        <span style="color:#6b7280;font-size:0.63rem">${rate}</span>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:3px;text-align:center">
+        <div><span style="color:#fca5a5;font-weight:600">${fatal}</span><br><span style="color:#4b5563;font-size:0.58rem">FATAL</span></div>
+        <div><span style="color:#fdba74;font-weight:600">${sev}</span><br><span style="color:#4b5563;font-size:0.58rem">SEVERE</span></div>
+        <div><span style="color:#9ca3af;font-weight:600">${tot}</span><br><span style="color:#4b5563;font-size:0.58rem">TOTAL</span></div>
+      </div>
     </div>
-    <div style="margin-top:5px;font-size:0.65rem;color:#6b7280">Click row in panel for full stats</div>
+    <div style="margin-top:5px;font-size:0.62rem;color:#4b5563;text-align:center">Click to open full crash dashboard ›</div>
   </div>`;
 }
 

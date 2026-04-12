@@ -26,6 +26,7 @@ MLY_CACHE   = os.path.join(DATA_DIR, "mapillary_cache")
 OSM_CACHE    = os.path.join(DATA_DIR, "osm_cache")
 CRASH_CACHE  = os.path.join(DATA_DIR, "crash_cache")
 RANKINGS_DIR = os.environ.get("RANKINGS_DIR", os.path.join(DATA_DIR, "rankings"))
+AADT_FILE    = os.path.join(DATA_DIR, "CaltransAADT", "aadt_geocoded.geojson")
 
 os.makedirs(MLY_CACHE,   exist_ok=True)
 os.makedirs(OSM_CACHE,   exist_ok=True)
@@ -402,6 +403,23 @@ def _fetch_tile(x: int, y: int) -> list:
 # ---------------------------------------------------------------------------
 # Static pages
 # ---------------------------------------------------------------------------
+
+@app.get("/api/aadt")
+def get_aadt():
+    """Serve the pre-geocoded Caltrans AADT GeoJSON (all CA state routes)."""
+    if not os.path.exists(AADT_FILE):
+        raise HTTPException(
+            404,
+            "AADT data not found. Run: python scripts/geocode_caltrans_aadt.py"
+        )
+    return FileResponse(AADT_FILE, media_type="application/geo+json")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    from fastapi.responses import Response
+    return Response(status_code=204)
+
 
 @app.get("/")
 def index():
