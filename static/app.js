@@ -2599,73 +2599,121 @@ async function _loadPartyDataForDash(facilityId, collisionIds) {
  * @param {object} gs         — {n, mean, p50, p75, p90, p95}
  */
 function _renderPercentileChart(epdoScore, pct, gs) {
-  const W = 240, H = 28, BAR_H = 10, BAR_Y = 6;
-  const pctToX = p => Math.round(p / 100 * W);
+  // True CDF curve: x-axis = EPDO value, y-axis = cumulative percentile (0–100).
+  // The CDF data is stored as gs.cdf — an array of 21 EPDO values at percentiles
+  // 0, 5, 10, …, 100. We draw the curve as a polyline and mark the facility's
+  // position with a dot + crosshair lines.
+  //
+  // Layout (SVG coordinate system, y increases downward):
+  //   Total SVG: W×H with PAD margins on all sides.
+  //   Plot area: x in [PAD_L, PAD_L+PW], y in [PAD_T, PAD_T+PH]
+  //   x maps EPDO value 0 → xMax into plot width.
+  //   y maps percentile 100 → 0 (top=100%, bottom=0%).
 
-  // Coloured bands
-  const bands = [
-    { from: 0,   to: 50,  color: '#374151' },
-    { from: 50,  to: 75,  color: '#78350f' },
-    { from: 75,  to: 90,  color: '#9a3412' },
-    { from: 90,  to: 95,  color: '#991b1b' },
-    { from: 95,  to: 100, color: '#7f1d1d' },
-  ];
-  let barsHtml = bands.map(b =>
-    `<rect x="${pctToX(b.from)}" y="${BAR_Y}" width="${pctToX(b.to) - pctToX(b.from)}" height="${BAR_H}" fill="${b.color}"/>`
-  ).join('');
+  const W = 260, H = 120;
+  const PAD_L = 28, PAD_R = 10, PAD_T = 14, PAD_B = 22;
+  const PW = W - PAD_L - PAD_R;
+  const PH = H - PAD_T - PAD_B;
 
-  // Tick marks + labels at P50, P75, P90, P95
-  const ticks = [
-    { p: 50,  label: 'P50',  val: gs.p50 },
-    { p: 75,  label: 'P75',  val: gs.p75 },
-    { p: 90,  label: 'P90',  val: gs.p90 },
-    { p: 95,  label: 'P95',  val: gs.p95 },
+  // Use CDF data if available, else fall back to the 4-percentile-point sketch
+  const cdf = gs.cdf;  // array length 21: index i → EPDO at percentile i*5
+  const xMax = (cdf && cdf.length === 21) ? (cdf[20] * 1.05 || 1) : ((gs.p95 || 1) * 1.2);
+
+  const xScale = v => PAD_L + Math.min(PW, Math.max(0, v / xMax * PW));
+  const yScale = p => PAD_T + PH - (p / 100 * PH);  // percentile → SVG y (inverted)
+
+  // --- Background bands (horizontal, by percentile zone) ---
+  const BAND_ZONES = [
+    { from: 0,   to: 50,  fill: '#1f2937' },  // dark gray
+    { from: 50,  to: 75,  fill: '#292524' },  // warm dark
+    { from: 75,  to: 90,  fill: '#3b1a0e' },  // dark amber
+    { from: 90,  to: 95,  fill: '#450a0a' },  // dark red
+    { from: 95,  to: 100, fill: '#3b0000' },  // darkest red
   ];
-  let ticksHtml = ticks.map(t => {
-    const x = pctToX(t.p);
-    return `<line x1="${x}" y1="${BAR_Y - 2}" x2="${x}" y2="${BAR_Y + BAR_H + 2}" stroke="#6b7280" stroke-width="0.8"/>
-      <text x="${x}" y="${BAR_Y + BAR_H + 10}" text-anchor="middle" font-size="6" fill="#6b7280">${t.label}</text>`;
+  let bandsHtml = BAND_ZONES.map(z => {
+    const y1 = yScale(z.to);
+    const y2 = yScale(z.from);
+    return `<rect x="${PAD_L}" y="${y1.toFixed(1)}" width="${PW}" height="${(y2 - y1).toFixed(1)}" fill="${z.fill}"/>`;
   }).join('');
 
-  // Mean indicator (dashed line)
-  const meanPct = gs.p50 != null ? null : null;  // mean position unknown without all values; skip
-  // (we don't store mean's percentile position — just annotate the bar visually)
+  // --- CDF polyline ---
+  let polylineHtml = '';
+  if (cdf && cdf.length === 21) {
+    const pts = cdf.map((epdo, i) => `${xScale(epdo).toFixed(1)},${yScale(i * 5).toFixed(1)}`).join(' ');
+    polylineHtml = `<polyline points="${pts}" fill="none" stroke="#60a5fa" stroke-width="1.5" stroke-linejoin="round"/>`;
+  } else {
+    // Fallback: draw from the 4-point sketch (P50, P75, P90, P95)
+    const fallbackPts = [
+      [0, 0], [gs.p50, 50], [gs.p75, 75], [gs.p90, 90], [gs.p95, 95], [xMax, 100]
+    ].map(([v, p]) => `${xScale(v).toFixed(1)},${yScale(p).toFixed(1)}`).join(' ');
+    polylineHtml = `<polyline points="${fallbackPts}" fill="none" stroke="#60a5fa" stroke-width="1.5" stroke-linejoin="round"/>`;
+  }
 
-  // Facility indicator triangle + EPDO label
-  const indX = pctToX(pct);
-  const DBAND_FG = { critical: '#ef4444', high_priority: '#f97316', elevated: '#facc15',
-                     above_median: '#9ca3af', below_median: '#6b7280' };
-  const band = (epdoScore != null && gs.p95 != null)
-    ? (pct >= 95 ? 'critical' : pct >= 90 ? 'high_priority' : pct >= 75 ? 'elevated' : pct >= 50 ? 'above_median' : 'below_median')
-    : 'above_median';
-  const indColor = DBAND_FG[band] || '#9ca3af';
-  // Downward-pointing triangle at top of bar
-  const triY = BAR_Y - 1;
-  const triSize = 4;
-  const triPts = `${indX},${triY + triSize} ${indX - triSize},${triY - triSize} ${indX + triSize},${triY - triSize}`;
+  // --- Y-axis percentile gridlines + labels at P50, P75, P90, P95 ---
+  const Y_TICKS = [
+    { p: 50, label: 'P50', color: '#6b7280' },
+    { p: 75, label: 'P75', color: '#d97706' },
+    { p: 90, label: 'P90', color: '#ea580c' },
+    { p: 95, label: 'P95', color: '#dc2626' },
+  ];
+  let yTicksHtml = Y_TICKS.map(t => {
+    const y = yScale(t.p);
+    return `<line x1="${PAD_L}" y1="${y.toFixed(1)}" x2="${PAD_L + PW}" y2="${y.toFixed(1)}" stroke="${t.color}" stroke-width="0.6" stroke-dasharray="2,2"/>
+      <text x="${PAD_L - 2}" y="${(y + 2.5).toFixed(1)}" text-anchor="end" font-size="6" fill="${t.color}">${t.label}</text>`;
+  }).join('');
 
-  // EPDO value label near indicator (above if near right edge, else above)
-  const labelAnchor = indX > W - 30 ? 'end' : indX < 30 ? 'start' : 'middle';
-  const labelX = Math.min(W - 2, Math.max(2, indX));
-  const indicatorHtml = `
-    <polygon points="${triPts}" fill="${indColor}"/>
-    <text x="${labelX}" y="${triY - triSize - 2}" text-anchor="${labelAnchor}" font-size="6.5" fill="${indColor}" font-weight="bold">
-      EPDO ${typeof epdoScore === 'number' ? epdoScore.toFixed(1) : epdoScore} · P${Math.round(pct)}
-    </text>`;
+  // --- X-axis EPDO value labels (0, max) ---
+  const xAxisHtml = `
+    <line x1="${PAD_L}" y1="${PAD_T + PH}" x2="${PAD_L + PW}" y2="${PAD_T + PH}" stroke="#4b5563" stroke-width="0.6"/>
+    <line x1="${PAD_L}" y1="${PAD_T}" x2="${PAD_L}" y2="${PAD_T + PH}" stroke="#4b5563" stroke-width="0.6"/>
+    <text x="${PAD_L}" y="${PAD_T + PH + 9}" text-anchor="middle" font-size="6" fill="#6b7280">0</text>
+    <text x="${PAD_L + PW}" y="${PAD_T + PH + 9}" text-anchor="end" font-size="6" fill="#6b7280">${xMax.toFixed(0)}</text>
+    <text x="${PAD_L + PW / 2}" y="${H - 2}" text-anchor="middle" font-size="6" fill="#4b5563">EPDO →</text>
+    <text x="6" y="${PAD_T + PH / 2}" text-anchor="middle" font-size="6" fill="#4b5563" transform="rotate(-90,6,${PAD_T + PH / 2})">%ile</text>`;
 
-  // Scale labels: 0 and 100 at ends
-  const scaleHtml = `
-    <text x="1" y="${BAR_Y + BAR_H + 10}" text-anchor="start" font-size="6" fill="#4b5563">0</text>
-    <text x="${W - 1}" y="${BAR_Y + BAR_H + 10}" text-anchor="end" font-size="6" fill="#4b5563">100</text>`;
+  // --- Facility position: dot + crosshair lines ---
+  const BAND_COLORS = { critical: '#ef4444', high_priority: '#f97316', elevated: '#facc15',
+                        above_median: '#9ca3af', below_median: '#6b7280' };
+  const band = pct >= 95 ? 'critical' : pct >= 90 ? 'high_priority' : pct >= 75 ? 'elevated'
+             : pct >= 50 ? 'above_median' : 'below_median';
+  const dotColor = BAND_COLORS[band];
+  const dotX = xScale(epdoScore);
+  const dotY = yScale(pct);
 
-  return `<div style="padding:4px 0 8px;overflow:hidden">
-    <svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" style="display:block;overflow:visible">
-      ${barsHtml}${ticksHtml}${indicatorHtml}${scaleHtml}
+  // Crosshairs: dashed lines to axes
+  const crosshairHtml = `
+    <line x1="${PAD_L}" y1="${dotY.toFixed(1)}" x2="${dotX.toFixed(1)}" y2="${dotY.toFixed(1)}"
+          stroke="${dotColor}" stroke-width="0.8" stroke-dasharray="2,2" opacity="0.7"/>
+    <line x1="${dotX.toFixed(1)}" y1="${dotY.toFixed(1)}" x2="${dotX.toFixed(1)}" y2="${PAD_T + PH}"
+          stroke="${dotColor}" stroke-width="0.8" stroke-dasharray="2,2" opacity="0.7"/>`;
+
+  // Dot on curve
+  const dotHtml = `<circle cx="${dotX.toFixed(1)}" cy="${dotY.toFixed(1)}" r="3.5"
+    fill="${dotColor}" stroke="#111827" stroke-width="1"/>`;
+
+  // Label: "EPDO X.X · P{nn}" positioned above-right of dot, shifting left if near edge
+  const labelX = dotX > PAD_L + PW - 40 ? dotX - 3 : dotX + 3;
+  const labelAnchor = dotX > PAD_L + PW - 40 ? 'end' : 'start';
+  const labelY = dotY < PAD_T + 12 ? dotY + 10 : dotY - 5;
+  const labelHtml = `<text x="${labelX.toFixed(1)}" y="${labelY.toFixed(1)}"
+    text-anchor="${labelAnchor}" font-size="6.5" fill="${dotColor}" font-weight="bold">
+    EPDO ${typeof epdoScore === 'number' ? epdoScore.toFixed(1) : epdoScore} · P${Math.round(pct)}
+  </text>`;
+
+  return `<div style="padding:4px 0 6px">
+    <svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" style="display:block">
+      ${bandsHtml}
+      ${xAxisHtml}
+      ${yTicksHtml}
+      ${polylineHtml}
+      ${crosshairHtml}
+      ${dotHtml}
+      ${labelHtml}
     </svg>
-    <div style="font-size:0.58rem;color:#4b5563;line-height:1.7;margin-top:2px">
-      Peer group mean EPDO: <span style="color:#9ca3af">${gs.mean}</span> &nbsp;·&nbsp;
-      Median (P50): <span style="color:#9ca3af">${gs.p50}</span> &nbsp;·&nbsp;
-      n = <span style="color:#9ca3af">${gs.n.toLocaleString()}</span>
+    <div style="font-size:0.58rem;color:#4b5563;line-height:1.7;margin-top:1px">
+      Peer group — n=<span style="color:#9ca3af">${gs.n.toLocaleString()}</span>
+      &nbsp;·&nbsp; Mean: <span style="color:#9ca3af">${gs.mean}</span>
+      &nbsp;·&nbsp; Median (P50): <span style="color:#9ca3af">${gs.p50}</span>
     </div>
   </div>`;
 }

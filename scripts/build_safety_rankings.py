@@ -935,6 +935,11 @@ def rank_statewide(global_stats: dict) -> dict:
         p90  = _pct(epdo_vals, 90)
         p95  = _pct(epdo_vals, 95)
 
+        # CDF curve points at every 5th percentile (21 points: 0, 5, 10, ..., 100)
+        # Stored as [epdo_value, ...] indexed by percentile/5, so frontend can draw
+        # a true cumulative distribution curve without fetching all raw values.
+        cdf_vals = [round(_pct(epdo_vals, p), 3) for p in range(0, 101, 5)]
+
         group_stats = {
             "n":    n,
             "mean": round(mean_epdo, 2),
@@ -942,6 +947,8 @@ def rank_statewide(global_stats: dict) -> dict:
             "p75":  round(p75, 2),
             "p90":  round(p90, 2),
             "p95":  round(p95, 2),
+            "max":  round(epdo_vals[-1], 2),
+            "cdf":  cdf_vals,   # index i → EPDO at percentile i*5
         }
 
         # Assign per-facility percentile rank
