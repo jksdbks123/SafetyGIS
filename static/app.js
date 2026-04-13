@@ -1145,13 +1145,7 @@ function setupPanelInteractions() {
     _initPanelInteractive(panelEl, panelHandle, { minW: 200, minH: 160 });
   }
 
-  // #analysis-panel — drag by its dedicated drag bar
-  const anaEl = document.getElementById('analysis-panel');
-  const anaHandle = document.getElementById('analysis-drag-bar');
-  if (anaEl && anaHandle) {
-    _initPanelInteractive(anaEl, anaHandle, { minW: 220, minH: 200 });
-  }
-
+  // #analysis-panel — lazy-init on first switch to analysis mode (see setAppMode)
   // #rank-dash-panel — initialized on first open (see openRankDash)
 }
 
@@ -3047,9 +3041,11 @@ function openRankDash(facilityId) {
   const rdPanel = document.getElementById('rank-dash-panel');
   rdPanel.classList.add('open');
   if (!_rankDashInited) {
-    _initPanelInteractive(rdPanel, document.getElementById('rank-dash-header'),
-      { minW: 280, minH: 200 });
     _rankDashInited = true;
+    requestAnimationFrame(() => {
+      _initPanelInteractive(rdPanel, document.getElementById('rank-dash-header'),
+        { minW: 280, minH: 200 });
+    });
   }
   // Async: fetch party data and populate direction rose + movement pairs
   _loadPartyDataForDash(facilityId, collisionIds);
@@ -3256,6 +3252,13 @@ function setAppMode(mode) {
   if (inspPanel) inspPanel.style.display = isAnalysis ? 'none' : 'block';
   if (anaPanel)  anaPanel.classList.toggle('hidden', !isAnalysis);
 
+  // Lazy-init analysis panel drag/resize on first show (can't init while hidden)
+  if (isAnalysis && anaPanel && !anaPanel._piInited) {
+    requestAnimationFrame(() => {
+      _initPanelInteractive(anaPanel, document.getElementById('analysis-drag-bar'),
+        { minW: 220, minH: 200 });
+    });
+  }
 
   if (isAnalysis) {
     clearTimeout(_viewportTimer);
