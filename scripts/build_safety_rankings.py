@@ -126,7 +126,8 @@ SEGMENT_R      = 30.0   # crash → way
 LEG_COUNT_R    = 30.0   # way endpoint → node (for leg count)
 SNAP_R         = 25.0   # infra node → centroid (for control-type derivation)
 
-MIN_FACILITIES = 20   # minimum per bin to produce rankings
+MIN_FACILITIES   = 20     # minimum per bin to produce rankings
+MIN_SEG_LENGTH_M = 100.0  # exclude segments shorter than 100 m (stubs inside intersection zones)
 LIST_N         = 20   # facilities returned in top-by-EPDO list per bin
 
 # ---------------------------------------------------------------------------
@@ -723,6 +724,12 @@ def process_county(county_name: str, global_stats: dict,
 
         sevs    = crash_map.get(fid, [])
         is_node = (fac["geom_type"] == "Point")
+
+        # Skip segments shorter than MIN_SEG_LENGTH_M — these are connector stubs,
+        # ramp gore tips, or service road entries that physically overlap an
+        # intersection zone and attract its crashes, inflating EPDO.
+        if not is_node and fac.get("length_m", 0) < MIN_SEG_LENGTH_M:
+            continue
 
         if is_node:
             idx     = node_ids.index(fid)

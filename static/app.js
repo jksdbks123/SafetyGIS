@@ -207,6 +207,7 @@ map.on('load', async () => {
   setupDraw();
   setupPegman();
   setupRankingInteractions();
+  setupPanelInteractions();
   // Wire up AI input Enter key
   document.getElementById('ai-input').addEventListener('keydown', e => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendAiQuery(); }
@@ -1135,6 +1136,25 @@ function loadGoogleMapsAPI(key) {
   document.head.appendChild(s);
 }
 
+function setupPanelInteractions() {
+  // Make always-visible panels draggable and resizable.
+  // #panel (inspect mode) — drag by the "Layer Controls" h2 heading
+  const panelEl = document.getElementById('panel');
+  const panelHandle = panelEl && panelEl.querySelector('h2');
+  if (panelEl && panelHandle) {
+    _initPanelInteractive(panelEl, panelHandle, { minW: 200, minH: 160 });
+  }
+
+  // #analysis-panel — drag by its dedicated drag bar
+  const anaEl = document.getElementById('analysis-panel');
+  const anaHandle = document.getElementById('analysis-drag-bar');
+  if (anaEl && anaHandle) {
+    _initPanelInteractive(anaEl, anaHandle, { minW: 220, minH: 200 });
+  }
+
+  // #rank-dash-panel — initialized on first open (see openRankDash)
+}
+
 function setupPegman() {
   const btn = document.getElementById('pegman-btn');
   if (!btn) return;
@@ -1195,12 +1215,94 @@ function cancelPegmanMode() {
   if (hint) hint.textContent = 'Drag 🟡 person to map for Street View';
 }
 
+// ---------------------------------------------------------------------------
+// Panel drag + resize (shared utility for all floating panels)
+// ---------------------------------------------------------------------------
+
+/**
+ * Make a panel draggable by its header and resizable at its edges/corners.
+ * Works for panels that are position:absolute or position:fixed.
+ * Call once per panel; safe to call again (guards with _piInited flag).
+ *
+ * @param {HTMLElement} panelEl  — the panel root
+ * @param {HTMLElement} handleEl — drag handle (header bar / h2 element)
+ * @param {{ minW?: number, minH?: number }} opts
+ */
+function _initPanelInteractive(panelEl, handleEl, { minW = 180, minH = 120 } = {}) {
+  if (panelEl._piInited) return;
+  panelEl._piInited = true;
+
+  // Snapshot explicit size so position:absolute bottom/right handles work correctly
+  if (!panelEl.style.width)  panelEl.style.width  = panelEl.offsetWidth  + 'px';
+  if (!panelEl.style.height) panelEl.style.height = panelEl.offsetHeight + 'px';
+  panelEl.style.maxHeight = 'none';
+  panelEl.style.maxWidth  = 'none';
+
+  // ── Drag by header ───────────────────────────────────────────────────────
+  let dragOffX = 0, dragOffY = 0, dragging = false;
+  handleEl.style.cursor = 'move';
+  handleEl.addEventListener('mousedown', e => {
+    if (e.button !== 0) return;
+    const r = panelEl.getBoundingClientRect();
+    dragOffX = e.clientX - r.left;
+    dragOffY = e.clientY - r.top;
+    dragging = true;
+    e.preventDefault();
+  });
+  document.addEventListener('mousemove', e => {
+    if (!dragging) return;
+    const x = Math.max(0, Math.min(window.innerWidth  - 40, e.clientX - dragOffX));
+    const y = Math.max(0, Math.min(window.innerHeight - 40, e.clientY - dragOffY));
+    panelEl.style.left   = x + 'px';
+    panelEl.style.top    = y + 'px';
+    panelEl.style.right  = 'auto';
+    panelEl.style.bottom = 'auto';
+  });
+  document.addEventListener('mouseup', () => { dragging = false; });
+
+  // ── Resize handles ───────────────────────────────────────────────────────
+  function addResizeHandle(cls, onMove) {
+    const h = document.createElement('div');
+    h.className = cls;
+    panelEl.appendChild(h);
+    let resizing = false, sX, sY, sW, sH;
+    h.addEventListener('mousedown', e => {
+      if (e.button !== 0) return;
+      resizing = true;
+      sX = e.clientX; sY = e.clientY;
+      sW = panelEl.offsetWidth; sH = panelEl.offsetHeight;
+      e.preventDefault(); e.stopPropagation();
+    });
+    document.addEventListener('mousemove', e => {
+      if (!resizing) return;
+      onMove(e.clientX - sX, e.clientY - sY, sW, sH);
+    });
+    document.addEventListener('mouseup', () => { resizing = false; });
+  }
+
+  addResizeHandle('panel-resize-e',  (dx, dy, sW)      => { panelEl.style.width  = Math.max(minW, sW + dx) + 'px'; });
+  addResizeHandle('panel-resize-s',  (dx, dy, sW, sH)  => { panelEl.style.height = Math.max(minH, sH + dy) + 'px'; });
+  addResizeHandle('panel-resize-se', (dx, dy, sW, sH)  => {
+    panelEl.style.width  = Math.max(minW, sW + dx) + 'px';
+    panelEl.style.height = Math.max(minH, sH + dy) + 'px';
+  });
+}
+
+// One-time init flags for lazily-opened panels
+let _mlyPanelInited  = false;
+let _helpPanelInited = false;
+let _rankDashInited  = false;
+
 function showStreetView(lat, lng) {
   const panel       = document.getElementById('mly-panel');
   const panoDiv     = document.getElementById('sv-pano');
   const placeholder = document.getElementById('sv-placeholder');
 
-  panel.classList.add('open');
+  panel.style.display = 'flex';
+  if (!_mlyPanelInited) {
+    _initPanelInteractive(panel, document.getElementById('mly-header'), { minW: 280, minH: 280 });
+    _mlyPanelInited = true;
+  }
   panoDiv.innerHTML         = '';
   placeholder.style.display = 'flex';
   placeholder.textContent   = 'Loading Street View…';
@@ -1241,22 +1343,22 @@ function showStreetView(lat, lng) {
 }
 
 function closeSidePanel() {
-  document.getElementById('mly-panel').classList.remove('open');
+  document.getElementById('mly-panel').style.display = 'none';
 }
 
 function openHelpPanel() {
-  document.getElementById('help-panel').classList.add('open');
+  const panel = document.getElementById('help-panel');
+  panel.style.display = 'flex';
+  if (!_helpPanelInited) {
+    _initPanelInteractive(panel, document.getElementById('help-header'), { minW: 320, minH: 350 });
+    _helpPanelInited = true;
+  }
 }
 
 function closeHelpPanel() {
-  document.getElementById('help-panel').classList.remove('open');
+  document.getElementById('help-panel').style.display = 'none';
 }
 
-// ---- Stats ribbon ------------------------------------------------------------
-
-function toggleStatsRibbon() {
-  document.getElementById('stats-ribbon').classList.toggle('open');
-}
 
 // ---- Crash detail (Parties & Victims) helpers --------------------------------
 
@@ -2668,8 +2770,8 @@ function _renderPercentileChart(epdoScore, pct, gs) {
     <line x1="${PAD_L}" y1="${PAD_T}" x2="${PAD_L}" y2="${PAD_T + PH}" stroke="#4b5563" stroke-width="0.6"/>
     <text x="${PAD_L}" y="${PAD_T + PH + 9}" text-anchor="middle" font-size="6" fill="#6b7280">0</text>
     <text x="${PAD_L + PW}" y="${PAD_T + PH + 9}" text-anchor="end" font-size="6" fill="#6b7280">${xMax.toFixed(0)}</text>
-    <text x="${PAD_L + PW / 2}" y="${H - 2}" text-anchor="middle" font-size="6" fill="#4b5563">EPDO →</text>
-    <text x="6" y="${PAD_T + PH / 2}" text-anchor="middle" font-size="6" fill="#4b5563" transform="rotate(-90,6,${PAD_T + PH / 2})">%ile</text>`;
+    <text x="${PAD_L + PW / 2}" y="${H - 2}" text-anchor="middle" font-size="7.5" fill="#6b7280">EPDO →</text>
+    <text x="6" y="${PAD_T + PH / 2}" text-anchor="middle" font-size="7.5" fill="#6b7280" transform="rotate(-90,6,${PAD_T + PH / 2})">%ile</text>`;
 
   // --- Facility position: dot + crosshair lines ---
   const BAND_COLORS = { critical: '#ef4444', high_priority: '#f97316', elevated: '#facc15',
@@ -2696,7 +2798,7 @@ function _renderPercentileChart(epdoScore, pct, gs) {
   const labelAnchor = dotX > PAD_L + PW - 40 ? 'end' : 'start';
   const labelY = dotY < PAD_T + 12 ? dotY + 10 : dotY - 5;
   const labelHtml = `<text x="${labelX.toFixed(1)}" y="${labelY.toFixed(1)}"
-    text-anchor="${labelAnchor}" font-size="6.5" fill="${dotColor}" font-weight="bold">
+    text-anchor="${labelAnchor}" font-size="5.5" fill="${dotColor}" font-weight="bold">
     EPDO ${typeof epdoScore === 'number' ? epdoScore.toFixed(1) : epdoScore} · P${Math.round(pct)}
   </text>`;
 
@@ -2942,7 +3044,13 @@ function openRankDash(facilityId) {
   }
 
   document.getElementById('rank-dash-body').innerHTML = html;
-  document.getElementById('rank-dash-panel').classList.add('open');
+  const rdPanel = document.getElementById('rank-dash-panel');
+  rdPanel.classList.add('open');
+  if (!_rankDashInited) {
+    _initPanelInteractive(rdPanel, document.getElementById('rank-dash-header'),
+      { minW: 280, minH: 200 });
+    _rankDashInited = true;
+  }
   // Async: fetch party data and populate direction rose + movement pairs
   _loadPartyDataForDash(facilityId, collisionIds);
 }

@@ -83,21 +83,9 @@
     #ai-response::-webkit-scrollbar { width: 3px; }
     #ai-response::-webkit-scrollbar-thumb { background: #374151; border-radius: 2px; }
 
-    /* ── Stats ribbon (collapsible) ── */
-    #stats-ribbon { flex-shrink: 0; background: #1a1d2e; border-top: 1px solid #2a2d3e; cursor: pointer; }
-    #stats-tab { display: flex; align-items: center; justify-content: center; gap: 6px; height: 22px; font-size: 0.65rem; color: #6b7280; letter-spacing: 0.06em; text-transform: uppercase; user-select: none; transition: color 0.15s; }
-    #stats-tab:hover { color: #e0e0e0; }
-    #stats-tab .tab-arrow { font-size: 0.6rem; transition: transform 0.2s; }
-    #stats-ribbon.open #stats-tab .tab-arrow { transform: rotate(180deg); }
-    #stats { display: flex; gap: 8px; overflow: hidden; max-height: 0; transition: max-height 0.25s ease, padding 0.25s ease; padding: 0 12px; }
-    #stats-ribbon.open #stats { max-height: 70px; padding: 8px 12px; }
-    .stat-card { flex: 1; }
-    .stat-card .val { font-size: 1.1rem; font-weight: 700; color: #fff; }
-    .stat-card .lbl { font-size: 0.62rem; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em; }
 
-    /* ── Street View side panel ── */
-    #mly-panel { width: 0; background: #1a1d2e; border-left: 1px solid #2a2d3e; overflow: hidden; transition: width 0.25s ease; display: flex; flex-direction: column; flex-shrink: 0; }
-    #mly-panel.open { width: 360px; }
+    /* ── Street View floating panel ── */
+    #mly-panel { position: fixed; right: 12px; top: 56px; width: 360px; min-height: 380px; background: #1a1d2e; border: 1px solid #2a2d3e; border-radius: 8px; display: none; flex-direction: column; z-index: 30; overflow: hidden; }
     #mly-header { padding: 12px 14px; border-bottom: 1px solid #2a2d3e; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
     #mly-header h3 { font-size: 0.85rem; font-weight: 600; color: #fff; }
     #mly-close { background: none; border: none; color: #6b7280; font-size: 1.1rem; cursor: pointer; padding: 2px 6px; border-radius: 4px; }
@@ -144,9 +132,8 @@
     .crash-filter-row label:hover { color: #9ca3af; }
     .crash-filter-row input[type="checkbox"] { accent-color: #3b82f6; width: 11px; height: 11px; flex-shrink: 0; }
 
-    /* ── Help side panel ── */
-    #help-panel { width: 0; background: #1a1d2e; border-left: 1px solid #2a2d3e; overflow: hidden; transition: width 0.25s ease; display: flex; flex-direction: column; flex-shrink: 0; }
-    #help-panel.open { width: 420px; }
+    /* ── Help floating panel ── */
+    #help-panel { position: fixed; right: 12px; top: 56px; width: 420px; min-height: 480px; background: #1a1d2e; border: 1px solid #2a2d3e; border-radius: 8px; display: none; flex-direction: column; z-index: 30; overflow: hidden; }
     #help-header { padding: 12px 14px; border-bottom: 1px solid #2a2d3e; display: flex; align-items: center; justify-content: space-between; flex-shrink: 0; }
     #help-header h3 { font-size: 0.85rem; font-weight: 600; color: #fff; }
     #help-close { background: none; border: none; color: #6b7280; font-size: 1.1rem; cursor: pointer; padding: 2px 6px; border-radius: 4px; }
@@ -320,6 +307,12 @@
     #analysis-panel { position: absolute; top: 12px; left: 12px; width: 272px; background: rgba(26,29,46,0.97); border: 1px solid #2a2d3e; border-radius: 8px; padding: 12px; z-index: 10; backdrop-filter: blur(6px); max-height: calc(100vh - 80px); overflow-y: auto; scrollbar-width: thin; scrollbar-color: #374151 transparent; }
     #analysis-panel::-webkit-scrollbar { width: 4px; }
     #analysis-panel::-webkit-scrollbar-thumb { background: #374151; border-radius: 2px; }
+    /* ── Drag/resize handles ── */
+    .panel-drag-bar { height: 20px; display: flex; align-items: center; justify-content: center; cursor: move; color: #374151; font-size: 0.6rem; letter-spacing: 3px; user-select: none; margin: -12px -12px 8px; border-bottom: 1px solid #2a2d3e; border-radius: 8px 8px 0 0; background: rgba(255,255,255,0.03); flex-shrink: 0; }
+    .panel-drag-bar:hover { color: #6b7280; background: rgba(255,255,255,0.06); }
+    .panel-resize-e  { position: absolute; top: 0; right: 0; width: 5px; height: 100%; cursor: ew-resize; z-index: 100; }
+    .panel-resize-s  { position: absolute; bottom: 0; left: 0; right: 0; height: 5px; cursor: ns-resize; z-index: 100; }
+    .panel-resize-se { position: absolute; bottom: 0; right: 0; width: 12px; height: 12px; cursor: nwse-resize; z-index: 101; }
     #btn-mode-inspect.ana-active  { background: transparent; color: #6b7280; }
     #btn-mode-analysis.ana-active { background: #7c3aed; color: #fff; }
     /* County list */
@@ -638,6 +631,7 @@
          Shown when G_appMode === 'analysis'
          ═══════════════════════════════════════════════ -->
     <div id="analysis-panel" class="hidden">
+      <div class="panel-drag-bar" id="analysis-drag-bar">&#xB7;&#xB7;&#xB7;&#xB7;&#xB7;&#xB7;</div>
 
       <!-- ── 1. County Download Grid ── -->
       <div class="layer-group">
@@ -962,16 +956,6 @@
   </div>
 </div>
 
-<!-- Stats ribbon — spans full width below the map row -->
-<div id="stats-ribbon" onclick="toggleStatsRibbon()">
-  <div id="stats-tab"><span class="tab-arrow">&#9650;</span> Stats</div>
-  <div id="stats">
-    <div class="stat-card"><div class="val" id="stat-signals">—</div><div class="lbl">Traffic Signals</div></div>
-    <div class="stat-card"><div class="val" id="stat-crossings">—</div><div class="lbl">Crosswalks</div></div>
-    <div class="stat-card"><div class="val" id="stat-crashes-total">—</div><div class="lbl">Crash Records</div></div>
-    <div class="stat-card"><div class="val" id="stat-fatal">—</div><div class="lbl">Fatal Crashes</div></div>
-  </div>
-</div>
 
 <!-- Data source info modal -->
 <div id="data-info-modal" class="hidden" onclick="closeDataInfo()">
