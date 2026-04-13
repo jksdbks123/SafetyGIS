@@ -73,7 +73,13 @@ python scripts/fetch_crash_data.py
 # Re-fetch OSM infrastructure from Overpass API (writes to data/osm_cache/)
 python scripts/fetch_osm.py
 
+# Assign Caltrans AADT to every OSM road segment (run once after fetch_osm / new AADT data)
+# Output: data/CaltransAADT/osm_aadt_lookup.json  (required by build_safety_rankings.py)
+python scripts/assign_aadt_to_osm.py
+python scripts/assign_aadt_to_osm.py --mainline-radius 2000 --ramp-radius 500
+
 # Compute safety rankings (EPDO spatial join, peer-group bins, outputs to data/rankings/)
+# Requires osm_aadt_lookup.json to populate aadt field on facilities
 python scripts/build_safety_rankings.py --counties sacramento,humboldt
 python scripts/build_safety_rankings.py --counties all --min-osm-pct 80
 python scripts/build_safety_rankings.py --weights 10,2,0.2   # fatal,injury,PDO
@@ -158,25 +164,47 @@ On basemap switch, `map.setStyle()` replaces the entire style. A permanent `map.
 
 ## Lessons Learned
 
-### Overpass API — always use `out geom;`
+### Overpass API — `out geom;` vs. `out body; >; out skel qt;`
 
-**Never** use `out body; >; out skel qt;` for queries that include `way` elements. That format returns way elements first (with node ID references but no coordinates), then resolves nodes afterward. A single-pass parser will have an empty `nodes` dict when it hits the way elements, silently dropping every line feature.
+The choice of output format depends on whether you need **node-ID connectivity** within ways:
 
-**Always use `out geom;`** — it embeds coordinates directly in each element:
-```
-# CORRECT
-out geom;
-
-# WRONG — breaks single-pass parsing, drops all ways
-out body;
->;
-out skel qt;
-```
-
-Way coordinate extraction with `out geom;`:
+**`out geom;`** — embeds coordinates directly in each element. Simple single-pass parsing.
+Use when you only need geometry (no topology). Way coordinate extraction:
 ```python
 coords = [(g["lon"], g["lat"]) for g in el.get("geometry", []) if g]
 ```
+
+**`out body; >; out skel qt;`** — returns way node-ID lists + resolves all referenced node
+coordinates separately. Recovers topological connectivity (which ways share which nodes).
+**Requires two-pass parsing** — the response intermingles tagged nodes, ways (with `nodes`
+arrays but no coordinates), and untagged skel nodes. A single-pass parser will have an empty
+`nodes_dict` when it hits way elements, silently dropping every line feature.
+
+Two-pass pattern used in `_osm_tile_features()`:
+```python
+# Pass 1: collect ALL node coordinates (tagged + skel)
+nodes_dict = {}
+tagged_nodes = []
+for el in elements:
+    if el["type"] == "node":
+        nodes_dict[el["id"]] = (el["lon"], el["lat"])
+        if el.get("tags"):
+            tagged_nodes.append(el)
+
+# Pass 2: process ways, reconstruct geometry from node IDs, track degree
+node_degree = {}
+for el in elements:
+    if el["type"] == "way":
+        coords = [(nodes_dict[n][0], nodes_dict[n][1])
+                  for n in el.get("nodes", []) if n in nodes_dict]
+        # count node references to identify intersection centroids
+        for nid in el.get("nodes", []):
+            node_degree[nid] = node_degree.get(nid, 0) + 1
+```
+
+The current `_osm_tile_features()` uses `out body; >; out skel qt;` to derive intersection
+centroids (nodes shared by 2+ rankable road ways) and stores them as `type=intersection_centroid`
+features in the tile cache.
 
 ### Overpass API — 429 rate limit handling
 

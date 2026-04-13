@@ -31,12 +31,29 @@ from shapely.strtree import STRtree
 # Paths
 # ---------------------------------------------------------------------------
 
-BASE_DIR     = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CRASH_CACHE  = os.path.join(BASE_DIR, "data", "crash_cache")
-OSM_CACHE    = os.path.join(BASE_DIR, "data", "osm_cache")
-RANKINGS_DIR = os.environ.get("RANKINGS_DIR",
-                              os.path.join(BASE_DIR, "data", "rankings"))
-OSM_ZOOM     = 12
+BASE_DIR       = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+CRASH_CACHE    = os.path.join(BASE_DIR, "data", "crash_cache")
+OSM_CACHE      = os.path.join(BASE_DIR, "data", "osm_cache")
+RANKINGS_DIR   = os.environ.get("RANKINGS_DIR",
+                                os.path.join(BASE_DIR, "data", "rankings"))
+AADT_LOOKUP_FILE = os.path.join(BASE_DIR, "data", "CaltransAADT", "osm_aadt_lookup.json")
+OSM_ZOOM       = 12
+
+
+def _load_aadt_lookup() -> dict:
+    """
+    Load osm_aadt_lookup.json produced by assign_aadt_to_osm.py.
+    Returns {str(osm_id): aadt_value} or empty dict if file absent.
+    Logs a warning when missing so operators know to run the prerequisite script.
+    """
+    if not os.path.exists(AADT_LOOKUP_FILE):
+        print("  [AADT] osm_aadt_lookup.json not found — AADT will be null for all facilities.")
+        print("         Run: python scripts/assign_aadt_to_osm.py")
+        return {}
+    with open(AADT_LOOKUP_FILE, encoding="utf-8") as f:
+        raw = json.load(f)
+    # raw keys are str(osm_id); values are {aadt, method, distance_m}
+    return {k: v["aadt"] for k, v in raw.items()}
 
 # ---------------------------------------------------------------------------
 # EPDO weights  (FHWA Highway Safety Manual)
@@ -87,7 +104,7 @@ ROAD_CLASS = {
 ROAD_CLASS_ORDER = ["highway", "arterial", "collector", "local"]
 
 RANKABLE_WAY_TYPES  = set(ROAD_CLASS.keys())
-# Node types ranked as intersection facilities
+# Infrastructure node types — used for control-type lookup, NOT as ranked facilities
 RANKABLE_NODE_TYPES = {"traffic_signals", "stop", "give_way"}
 
 # Control type label for each node type
@@ -103,9 +120,10 @@ DEFAULT_SPEED = {"highway": 65, "arterial": 45, "collector": 35, "local": 25}
 DEFAULT_LANES = {"highway": 4,  "arterial": 2,  "collector": 2,  "local": 2}
 
 # Search radii in metres (projected coordinates)
-INTERSECTION_R = 50.0   # crash → node
+INTERSECTION_R = 50.0   # crash → centroid node
 SEGMENT_R      = 30.0   # crash → way
 LEG_COUNT_R    = 30.0   # way endpoint → node (for leg count)
+SNAP_R         = 25.0   # infra node → centroid (for control-type derivation)
 
 MIN_FACILITIES = 20   # minimum per bin to produce rankings
 TOP_N          = 10   # worst / best count
@@ -281,6 +299,27 @@ def _way_length_m(coords: list) -> float:
 # Data loading
 # ---------------------------------------------------------------------------
 
+def _classify_conflict(p: dict) -> str:
+    """Derive conflict type from crash-level properties (no party data needed)."""
+    ct   = (p.get("collision_type_description") or "").upper().strip()
+    mveh = (p.get("motorvehicleinvolvedwithdesc") or "").upper().strip()
+    if "PEDESTRIAN" in ct or mveh == "PEDESTRIAN":
+        return "ped_veh"
+    if mveh == "BICYCLE":
+        return "bike_veh"
+    if ct == "BROADSIDE":
+        return "angle"
+    if ct == "REAR END":
+        return "rear_end"
+    if ct == "HEAD-ON":
+        return "head_on"
+    if "SIDE SWIPE" in ct or "SIDESWIPE" in ct:
+        return "sideswipe"
+    if ct == "OVERTURNED":
+        return "overturn"
+    return "other"
+
+
 def load_crashes(county_name: str) -> list:
     """Return list of crash dicts within YEAR_WINDOW with slim properties for dashboard."""
     path = os.path.join(CRASH_CACHE, f"{county_name}.geojson")
@@ -312,11 +351,15 @@ def load_crashes(county_name: str) -> list:
             "day":            p.get("day_of_week", ""),
             "ped":            bool(p.get("has_pedestrian")),
             "cyc":            bool(p.get("has_cyclist")),
-            "imp":            bool(p.get("has_impaired")),
+            "imp":            bool(p.get("has_impaired")),   # absent in cache; always False
             "collision_type": (p.get("collision_type_description") or "Unknown")[:40],
             "road_cond":      (p.get("road_condition_1") or "Unknown")[:40],
             "mveh":           (p.get("motorvehicleinvolvedwithdesc") or "Unknown")[:40],
             "hour":           hour,
+            # Enrichment fields
+            "isfreeway":      bool(p.get("isfreeway")),
+            "conflict_type":  _classify_conflict(p),
+            "collision_id":   str(p.get("collision_id") or p.get("id") or ""),
         })
     return result
 
@@ -333,10 +376,11 @@ def load_osm_tile(x: int, y: int) -> list:
 # Facility registry
 # ---------------------------------------------------------------------------
 
-def build_facility_registry(tiles: list, project) -> dict:
+def build_facility_registry(tiles: list, project, aadt_lookup: dict) -> dict:
     """
     Load all OSM tiles for a county, deduplicate by OSM id, return dict of
-    rankable facilities.
+    rankable facilities.  Populates fac["aadt"] from the pre-computed lookup
+    produced by assign_aadt_to_osm.py.
 
     Returns: {facility_id: {geom: Shapely, geometry: GeoJSON, ...props}}
     """
@@ -351,22 +395,40 @@ def build_facility_registry(tiles: list, project) -> dict:
             gtype    = geom_raw.get("type")
 
             if gtype == "Point":
-                if ftype not in RANKABLE_NODE_TYPES:
-                    continue
-                fid = f"n{osm_id}"
-                if fid in registry:  # nodes don't duplicate across tiles
-                    continue
-                lon, lat = geom_raw["coordinates"]
-                px, py   = project(lon, lat)
-                registry[fid] = {
-                    "fid":          fid,
-                    "geom":         Point(px, py),
-                    "geometry":     geom_raw,
-                    "geom_type":    "Point",
-                    "osm_id":       osm_id,
-                    "road_type":    ftype,
-                    "name":         props.get("name", ""),
-                }
+                if ftype == "intersection_centroid":
+                    # Topological intersection centroid — primary ranked facility
+                    fid = f"n{osm_id}"
+                    if fid in registry:
+                        continue
+                    lon, lat = geom_raw["coordinates"]
+                    px, py   = project(lon, lat)
+                    registry[fid] = {
+                        "fid":       fid,
+                        "geom":      Point(px, py),
+                        "geometry":  geom_raw,
+                        "geom_type": "Point",
+                        "osm_id":    osm_id,
+                        "road_type": "intersection_centroid",
+                        "degree":    props.get("degree", 2),
+                        "name":      "",
+                    }
+                elif ftype in RANKABLE_NODE_TYPES:
+                    # Infrastructure node — stored for control-type lookup only, not ranked
+                    fid = f"infra_{osm_id}"
+                    if fid in registry:
+                        continue
+                    lon, lat = geom_raw["coordinates"]
+                    px, py   = project(lon, lat)
+                    registry[fid] = {
+                        "fid":        fid,
+                        "geom":       Point(px, py),
+                        "geometry":   geom_raw,
+                        "geom_type":  "Point",
+                        "osm_id":     osm_id,
+                        "road_type":  ftype,
+                        "name":       "",
+                        "_infra_only": True,
+                    }
 
             elif gtype == "LineString":
                 if ftype not in RANKABLE_WAY_TYPES:
@@ -404,8 +466,8 @@ def build_facility_registry(tiles: list, project) -> dict:
                     "speed_mph":  spd,
                     "lanes":      lanes,
                     "length_m":   round(_way_length_m(coords), 1),
+                    "aadt":       aadt_lookup.get(str(osm_id)),
                     # Future enrichment placeholders:
-                    # "aadt": None,          # Caltrans AADT (fetch_enrichment.py)
                     # "turn_lanes": None,    # OSM turn:lanes (1.4% coverage)
                     # "median_type": None,   # not in OSM; needs Caltrans HPMS
                 }
@@ -422,31 +484,42 @@ def match_crashes(
     node_geoms: list, node_ids: list, node_tree,
     way_geoms: list,  way_ids: list,  way_tree,
     project,
+    freeway_fids: set | None = None,
 ) -> dict:
     """
     Assign each crash to the nearest node within INTERSECTION_R AND/OR the
-    nearest way within SEGMENT_R. Returns {fid: [severity_str, ...]}.
+    nearest way within SEGMENT_R. Returns {fid: [crash_dict, ...]}.
     A crash may match both an intersection node and a road segment (they are
     independent ranking categories).
+
+    freeway_fids: set of facility IDs that are highway/motorway class. When
+    provided, crashes with isfreeway=True are constrained to only match
+    facilities in this set, preventing overcrossing crashes from being
+    incorrectly assigned to grade-level intersections below.
     """
     crash_map: dict = {}
 
     for cr in crashes:
-        lon, lat, severity = cr["lon"], cr["lat"], cr["severity"]
+        lon, lat = cr["lon"], cr["lat"]
         cx, cy   = project(lon, lat)
         crash_pt = Point(cx, cy)
+        is_fw    = cr.get("isfreeway", False)
 
         if node_tree is not None:
-            idxs = node_tree.query(crash_pt, predicate="dwithin",
-                                   distance=INTERSECTION_R)
-            if len(idxs):
+            idxs = list(node_tree.query(crash_pt, predicate="dwithin",
+                                        distance=INTERSECTION_R))
+            if is_fw and freeway_fids is not None:
+                idxs = [i for i in idxs if node_ids[i] in freeway_fids]
+            if idxs:
                 best = min(idxs, key=lambda i: node_geoms[i].distance(crash_pt))
                 crash_map.setdefault(node_ids[best], []).append(cr)
 
         if way_tree is not None:
-            idxs = way_tree.query(crash_pt, predicate="dwithin",
-                                  distance=SEGMENT_R)
-            if len(idxs):
+            idxs = list(way_tree.query(crash_pt, predicate="dwithin",
+                                       distance=SEGMENT_R))
+            if is_fw and freeway_fids is not None:
+                idxs = [i for i in idxs if way_ids[i] in freeway_fids]
+            if idxs:
                 best = min(idxs, key=lambda i: way_geoms[i].distance(crash_pt))
                 crash_map.setdefault(way_ids[best], []).append(cr)
 
@@ -459,9 +532,28 @@ def match_crashes(
 
 def classify_node(fac: dict, node_geom: Point,
                   way_geoms: list, way_ids: list, way_tree,
-                  way_registry: dict) -> str:
-    """Compute bin key for an intersection node facility."""
-    control    = CONTROL_LABEL.get(fac["road_type"], "uncontrolled")
+                  way_registry: dict,
+                  infra_geoms: list | None = None,
+                  infra_types: list | None = None,
+                  infra_tree=None) -> str:
+    """Compute bin key for an intersection node facility.
+
+    For topological centroid nodes the control type is derived by looking for
+    infrastructure nodes (traffic_signals / stop / give_way) within SNAP_R.
+    Priority order: signal > stop > give_way > uncontrolled.
+    """
+    if fac["road_type"] == "intersection_centroid":
+        control = "uncontrolled"
+        if infra_tree is not None and infra_types:
+            idxs = infra_tree.query(node_geom, predicate="dwithin", distance=SNAP_R)
+            if len(idxs):
+                present = {infra_types[i] for i in idxs}
+                for itype in ("traffic_signals", "stop", "give_way"):
+                    if itype in present:
+                        control = CONTROL_LABEL[itype]
+                        break
+    else:
+        control = CONTROL_LABEL.get(fac["road_type"], "uncontrolled")
     road_class = "local"
     speed_mph  = DEFAULT_SPEED["local"]
     leg_count  = 0
@@ -544,6 +636,7 @@ def compute_epdo(crashes: list) -> tuple:
         "cyc":            sum(1 for c in crashes if c.get("cyc")),
         "imp":            sum(1 for c in crashes if c.get("imp")),
         "collision_type": _count_dist(crashes, "collision_type"),
+        "conflict_type":  _count_dist(crashes, "conflict_type"),
         "road_cond":      _count_dist(crashes, "road_cond"),
         "mveh":           _count_dist(crashes, "mveh"),
         "hour":           hour_dist,
@@ -555,7 +648,8 @@ def compute_epdo(crashes: list) -> tuple:
 # County processing
 # ---------------------------------------------------------------------------
 
-def process_county(county_name: str, global_stats: dict, dry_run: bool = False) -> dict:
+def process_county(county_name: str, global_stats: dict,
+                   aadt_lookup: dict, dry_run: bool = False) -> dict:
     """
     Process one county: load crashes + OSM tiles, match, classify, accumulate
     facility stats into global_stats.  Large objects are freed after use.
@@ -575,32 +669,46 @@ def process_county(county_name: str, global_stats: dict, dry_run: bool = False) 
     _, (south, west, north, east) = CA_COUNTIES[county_name]
     project, _   = make_projector((south + north) / 2)
 
-    # 3. Build facility registry
+    # 3. Build facility registry (aadt_lookup injected from caller)
     print(f"  Building facility registry ({len(tiles)} tiles)...", flush=True)
-    registry     = build_facility_registry(tiles, project)
+    registry     = build_facility_registry(tiles, project, aadt_lookup)
     if not registry:
         del crashes
         print(f"  No OSM tiles cached — browse the map to populate osm_cache first")
         return {"county": county_name, "skipped": "no_osm_tiles"}
 
-    # 4. Separate nodes / ways; build STRtrees
-    node_geoms, node_ids = [], []
-    way_geoms,  way_ids  = [], []
+    # 4. Separate centroid nodes / infra-only nodes / ways; build STRtrees
+    node_geoms,  node_ids   = [], []   # topological centroids — crash matching
+    infra_geoms, infra_types = [], []  # infrastructure nodes — control-type lookup
+    way_geoms,   way_ids    = [], []
+
     for fid, fac in registry.items():
-        if fac["geom_type"] == "Point":
+        if fac.get("_infra_only"):
+            infra_geoms.append(fac["geom"])
+            infra_types.append(fac["road_type"])
+        elif fac["geom_type"] == "Point":
             node_geoms.append(fac["geom"]); node_ids.append(fid)
         else:
             way_geoms.append(fac["geom"]);  way_ids.append(fid)
 
-    node_tree = STRtree(node_geoms) if node_geoms else None
-    way_tree  = STRtree(way_geoms)  if way_geoms  else None
-    print(f"  {len(node_geoms):,} intersection nodes, {len(way_geoms):,} road segments",
-          flush=True)
+    node_tree  = STRtree(node_geoms)  if node_geoms  else None
+    infra_tree = STRtree(infra_geoms) if infra_geoms else None
+    way_tree   = STRtree(way_geoms)   if way_geoms   else None
+    print(f"  {len(node_geoms):,} intersection centroids, {len(way_geoms):,} road segments, "
+          f"{len(infra_geoms):,} infra control nodes", flush=True)
 
     # 5. Spatial join
-    print(f"  Matching crashes...", flush=True)
+    # freeway_fids: highway-class way IDs used to gate isfreeway=True crashes.
+    # Prevents overcrossing crashes from matching grade-level intersections below.
+    freeway_fids = {
+        fid for fid in way_ids
+        if registry[fid].get("road_class") == "highway"
+    }
+    print(f"  Matching crashes ({len(freeway_fids):,} freeway-class facilities)...",
+          flush=True)
     crash_map    = match_crashes(crashes, node_geoms, node_ids, node_tree,
-                                 way_geoms,  way_ids,  way_tree,  project)
+                                 way_geoms,  way_ids,  way_tree,  project,
+                                 freeway_fids=freeway_fids or None)
     n_matched    = sum(1 for v in crash_map.values() if v)
     print(f"  {n_matched:,} facilities with >=1 crash", flush=True)
 
@@ -609,15 +717,19 @@ def process_county(county_name: str, global_stats: dict, dry_run: bool = False) 
 
     new_facs = 0
     for fid, fac in registry.items():
+        if fac.get("_infra_only"):
+            continue   # infra nodes are for control-type lookup only — not ranked
+
         sevs    = crash_map.get(fid, [])
         is_node = (fac["geom_type"] == "Point")
 
         if is_node:
-            idx       = node_ids.index(fid)
-            bin_key   = classify_node(fac, node_geoms[idx],
-                                      way_geoms, way_ids, way_tree, way_reg)
+            idx     = node_ids.index(fid)
+            bin_key = classify_node(fac, node_geoms[idx],
+                                    way_geoms, way_ids, way_tree, way_reg,
+                                    infra_geoms, infra_types, infra_tree)
         else:
-            bin_key   = classify_way(fac)
+            bin_key = classify_way(fac)
 
         epdo, fatal, severe, total, dists = compute_epdo(sevs)
 
@@ -639,6 +751,7 @@ def process_county(county_name: str, global_stats: dict, dry_run: bool = False) 
                 "speed_mph":     fac.get("speed_mph", 0),
                 "lanes":         fac.get("lanes", 0),
                 "length_m":      fac.get("length_m", 0),
+                "aadt":          fac.get("aadt"),
                 "facility_type": "intersection" if is_node else "segment",
                 "geometry":      fac["geometry"],
                 "crash_list":    sevs,
@@ -646,7 +759,7 @@ def process_county(county_name: str, global_stats: dict, dry_run: bool = False) 
         new_facs += 1
 
     # 7. Free large objects before next county
-    del crashes, registry, node_geoms, way_geoms, node_tree, way_tree, crash_map, way_reg
+    del crashes, registry, node_geoms, infra_geoms, way_geoms, node_tree, infra_tree, way_tree, crash_map, way_reg
     gc.collect()
 
     print(f"  Accumulated {new_facs:,} facilities", flush=True)
@@ -668,6 +781,28 @@ def _make_feature(fid: str, stats: dict,
         [round(c["lon"], 6), round(c["lat"], 6), _SEV_CODE.get(c.get("severity", ""), "p")]
         for c in crash_list[:200]
     ])
+    # Collision IDs for party data lazy-fetch in the dashboard
+    collision_ids = json.dumps([
+        c["collision_id"] for c in crash_list[:200]
+        if c.get("collision_id")
+    ])
+
+    # VMT-normalised EPDO rate
+    # Segments : EPDO / (AADT × length_km × YEAR_WINDOW / 1 000 000)  → per MV-km
+    # Intersections: EPDO / (AADT × YEAR_WINDOW / 1 000 000)          → per MEV
+    aadt      = stats.get("aadt")
+    length_m  = stats.get("length_m") or 0
+    is_seg    = stats["facility_type"] == "segment"
+    vmt_5yr   = None
+    epdo_rate = None
+    if aadt:
+        if is_seg and length_m > 0:
+            vmt_5yr   = round(aadt * (length_m / 1000.0) * YEAR_WINDOW, 1)
+            epdo_rate = round(stats["epdo"] / (vmt_5yr / 1_000_000), 4) if vmt_5yr > 0 else None
+        elif not is_seg:
+            mev_5yr   = aadt * YEAR_WINDOW / 1_000_000
+            epdo_rate = round(stats["epdo"] / mev_5yr, 4) if mev_5yr > 0 else None
+
     return {
         "type":     "Feature",
         "geometry": stats["geometry"],
@@ -678,6 +813,10 @@ def _make_feature(fid: str, stats: dict,
             "rank_worst":    rank_worst,
             "rank_best":     rank_best,
             "epdo_score":    stats["epdo"],
+            "epdo_rate":     epdo_rate,       # per MV-km (segment) or per MEV (intersection)
+            "vmt_5yr":       vmt_5yr,         # million vehicle-km over analysis window (segment only)
+            "epdo_weights":  dict(EPDO),      # fatal/severe/other/pdo weights used
+            "year_window":   YEAR_WINDOW,
             "fatal_5yr":     stats["fatal"],
             "severe_5yr":    stats["severe"],
             "total_5yr":     stats["total"],
@@ -692,8 +831,15 @@ def _make_feature(fid: str, stats: dict,
             "similar_best":  similar_best,
             "crash_dists":   stats.get("dists", {}),
             "crash_coords":  crash_coords,
-            # Future enrichment (None until fetch_enrichment.py is run):
-            "aadt":              None,
+            "collision_ids": collision_ids,
+            "aadt":          aadt,
+            # Conflict type counts (from crash_dists.conflict_type, pre-computed for quick access)
+            "ped_veh_5yr":   stats.get("dists", {}).get("conflict_type", {}).get("ped_veh",  0),
+            "bike_veh_5yr":  stats.get("dists", {}).get("conflict_type", {}).get("bike_veh", 0),
+            "angle_5yr":     stats.get("dists", {}).get("conflict_type", {}).get("angle",    0),
+            "rear_end_5yr":  stats.get("dists", {}).get("conflict_type", {}).get("rear_end", 0),
+            "head_on_5yr":   stats.get("dists", {}).get("conflict_type", {}).get("head_on",  0),
+            # Future enrichment placeholders:
             "turn_channelization": None,
             "median_type":       None,
         },
@@ -806,6 +952,12 @@ def main():
 
     min_osm = args.min_osm_pct
     print(f"Processing {len(counties)} county/counties (min OSM {min_osm:.0f}%): {', '.join(counties)}")
+
+    # Load AADT lookup once (statewide; keyed by str(osm_id))
+    print("Loading AADT lookup...")
+    aadt_lookup = _load_aadt_lookup()
+    print(f"  {len(aadt_lookup):,} ways with AADT values loaded")
+
     global_stats: dict = {}
     summaries    = []
 
@@ -815,7 +967,7 @@ def main():
             print(f"  Skipping {county_name}: {msg}")
             continue
         try:
-            summary = process_county(county_name, global_stats, args.dry_run)
+            summary = process_county(county_name, global_stats, aadt_lookup, args.dry_run)
             summaries.append(summary)
         except Exception as exc:
             import traceback

@@ -25,12 +25,14 @@ MLY_CACHE   = os.path.join(DATA_DIR, "mapillary_cache")
 
 OSM_CACHE    = os.path.join(DATA_DIR, "osm_cache")
 CRASH_CACHE  = os.path.join(DATA_DIR, "crash_cache")
+PARTY_CACHE  = os.path.join(DATA_DIR, "party_cache")
 RANKINGS_DIR = os.environ.get("RANKINGS_DIR", os.path.join(DATA_DIR, "rankings"))
 AADT_FILE    = os.path.join(DATA_DIR, "CaltransAADT", "aadt_geocoded.geojson")
 
 os.makedirs(MLY_CACHE,   exist_ok=True)
 os.makedirs(OSM_CACHE,   exist_ok=True)
 os.makedirs(CRASH_CACHE, exist_ok=True)
+os.makedirs(PARTY_CACHE, exist_ok=True)
 os.makedirs(RANKINGS_DIR, exist_ok=True)
 
 # CCRS API constants
@@ -146,8 +148,18 @@ OVERPASS_QUERY = """
   way["footway"="sidewalk"]({bbox});
   way["highway"="pedestrian"]({bbox});
 );
-out geom;
+out body;
+>;
+out skel qt;
 """
+
+# Way types whose nodes contribute to intersection centroid detection
+_RANKABLE_HIGHWAY_FOR_CENTROIDS = {
+    "motorway", "motorway_link", "trunk", "trunk_link",
+    "primary", "primary_link", "secondary", "secondary_link",
+    "tertiary", "tertiary_link", "residential", "unclassified", "living_street",
+    "roundabout",
+}
 
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
@@ -486,57 +498,96 @@ def _osm_tile_features(x: int, y: int) -> list:
             json.dump([], f)
         return []
 
-    # out geom; returns coordinates directly on each element — no node resolution needed.
+    # Two-pass parse for out body; >; out skel qt; format.
+    # Pass 1: collect ALL node coordinates (tagged infra nodes + untagged skel nodes).
+    # Pass 2: process ways using node-ID lists to reconstruct geometry, and track
+    #         how many rankable ways reference each node → intersection centroids.
+    elements = raw.get("elements", [])
+
+    nodes_dict: dict  = {}   # node_id → (lon, lat)
+    tagged_nodes: list = []  # nodes with tags (infra features for display)
+
+    for el in elements:
+        if el["type"] != "node":
+            continue
+        nid = el["id"]
+        nodes_dict[nid] = (el["lon"], el["lat"])
+        if el.get("tags"):
+            tagged_nodes.append(el)
+
+    node_degree: dict = {}   # node_id → count of rankable ways referencing it
     features = []
-    for el in raw.get("elements", []):
-        if el["type"] == "node":
-            tags = el.get("tags", {})
-            if not tags:
-                continue
-            hw  = tags.get("highway")
-            am  = tags.get("amenity")
-            tc  = tags.get("traffic_calming")
-            jn = tags.get("junction")
-            if hw == "give_way":
-                ftype = "give_way"
-            elif hw == "mini_roundabout" or jn == "roundabout":
-                ftype = "roundabout"
-            elif hw:
-                ftype = hw
-            elif am:
-                ftype = am
-            elif tc:
-                ftype = "traffic_calming"
-            else:
-                ftype = "unknown"
-            features.append({
-                "type": "Feature",
-                "geometry": {"type": "Point", "coordinates": [el["lon"], el["lat"]]},
-                "properties": {"id": el["id"], "type": ftype, **tags},
-            })
-        elif el["type"] == "way":
-            tags = el.get("tags", {})
-            # out geom; embeds geometry directly — [(lon, lat), ...]
-            coords = [(g["lon"], g["lat"]) for g in el.get("geometry", []) if g]
-            if len(coords) < 2:
-                continue
-            hw = tags.get("highway", "")
-            cy = tags.get("cycleway", "")
-            ft = tags.get("footway", "")
-            jn = tags.get("junction", "")
-            if jn == "roundabout":
-                wtype = "roundabout"
-            elif hw == "cycleway" or cy:
-                wtype = "cycleway"
-            elif hw in ("footway", "path", "pedestrian") or ft == "sidewalk":
-                wtype = "footway"
-            else:
-                wtype = hw or "unknown"
-            features.append({
-                "type": "Feature",
-                "geometry": {"type": "LineString", "coordinates": coords},
-                "properties": {"id": el["id"], "type": wtype, **tags},
-            })
+
+    for el in elements:
+        if el["type"] != "way":
+            continue
+        tags     = el.get("tags", {})
+        nid_list = el.get("nodes", [])
+        coords   = [(nodes_dict[n][0], nodes_dict[n][1])
+                    for n in nid_list if n in nodes_dict]
+        if len(coords) < 2:
+            continue
+        hw = tags.get("highway", "")
+        cy = tags.get("cycleway", "")
+        ft = tags.get("footway", "")
+        jn = tags.get("junction", "")
+        if jn == "roundabout":
+            wtype = "roundabout"
+        elif hw == "cycleway" or cy:
+            wtype = "cycleway"
+        elif hw in ("footway", "path", "pedestrian") or ft == "sidewalk":
+            wtype = "footway"
+        else:
+            wtype = hw or "unknown"
+
+        # Track node degree for rankable road ways only
+        if wtype in _RANKABLE_HIGHWAY_FOR_CENTROIDS:
+            for nid in nid_list:
+                node_degree[nid] = node_degree.get(nid, 0) + 1
+
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "LineString", "coordinates": coords},
+            "properties": {"id": el["id"], "type": wtype, **tags},
+        })
+
+    # Emit tagged infrastructure node features (signals, stops, bus stops, etc.)
+    for el in tagged_nodes:
+        tags = el.get("tags", {})
+        hw   = tags.get("highway")
+        am   = tags.get("amenity")
+        tc   = tags.get("traffic_calming")
+        jn   = tags.get("junction")
+        if hw == "give_way":
+            ftype = "give_way"
+        elif hw == "mini_roundabout" or jn == "roundabout":
+            ftype = "roundabout"
+        elif hw:
+            ftype = hw
+        elif am:
+            ftype = am
+        elif tc:
+            ftype = "traffic_calming"
+        else:
+            ftype = "unknown"
+        lon, lat = nodes_dict[el["id"]]
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [lon, lat]},
+            "properties": {"id": el["id"], "type": ftype, **tags},
+        })
+
+    # Emit topological intersection centroid features.
+    # A node referenced by 2+ rankable road ways is a true intersection center.
+    for nid, deg in node_degree.items():
+        if deg < 2 or nid not in nodes_dict:
+            continue
+        lon, lat = nodes_dict[nid]
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [lon, lat]},
+            "properties": {"id": nid, "type": "intersection_centroid", "degree": deg},
+        })
 
     with open(cache_path, "w") as f:
         json.dump(features, f)
@@ -734,6 +785,49 @@ def get_crash_detail(
     return JSONResponse(result)
 
 
+@app.post("/api/party_data")
+async def get_party_data(body: dict = Body(...)):
+    """Batch-fetch CCRS party records for a list of collision IDs.
+
+    Caches results to data/party_cache/{cid}.json so repeated calls for the
+    same facility are served from disk. Returns {collision_id: [party_record, ...]}.
+    Capped at 200 IDs per call.
+    """
+    collision_ids: list[str] = [str(i) for i in body.get("ids", []) if i][:200]
+    results: dict = {}
+    uncached: list[str] = []
+
+    for cid in collision_ids:
+        cache_path = os.path.join(PARTY_CACHE, f"{cid}.json")
+        if os.path.exists(cache_path):
+            try:
+                with open(cache_path) as f:
+                    results[cid] = json.load(f)
+            except Exception:
+                uncached.append(cid)
+        else:
+            uncached.append(cid)
+
+    if uncached:
+        party_resources = _get_ccrs_parties_resources()
+
+        def _fetch_and_cache(cid: str) -> tuple[str, list]:
+            records = _fetch_detail_records(party_resources, cid, numeric_id=True, limit=10)
+            cache_path = os.path.join(PARTY_CACHE, f"{cid}.json")
+            try:
+                with open(cache_path, "w") as f:
+                    json.dump(records, f)
+            except Exception:
+                pass
+            return cid, records
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for cid, records in pool.map(_fetch_and_cache, uncached):
+                results[cid] = records
+
+    return JSONResponse(results)
+
+
 @app.get("/api/counties")
 def get_counties():
     """Return {county_name: county_code} for all 58 CA counties."""
@@ -921,6 +1015,36 @@ _CA_COUNTY_NAMES = set(CA_COUNTIES.keys())
 
 def _get_rankings_path() -> str:
     return os.path.join(_active_rankings_dir, "statewide.json")
+
+
+# ---------------------------------------------------------------------------
+# Rankings in-memory cache (mtime-invalidated)
+# ---------------------------------------------------------------------------
+
+_rankings_cache: dict | None = None
+_rankings_cache_path: str = ""
+_rankings_cache_mtime: float = 0.0
+
+
+def _load_rankings() -> dict:
+    """Return statewide.json as a dict, using an mtime-invalidated in-memory cache.
+
+    The cache is automatically invalidated when build_safety_rankings.py rewrites
+    the file (mtime changes).  First call after a new run pays one disk read;
+    all subsequent calls for the same file version are pure dict lookups.
+    """
+    global _rankings_cache, _rankings_cache_path, _rankings_cache_mtime
+    path = _get_rankings_path()
+    if not os.path.exists(path):
+        return {}
+    mtime = os.path.getmtime(path)
+    if _rankings_cache is None or path != _rankings_cache_path or mtime != _rankings_cache_mtime:
+        print(f"[rankings] Loading {path} into memory cache", flush=True)
+        with open(path, encoding="utf-8") as f:
+            _rankings_cache = json.load(f)
+        _rankings_cache_path  = path
+        _rankings_cache_mtime = mtime
+    return _rankings_cache
 
 
 def _run_rankings_script(county: str | None, output_dir: str,
@@ -1157,11 +1281,9 @@ def download_rankings():
 @app.get("/api/rankings/bins")
 def list_ranking_bins():
     """List all bin keys with facility counts."""
-    path = _get_rankings_path()
-    if not os.path.exists(path):
+    if not os.path.exists(_get_rankings_path()):
         raise HTTPException(404, "Rankings not computed. Run scripts/build_safety_rankings.py first.")
-    with open(path) as f:
-        data = json.load(f)
+    data = _load_rankings()
     return JSONResponse({
         "generated_at": data["generated_at"],
         "counties": data["counties_included"],
@@ -1175,11 +1297,9 @@ def list_ranking_bins():
 @app.get("/api/rankings/bin/{bin_key:path}")
 def get_ranking_bin(bin_key: str):
     """Return worst/best facilities for one bin key (URL-encoded pipe separators)."""
-    path = _get_rankings_path()
-    if not os.path.exists(path):
+    if not os.path.exists(_get_rankings_path()):
         raise HTTPException(404, "Rankings not computed")
-    with open(path) as f:
-        data = json.load(f)
+    data = _load_rankings()
     bin_data = data["bins"].get(bin_key)
     if not bin_data:
         raise HTTPException(404, f"Bin '{bin_key}' not found")

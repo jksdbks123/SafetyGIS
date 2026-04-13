@@ -27,10 +27,17 @@ const BASEMAP_STYLES = {
         attribution: '© Esri, Maxar, Earthstar Geographics',
         maxzoom: 19,
       },
+      'esri-labels': {
+        type: 'raster',
+        tiles: ['https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}'],
+        tileSize: 256,
+        maxzoom: 19,
+      },
     },
     layers: [
-      { id: 'background', type: 'background', paint: { 'background-color': '#0a0a0a' } },
+      { id: 'background',  type: 'background', paint: { 'background-color': '#0a0a0a' } },
       { id: 'sat-raster',  type: 'raster',     source: 'esri-sat' },
+      { id: 'sat-labels',  type: 'raster',     source: 'esri-labels' },
     ],
   },
 };
@@ -85,6 +92,7 @@ let _lastClickTime  = 0;       // for dblclick debounce in poly mode
 
 const LAYER_VISIBILITY = {
   signals:            true,
+  intersections:      false,
   crossings:          true,
   bus:                true,
   bike:               true,
@@ -106,6 +114,7 @@ const LAYER_VISIBILITY = {
 // toggle key → MapLibre layer IDs it controls
 const LAYER_IDS = {
   signals:            ['signals-layer'],
+  intersections:      ['intersections-pt-layer', 'intersections-rbt-layer'],
   crossings:          ['crossings-layer'],
   bus:                ['bus-layer'],
   bike:               ['bike-layer'],
@@ -126,7 +135,8 @@ const LAYER_IDS = {
 
 // source id → owned layer IDs (must remove layers before source)
 const SOURCE_LAYERS = {
-  osm:              ['signals-layer', 'crossings-layer', 'bus-layer', 'bike-layer',
+  osm:              ['signals-layer', 'intersections-pt-layer', 'intersections-rbt-layer',
+                     'crossings-layer', 'bus-layer', 'bike-layer',
                      'roads-layer', 'footway-layer', 'calming-layer', 'streetlamp-layer'],
   crashes:          ['heatmap-layer', 'crashes-layer'],
   aadt:             ['aadt-layer'],
@@ -428,6 +438,37 @@ function addOsmLayers() {
       'circle-color':        '#facc15',
       'circle-stroke-width': 1.5,
       'circle-stroke-color': '#78350f',
+    },
+  });
+
+  // Controlled intersections — stop signs, yield signs (point nodes)
+  // stop → red, give_way → orange, roundabout node → teal
+  map.addLayer({
+    id: 'intersections-pt-layer', type: 'circle', source: 'osm',
+    minzoom: 12,
+    filter: ['in', ['get', 'type'], ['literal', ['stop', 'give_way', 'roundabout']]],
+    paint: {
+      'circle-radius':       ['interpolate', ['linear'], ['zoom'], 12, 4, 16, 9],
+      'circle-color':        ['match', ['get', 'type'],
+        'stop',      '#f87171',
+        'give_way',  '#fb923c',
+        '#2dd4bf'
+      ],
+      'circle-stroke-width': 1.5,
+      'circle-stroke-color': '#1a1d2e',
+      'circle-opacity':      0.9,
+    },
+  });
+
+  // Roundabout way geometry (closed loop LineString tagged junction=roundabout)
+  map.addLayer({
+    id: 'intersections-rbt-layer', type: 'line', source: 'osm',
+    minzoom: 12,
+    filter: ['==', ['get', 'type'], 'roundabout'],
+    paint: {
+      'line-color':   '#2dd4bf',
+      'line-width':   ['interpolate', ['linear'], ['zoom'], 12, 2, 16, 4],
+      'line-opacity': 0.9,
     },
   });
 
@@ -948,6 +989,7 @@ function finalizeSelection(ring) {
       else if (type === 'footway')                            layerKey = 'footway';
       else if (type === 'traffic_calming')                    layerKey = 'calming';
       else if (type === 'street_lamp')                        layerKey = 'streetlamp';
+      else if (['stop','give_way','roundabout'].includes(type)) layerKey = 'intersections';
       else continue;
       if (!LAYER_VISIBILITY[layerKey]) continue;
 
@@ -1075,7 +1117,8 @@ async function sendAiQuery() {
 
 // Layers that have their own click popups (used by pegman handler)
 const POPUP_LAYERS = [
-  'signals-layer', 'crossings-layer', 'bus-layer', 'bike-layer',
+  'signals-layer', 'intersections-pt-layer', 'intersections-rbt-layer',
+  'crossings-layer', 'bus-layer', 'bike-layer',
   'crashes-layer',
   'asset-regulatory-layer', 'asset-warning-layer', 'asset-info-layer',
   'asset-crosswalks-layer',
@@ -1338,13 +1381,16 @@ function setupPopups() {
 
   // New OSM layers also need popups
   const OSM_LABEL_EXT = Object.assign({}, OSM_LABEL, {
+    'intersections-pt-layer': 'Controlled Intersection',
+    'intersections-rbt-layer': 'Roundabout',
     'roads-layer':      'Road',
     'footway-layer':    'Sidewalk / Footway',
     'calming-layer':    'Traffic Calming',
     'streetlamp-layer': 'Street Lamp',
   });
 
-  ['signals-layer', 'crossings-layer', 'bus-layer', 'bike-layer',
+  ['signals-layer', 'intersections-pt-layer', 'intersections-rbt-layer',
+   'crossings-layer', 'bus-layer', 'bike-layer',
    'roads-layer', 'footway-layer', 'calming-layer', 'streetlamp-layer'].forEach(layerId => {
     map.on('click', layerId, e => {
       if (G_drawActive) return;
@@ -2237,12 +2283,14 @@ function _rankPopupHtml(p) {
   const turn   = p.turn_channelization || null;
   const median = p.median_type || null;
 
-  const epdo   = typeof p.epdo_score === 'number' ? p.epdo_score.toFixed(1) : '—';
-  const fatal  = p.fatal_5yr  ?? 0;
-  const sev    = p.severe_5yr ?? 0;
-  const tot    = p.total_5yr  ?? 0;
-  const oth    = Math.max(0, tot - fatal - sev);
-  const rate   = p.crash_rate_yr != null ? p.crash_rate_yr.toFixed(2) + '/yr' : '—';
+  const epdo      = typeof p.epdo_score === 'number' ? p.epdo_score.toFixed(1) : '—';
+  const fatal     = p.fatal_5yr  ?? 0;
+  const sev       = p.severe_5yr ?? 0;
+  const tot       = p.total_5yr  ?? 0;
+  const oth       = Math.max(0, tot - fatal - sev);
+  const rate      = p.crash_rate_yr != null ? p.crash_rate_yr.toFixed(2) + '/yr' : '—';
+  const epdoRate  = p.epdo_rate  != null ? p.epdo_rate.toFixed(3)  : null;
+  const rateUnit  = isInt ? '/MEV' : '/MV-km';
 
   const rankW  = p.rank_worst != null ? `<span style="color:#f87171;font-weight:600">#${p.rank_worst} worst</span>` : '';
   const rankB  = p.rank_best  != null ? `<span style="color:#4ade80;font-weight:600">#${p.rank_best} best</span>` : '';
@@ -2273,7 +2321,7 @@ function _rankPopupHtml(p) {
     <div style="background:#0f1117;border-radius:4px;padding:6px 8px;border:1px solid #1f2937">
       <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:3px">
         <span style="color:#ef4444;font-weight:700;font-size:0.82rem">EPDO ${epdo}</span>
-        <span style="color:#6b7280;font-size:0.63rem">${rate}</span>
+        <span style="color:#6b7280;font-size:0.63rem">${epdoRate ? epdoRate + rateUnit : rate}</span>
       </div>
       <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:3px;text-align:center">
         <div><span style="color:#fca5a5;font-weight:600">${fatal}</span><br><span style="color:#4b5563;font-size:0.58rem">FATAL</span></div>
@@ -2358,6 +2406,184 @@ function _clearFacilityOverlay() {
 }
 
 // ---------------------------------------------------------------------------
+// Crash Dashboard Panel — party data helpers
+// ---------------------------------------------------------------------------
+
+async function _fetchPartyData(collisionIds) {
+  if (!collisionIds || collisionIds.length === 0) return {};
+  try {
+    const resp = await fetch('/api/party_data', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ids: collisionIds}),
+    });
+    if (!resp.ok) return {};
+    return await resp.json();
+  } catch (e) {
+    console.warn('Party data fetch failed:', e);
+    return {};
+  }
+}
+
+const _CONFLICT_COLORS = {
+  angle:     '#f59e0b',
+  rear_end:  '#3b82f6',
+  ped_veh:   '#ef4444',
+  bike_veh:  '#a78bfa',
+  head_on:   '#dc2626',
+  sideswipe: '#10b981',
+  overturn:  '#f97316',
+  other:     '#6b7280',
+};
+const _CONFLICT_LABELS = {
+  angle:     'Angle',
+  rear_end:  'Rear-End',
+  ped_veh:   'Ped / Veh',
+  bike_veh:  'Bike / Veh',
+  head_on:   'Head-On',
+  sideswipe: 'Sideswipe',
+  overturn:  'Overturned',
+  other:     'Other',
+};
+const _CONFLICT_ORDER = ['angle','rear_end','ped_veh','bike_veh','head_on','sideswipe','overturn','other'];
+
+function _renderConflictBars(ctDist) {
+  const ctTotal = Object.values(ctDist).reduce((a, b) => a + b, 0);
+  if (ctTotal === 0) return '<div style="color:#4b5563;font-size:0.6rem;font-style:italic">No conflict data</div>';
+  let html = '';
+  _CONFLICT_ORDER.forEach(k => {
+    const v = ctDist[k] || 0;
+    if (!v) return;
+    const pct   = Math.round(v / ctTotal * 100);
+    const color = _CONFLICT_COLORS[k] || '#6b7280';
+    const label = _CONFLICT_LABELS[k] || k;
+    html += `<div class="conflict-bar-row">
+      <span class="conflict-bar-label" title="${label}">${label}</span>
+      <div style="flex:1;background:#1f2937;border-radius:2px;height:6px;overflow:hidden">
+        <div style="width:${pct}%;height:100%;background:${color};border-radius:2px"></div>
+      </div>
+      <span style="font-size:0.58rem;color:#6b7280;width:26px;text-align:right;flex-shrink:0">${pct}%</span>
+    </div>`;
+  });
+  return html;
+}
+
+function _renderDirectionRose(partyData) {
+  const BEARING = {N:0,NE:45,E:90,SE:135,S:180,SW:225,W:270,NW:315};
+  const counts = {};
+  let totalDir = 0;
+  for (const parties of Object.values(partyData)) {
+    const primary = parties.find(p => p.IsAtFault === 'True' || p.IsAtFault === true)
+                 || parties.find(p => String(p.PartyNumber) === '1')
+                 || parties[0];
+    if (!primary) continue;
+    const dir = (primary.DirectionOfTravel || '').toUpperCase().trim();
+    if (!BEARING.hasOwnProperty(dir)) continue;
+    counts[dir] = (counts[dir] || 0) + 1;
+    totalDir++;
+  }
+  if (totalDir === 0) {
+    return '<div style="font-size:0.6rem;color:#4b5563;font-style:italic;text-align:center;padding:10px 0">No direction data</div>';
+  }
+  const maxCount = Math.max(1, ...Object.values(counts));
+  const CX = 55, CY = 55, MAX_LEN = 36, MIN_LEN = 4;
+  const toRad = deg => deg * Math.PI / 180;
+  let bars = '', labels = '';
+  Object.keys(BEARING).forEach(dir => {
+    const svgAngle = (BEARING[dir] - 90 + 360) % 360;
+    const rad = toRad(svgAngle);
+    const count = counts[dir] || 0;
+    // direction label (always)
+    const lx = (CX + Math.cos(rad) * 48).toFixed(1);
+    const ly = (CY + Math.sin(rad) * 48).toFixed(1);
+    labels += `<text x="${lx}" y="${ly}" text-anchor="middle" dominant-baseline="middle"
+      font-size="7" fill="${count > 0 ? '#d1d5db' : '#374151'}">${dir}</text>`;
+    if (!count) return;
+    const len = MIN_LEN + (count / maxCount) * (MAX_LEN - MIN_LEN);
+    const x2 = (CX + Math.cos(rad) * len).toFixed(1);
+    const y2 = (CY + Math.sin(rad) * len).toFixed(1);
+    const sw = (2.5 + (count / maxCount) * 3.5).toFixed(1);
+    bars += `<line x1="${CX}" y1="${CY}" x2="${x2}" y2="${y2}"
+      stroke="#60a5fa" stroke-width="${sw}" stroke-linecap="round" opacity="0.85"/>`;
+    // count label at tip
+    const tx = (CX + Math.cos(rad) * (len + 7)).toFixed(1);
+    const ty = (CY + Math.sin(rad) * (len + 7)).toFixed(1);
+    bars += `<text x="${tx}" y="${ty}" text-anchor="middle" dominant-baseline="middle"
+      font-size="6.5" fill="#9ca3af">${count}</text>`;
+  });
+  return `<div class="dir-rose-wrap">
+    <svg viewBox="0 0 110 110" width="110" height="110">
+      <circle cx="${CX}" cy="${CY}" r="${MAX_LEN}" fill="none" stroke="#1f2937" stroke-width="0.5"/>
+      <circle cx="${CX}" cy="${CY}" r="2" fill="#4b5563"/>
+      ${bars}${labels}
+    </svg>
+    <div style="font-size:0.55rem;color:#4b5563;text-align:center">${totalDir} parties w/ dir</div>
+  </div>`;
+}
+
+const _MVMT_ABBREV = {
+  'PROCEEDING STRAIGHT':   'Straight',
+  'MAKING LEFT TURN':      'Left Turn',
+  'MAKING RIGHT TURN':     'Right Turn',
+  'MAKING U-TURN':         'U-Turn',
+  'SLOWING/STOPPING':      'Slowing',
+  'CHANGING LANES':        'Chg. Lane',
+  'ENTERING TRAFFIC':      'Entering',
+  'MERGING':               'Merging',
+  'PARKED':                'Parked',
+  'BACKING':               'Backing',
+  'PASSING OTHER VEHICLE': 'Passing',
+};
+function _abbrevMovement(m) {
+  return _MVMT_ABBREV[m] || (m ? m.slice(0, 10) : 'Unknown');
+}
+
+function _renderMovementPairs(partyData) {
+  const pairCounts = {};
+  for (const parties of Object.values(partyData)) {
+    const p1 = parties.find(p => String(p.PartyNumber) === '1');
+    const p2 = parties.find(p => String(p.PartyNumber) === '2');
+    if (!p1 || !p2) continue;
+    const m1 = _abbrevMovement(p1.MovementPrecCollDescription);
+    const m2 = _abbrevMovement(p2.MovementPrecCollDescription);
+    const key = `${m1} × ${m2}`;
+    pairCounts[key] = (pairCounts[key] || 0) + 1;
+  }
+  const sorted = Object.entries(pairCounts).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  if (sorted.length === 0) {
+    return '<div style="font-size:0.6rem;color:#4b5563;font-style:italic">No movement data available</div>';
+  }
+  const maxCount = sorted[0][1];
+  return sorted.map(([key, count], i) => {
+    const pct = Math.round(count / maxCount * 100);
+    return `<div class="mvmt-pair-row">
+      <span style="color:#6b7280;margin-right:4px;flex-shrink:0">${i + 1}.</span>
+      <span style="flex:1;color:#9ca3af;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${key}</span>
+      <div style="width:50px;background:#1f2937;border-radius:2px;height:5px;overflow:hidden;margin:0 5px;flex-shrink:0;align-self:center">
+        <div style="width:${pct}%;height:100%;background:#818cf8;border-radius:2px"></div>
+      </div>
+      <span style="color:#6b7280;font-size:0.58rem;flex-shrink:0">${count}</span>
+    </div>`;
+  }).join('');
+}
+
+async function _loadPartyDataForDash(facilityId, collisionIds) {
+  const roseEl = document.getElementById('rank-dash-dir-rose');
+  const mvmtEl = document.getElementById('rank-dash-mvmt');
+  // Guard: ensure the panel still shows the same facility
+  if (G_lastFacilityId !== facilityId) return;
+  if (!collisionIds || collisionIds.length === 0) {
+    if (roseEl) roseEl.innerHTML = '<div style="font-size:0.6rem;color:#4b5563;font-style:italic">No collision IDs</div>';
+    if (mvmtEl) mvmtEl.innerHTML = '<div style="font-size:0.6rem;color:#4b5563;font-style:italic">No collision IDs</div>';
+    return;
+  }
+  const partyData = await _fetchPartyData(collisionIds);
+  if (G_lastFacilityId !== facilityId) return;  // user navigated away during fetch
+  if (roseEl) roseEl.innerHTML = _renderDirectionRose(partyData);
+  if (mvmtEl) mvmtEl.innerHTML = _renderMovementPairs(partyData);
+}
+
+// ---------------------------------------------------------------------------
 // Crash Dashboard Panel
 // ---------------------------------------------------------------------------
 
@@ -2372,6 +2598,10 @@ function openRankDash(facilityId) {
   const dists = typeof p.crash_dists === 'string'
     ? JSON.parse(p.crash_dists)
     : (p.crash_dists ?? {});
+  const ctDist       = dists.conflict_type || {};
+  const collisionIds = typeof p.collision_ids === 'string'
+    ? JSON.parse(p.collision_ids || '[]')
+    : (p.collision_ids || []);
   const total = p.total_5yr || 0;
   const fatal = p.fatal_5yr || 0;
   const sev   = p.severe_5yr || 0;
@@ -2396,24 +2626,61 @@ function openRankDash(facilityId) {
     <span style="color:#6b7280">&#9679;</span> PDO &nbsp;&mdash; shown on map
   </div>`;
 
+  const isInt_d  = (p.facility_type || '') === 'intersection';
+  const aadt_d   = p.aadt != null ? Number(p.aadt) : null;
+  const len_km_d = p.length_m > 0 ? (p.length_m / 1000) : null;
+
   // ── Summary grid ──────────────────────────────────────────────────
   let html = crashOverlayNote + `<div class="dash-summary-grid">
     <div class="dash-sg-cell"><span class="dk">County</span><span class="dv">${p.county || '—'}</span></div>
     <div class="dash-sg-cell"><span class="dk">Road Class</span><span class="dv">${p.road_class || '—'}</span></div>
     <div class="dash-sg-cell"><span class="dk">Type</span><span class="dv">${p.control_type || p.road_type || '—'}</span></div>
     <div class="dash-sg-cell"><span class="dk">Speed</span><span class="dv">${p.speed_mph ? p.speed_mph + ' mph' : '—'}</span></div>
-    ${p.lanes  ? `<div class="dash-sg-cell"><span class="dk">Lanes</span><span class="dv">${p.lanes}</span></div>` : ''}
-    ${p.length_m ? `<div class="dash-sg-cell"><span class="dk">Length</span><span class="dv">${p.length_m}m</span></div>` : ''}
+    ${p.lanes    ? `<div class="dash-sg-cell"><span class="dk">Lanes</span><span class="dv">${p.lanes}</span></div>` : ''}
+    ${p.length_m ? `<div class="dash-sg-cell"><span class="dk">Length</span><span class="dv">${(p.length_m/1000).toFixed(3)} km</span></div>` : ''}
+    ${aadt_d     ? `<div class="dash-sg-cell"><span class="dk">AADT</span><span class="dv">${aadt_d.toLocaleString()} veh/day</span></div>` : ''}
   </div>`;
 
   // ── Score + rank strip ─────────────────────────────────────────────
-  const epdo  = typeof p.epdo_score === 'number' ? p.epdo_score.toFixed(1) : '—';
-  const rate  = typeof p.crash_rate_yr === 'number' ? p.crash_rate_yr.toFixed(2) : '—';
+  const epdo      = typeof p.epdo_score === 'number' ? p.epdo_score.toFixed(1) : '—';
+  const rate      = typeof p.crash_rate_yr === 'number' ? p.crash_rate_yr.toFixed(2) : '—';
+  const epdoRate  = p.epdo_rate != null ? Number(p.epdo_rate).toFixed(3) : null;
+  const rateUnit  = isInt_d ? '/MEV' : '/MV-km';
   html += `<div class="dash-score-strip">
     <div class="dash-score-cell"><div class="dash-score-val" style="color:#ef4444">${epdo}</div><div class="dash-score-lbl">EPDO score</div></div>
     <div class="dash-score-cell"><div class="dash-score-val">${total}</div><div class="dash-score-lbl">crashes / 5yr</div></div>
     <div class="dash-score-cell"><div class="dash-score-val">${rate}</div><div class="dash-score-lbl">crashes / yr</div></div>
+    <div class="dash-score-cell"><div class="dash-score-val">${epdoRate ? epdoRate + rateUnit : '—'}</div><div class="dash-score-lbl">EPDO rate</div></div>
     <div class="dash-score-cell"><div class="dash-score-val">${rankBadge || '—'}</div><div class="dash-score-lbl">rank</div></div>
+  </div>`;
+
+  // ── Calculation transparency ───────────────────────────────────────
+  const weights = typeof p.epdo_weights === 'string' ? JSON.parse(p.epdo_weights || '{}') : (p.epdo_weights || {});
+  const yw      = p.year_window || 5;
+  const wFatal  = weights.fatal        ?? '—';
+  const wSev    = weights.severe_injury ?? '—';
+  const wPdo    = weights.pdo           ?? '—';
+  // EPDO formula string
+  const epdoFormula = `(${fatal}×${wFatal}) + (${sev}×${wSev}) + (${pdo}×${wPdo}) = ${epdo}`;
+  // VMT / MEV
+  let vmtLine = '';
+  if (aadt_d && !isInt_d && len_km_d) {
+    vmtLine = `<div><span style="color:#6b7280">VMT (${yw}yr):</span> <span style="color:#d1d5db">${aadt_d.toLocaleString()} × ${len_km_d.toFixed(3)} km × ${yw} yr = ${(aadt_d * len_km_d * yw).toLocaleString(undefined,{maximumFractionDigits:0})} veh-km</span></div>`;
+  } else if (aadt_d && isInt_d) {
+    const mevVal = (aadt_d * yw / 1_000_000).toFixed(4);
+    vmtLine = `<div><span style="color:#6b7280">MEV (${yw}yr):</span> <span style="color:#d1d5db">${aadt_d.toLocaleString()} × ${yw} yr / 1M = ${mevVal} MEV</span></div>`;
+  }
+  const rateExplain = epdoRate
+    ? `<div><span style="color:#6b7280">EPDO rate:</span> <span style="color:#d1d5db">${epdo} / ${isInt_d ? (aadt_d * yw / 1_000_000).toFixed(4) + ' MEV' : (aadt_d * len_km_d * yw / 1_000_000).toFixed(4) + ' M veh-km'} = <strong style="color:#fbbf24">${epdoRate}${rateUnit}</strong></span></div>`
+    : `<div style="color:#4b5563;font-style:italic">EPDO rate unavailable — no AADT assigned to this facility</div>`;
+
+  html += `<div class="dash-chart-title">Calculation Details</div>
+  <div style="font-size:0.62rem;line-height:1.8;background:#0f1117;border:1px solid #1f2937;border-radius:4px;padding:7px 9px">
+    <div><span style="color:#6b7280">Analysis window:</span> <span style="color:#d1d5db">${yw} years</span></div>
+    <div><span style="color:#6b7280">EPDO weights:</span> <span style="color:#d1d5db">fatal×${wFatal} · injury×${wSev} · PDO×${wPdo}</span></div>
+    <div><span style="color:#6b7280">EPDO formula:</span> <span style="color:#d1d5db">${epdoFormula}</span></div>
+    ${vmtLine}
+    ${rateExplain}
   </div>`;
 
   // ── Severity ───────────────────────────────────────────────────────
@@ -2423,6 +2690,15 @@ function openRankDash(facilityId) {
     ${_dashBar('PDO',     pdo,   total, '#6b7280',  true)}`;
 
   if (total > 0) {
+    // ── Conflict type + Direction rose (two-column) ─────────────────
+    html += `<div class="dash-chart-title">Conflict Type &amp; Travel Direction</div>
+    <div class="dash-conflict-dir">
+      <div>${_renderConflictBars(ctDist)}</div>
+      <div id="rank-dash-dir-rose"><div class="dash-party-loading">Loading direction…</div></div>
+    </div>
+    <div class="dash-chart-title">Top Movement Conflicts</div>
+    <div id="rank-dash-mvmt"><div class="dash-party-loading">Loading party data…</div></div>`;
+
     // ── Collision type ─────────────────────────────────────────────
     const ctypes = dists.collision_type || {};
     if (Object.keys(ctypes).length) {
@@ -2532,6 +2808,8 @@ function openRankDash(facilityId) {
 
   document.getElementById('rank-dash-body').innerHTML = html;
   document.getElementById('rank-dash-panel').classList.add('open');
+  // Async: fetch party data and populate direction rose + movement pairs
+  _loadPartyDataForDash(facilityId, collisionIds);
 }
 
 function _dashBar(label, count, total, color, showPct = false) {
@@ -2978,21 +3256,141 @@ function _anaSetBinTab(tab) {
   document.getElementById('ana-bins-seg')?.classList.toggle('hidden', tab !== 'seg');
 }
 
+// ---- Bin tree constants & state --------------------------------------------
+
+// Taxonomy: defines tree level order and human-readable value labels per facility type.
+// To add a new bin dimension: add one entry to the relevant array here — no other
+// tree-building logic needs to change.
+const BIN_TAXONOMY = {
+  seg: [
+    { key: 'road_class',  labels: { highway: 'Highway', arterial: 'Arterial', collector: 'Collector', local: 'Local' } },
+    { key: 'speed_bin',   labels: {} },   // raw value used as label (e.g. "<=25mph")
+    { key: 'lane_bin',    labels: { '1-2': '1-2 lanes', '3-4': '3-4 lanes', '5+': '5+ lanes' } },
+  ],
+  int: [
+    { key: 'control_type', labels: { signal: 'Signal', stop: 'All-Way Stop', give_way: 'Yield', uncontrolled: 'Uncontrolled' } },
+    { key: 'road_class',   labels: { highway: 'Highway', arterial: 'Arterial', collector: 'Collector', local: 'Local' } },
+    { key: 'speed_bin',    labels: {} },
+    { key: 'leg_bin',      labels: { 'T-int': '3-leg', '4-leg': '4-leg', multi: '5+-leg' } },
+  ],
+};
+
+// Tracks which tree node paths are expanded.  Path format: "seg|highway" or "int|stop|arterial".
+// Default on load: first-level nodes are expanded (seeded in _anaRenderBinChips).
+const _binTreeExpanded = new Set();
+
 function _anaBinLabel(key) {
-  // Convert bin_key to human-readable label
+  // Convert bin_key to human-readable label (still used by anaLoadRanking bin-label display)
   // int|signal|arterial|26-40mph|4-leg  →  Signal · Arterial · 26-40mph · 4-leg
   // seg|arterial|26-40mph|1-2           →  Arterial · 26-40mph · 1-2 lanes
-  const parts = key.split('|');
-  const type  = parts[0];
-  const attrs = parts.slice(1);
-  const labelMap = {
-    signal: 'Signal', stop: 'All-Way Stop', give_way: 'Yield', uncontrolled: 'Uncontrolled',
-    highway: 'Highway', arterial: 'Arterial', collector: 'Collector', local: 'Local',
-    'T-int': '3-leg', '4-leg': '4-leg', multi: '5+-leg',
-    '1-2': '1-2 lanes', '3-4': '3-4 lanes', '5+': '5+ lanes',
-  };
-  return attrs.map(a => labelMap[a] || a).join(' \u00b7 ');
+  const prefix = key.split('|')[0];
+  const tax    = BIN_TAXONOMY[prefix] || [];
+  return key.split('|').slice(1).map((val, i) => {
+    const lvl = tax[i];
+    return (lvl?.labels?.[val]) || val;
+  }).join(' \u00b7 ');
 }
+
+// ---- Tree builder -----------------------------------------------------------
+
+/**
+ * Build a nested tree from a flat bins dict.
+ * Returns: { [val]: { _count, _hasData, _children: { ... }, _leaf?: {key,info} } }
+ * _leaf is set only at the deepest level (the actual bin).
+ */
+function _buildBinTree(bins, prefix) {
+  const taxonomy = BIN_TAXONOMY[prefix] || [];
+  const root = {};
+
+  for (const [binKey, info] of Object.entries(bins)) {
+    if (!binKey.startsWith(prefix + '|')) continue;
+    const parts = binKey.split('|').slice(1);   // e.g. ['local','<=25mph','1-2']
+    let node = root;
+    for (let i = 0; i < parts.length; i++) {
+      const val = parts[i];
+      if (!node[val]) node[val] = { _count: 0, _hasData: false, _children: {} };
+      node[val]._count   += info.count || 0;
+      node[val]._hasData  = node[val]._hasData || !!info.has_data;
+      if (i === parts.length - 1) {
+        node[val]._leaf = { key: binKey, info };
+      }
+      node = node[val]._children;
+    }
+  }
+  return root;
+}
+
+// ---- Tree renderer ----------------------------------------------------------
+
+/**
+ * Recursively render tree nodes into HTML.
+ * @param {object} node     — current level { val: {_count,_hasData,_children,_leaf?} }
+ * @param {Array}  taxonomy — BIN_TAXONOMY level definitions (for labels)
+ * @param {number} depth    — current depth (0 = first level)
+ * @param {string} path     — parent path, e.g. "seg|highway"
+ */
+function _renderBinTree(node, taxonomy, depth, path) {
+  const indent = depth * 12;
+  let html = '';
+
+  // Sort entries: has_data nodes first, then by count desc
+  const entries = Object.entries(node).sort(([,a],[,b]) => {
+    if (a._hasData !== b._hasData) return a._hasData ? -1 : 1;
+    return (b._count || 0) - (a._count || 0);
+  });
+
+  for (const [val, meta] of entries) {
+    const levelDef  = taxonomy[depth] || {};
+    const label     = levelDef.labels?.[val] || val;
+    const nodePath  = path ? `${path}|${val}` : val;
+    const isLeaf    = !!meta._leaf;
+    const countStr  = meta._count ? meta._count.toLocaleString() : '0';
+
+    if (isLeaf) {
+      // Leaf: clickable bin
+      const isActive = meta._leaf.key === _anaActiveBinKey;
+      const cls      = meta._hasData
+        ? `available${isActive ? ' selected' : ''}`
+        : 'sparse';
+      const onclick  = meta._hasData
+        ? `onclick="anaLoadRanking('${meta._leaf.key}')"`
+        : '';
+      html += `<div class="bin-tree-leaf ${cls}" style="padding-left:${indent}px" ${onclick} title="${meta._leaf.key}">
+        <span class="bin-tree-bullet" style="color:${meta._hasData ? '#7c3aed' : '#374151'}">&#9679;</span>
+        <span class="bin-tree-label">${label}</span>
+        <span class="bin-tree-count">${countStr}</span>
+      </div>`;
+    } else {
+      // Parent: collapsible
+      const isExpanded = _binTreeExpanded.has(nodePath);
+      const arrow      = isExpanded ? '&#9660;' : '&#9654;';
+      const dataClass  = meta._hasData ? 'has-data' : 'no-data';
+      html += `<div class="bin-tree-node">
+        <div class="bin-tree-row ${dataClass}" style="padding-left:${indent}px"
+             onclick="_toggleBinNode('${nodePath}')">
+          <span class="bin-tree-arrow">${arrow}</span>
+          <span class="bin-tree-label">${label}</span>
+          <span class="bin-tree-count">${countStr}</span>
+        </div>`;
+      if (isExpanded) {
+        html += _renderBinTree(meta._children, taxonomy, depth + 1, nodePath);
+      }
+      html += `</div>`;
+    }
+  }
+  return html;
+}
+
+function _toggleBinNode(path) {
+  if (_binTreeExpanded.has(path)) {
+    _binTreeExpanded.delete(path);
+  } else {
+    _binTreeExpanded.add(path);
+  }
+  _anaRenderBinChips();
+}
+
+// ---- Main render entry point ------------------------------------------------
 
 function _anaRenderBinChips() {
   if (!_anaBinsData?.bins) return;
@@ -3001,35 +3399,28 @@ function _anaRenderBinChips() {
   const segEl = document.getElementById('ana-bins-seg');
   if (!intEl || !segEl) return;
 
-  // Group bins by: control type (for int) or road class (for seg), sorted by count desc
-  const intBins = Object.entries(_anaBinsData.bins)
-    .filter(([k]) => k.startsWith('int|'))
-    .sort(([,a],[,b]) => (b.count||0) - (a.count||0));
+  const bins = _anaBinsData.bins;
 
-  const segBins = Object.entries(_anaBinsData.bins)
-    .filter(([k]) => k.startsWith('seg|'))
-    .sort(([,a],[,b]) => (b.count||0) - (a.count||0));
-
-  function chipsHtml(bins) {
-    if (!bins.length) return '<div style="font-size:0.65rem;color:#4b5563">No bins computed yet.</div>';
-    return bins.map(([key, info]) => {
-      const available = info.has_data;
-      const isActive  = key === _anaActiveBinKey;
-      const cls = available ? `available${isActive ? ' selected' : ''}` : 'sparse';
-      const onclick = available ? `onclick="anaLoadRanking('${key}')"` : '';
-      const label = _anaBinLabel(key);
-      const count = info.count ? `<span class="bin-count">${info.count} facilities</span>` : '';
-      return `<span class="ana-bin-chip ${cls}" title="${key}" ${onclick}>${label}${count}</span>`;
-    }).join('');
+  // Seed first-level expansions on very first render
+  if (_binTreeExpanded.size === 0) {
+    for (const key of Object.keys(bins)) {
+      const prefix = key.split('|')[0];
+      const firstVal = key.split('|')[1];
+      if (firstVal) _binTreeExpanded.add(`${prefix}|${firstVal}`);
+    }
   }
 
-  intEl.innerHTML = intBins.length
-    ? `<div class="ana-bin-group-hdr">Intersections</div>${chipsHtml(intBins)}`
-    : '<div style="font-size:0.65rem;color:#4b5563">No intersection bins.</div>';
+  // Build and render segment tree
+  const segTree = _buildBinTree(bins, 'seg');
+  segEl.innerHTML = Object.keys(segTree).length
+    ? _renderBinTree(segTree, BIN_TAXONOMY.seg, 0, 'seg')
+    : '<div style="font-size:0.65rem;color:#4b5563">No segment bins computed yet.</div>';
 
-  segEl.innerHTML = segBins.length
-    ? `<div class="ana-bin-group-hdr">Road Segments</div>${chipsHtml(segBins)}`
-    : '<div style="font-size:0.65rem;color:#4b5563">No segment bins.</div>';
+  // Build and render intersection tree
+  const intTree = _buildBinTree(bins, 'int');
+  intEl.innerHTML = Object.keys(intTree).length
+    ? _renderBinTree(intTree, BIN_TAXONOMY.int, 0, 'int')
+    : '<div style="font-size:0.65rem;color:#4b5563">No intersection bins computed yet.</div>';
 }
 
 // ---- Load a specific bin's rankings ----------------------------------------

@@ -293,3 +293,97 @@ Same fix applied to `parties` and `victims` resource discovery.
 - `TUTORIAL.md` rewritten in English — covers local setup, architecture, Docker, Pi deployment, Cloudflare Tunnel, troubleshooting, and update workflow
 - `Plan.md` translated to English
 - `DEVLOG.md` updated with this session
+
+---
+
+## Session 2026-04-13 — OSM Topology + Conflict & Direction Dashboard
+
+### Problem: crash-to-intersection mapping was inaccurate
+
+OSM infrastructure nodes (traffic_signals, stop, give_way) represent the physical location
+of signal heads or stop bars, NOT the geometric center of the intersection. Multiple such
+nodes exist per intersection (one per approach), causing systematic spatial bias in crash
+matching: crashes were being assigned to the wrong leg of the intersection, or to grade-level
+nodes that lie directly below a freeway overcrossing.
+
+### Fix 1 — Overpass query switched to topological format (`main.py`)
+
+Changed the Overpass query tail from `out geom;` to `out body; >; out skel qt;`.
+
+This recovers node-ID connectivity within ways so we can derive **topological intersection
+centroids** (nodes shared by 2+ rankable road ways). These true geometric centers replace
+the infrastructure nodes as crash matching anchors.
+
+A **two-pass parser** was implemented in `_osm_tile_features()`:
+- **Pass 1**: collect all node coordinates (tagged + skel untagged) into `nodes_dict`
+- **Pass 2**: process ways using their `nodes` arrays; count `node_degree` (how many ways
+  reference each node); emit `intersection_centroid` Point features for nodes with degree ≥ 2
+
+Infrastructure nodes (`traffic_signals`, `stop`, `give_way`) are still captured but stored
+with `_infra_only: True` — used for control-type lookup within `SNAP_R = 25 m`, not for
+crash matching. See `CLAUDE.md` Lessons Learned for full two-pass code pattern.
+
+All 1,328 cached OSM tile files were deleted to force re-fetch with the new format.
+
+### Fix 2 — Freeway overcrossing gate (`build_safety_rankings.py`)
+
+`isfreeway=True` crashes (52 % of Humboldt data) were matching grade-level intersections
+directly below freeway overcrossings. Fix: `freeway_fids` set built from highway-class way
+facilities; freeway crashes are constrained to only match those facilities in `match_crashes()`.
+
+### Feature — Conflict type classification (`build_safety_rankings.py`)
+
+New `_classify_conflict(p)` function derives a high-level conflict category from existing
+crash-cache fields (`collision_type_description`, `motorvehicleinvolvedwithdesc`):
+
+| Category | Source field value |
+|---|---|
+| ped_veh | "PEDESTRIAN" in collision_type or mveh |
+| bike_veh | mveh == "BICYCLE" |
+| angle | collision_type == "BROADSIDE" |
+| rear_end | collision_type == "REAR END" |
+| head_on | collision_type == "HEAD-ON" |
+| sideswipe | collision_type contains "SIDE SWIPE" |
+| overturn | collision_type == "OVERTURNED" |
+| other | everything else |
+
+`conflict_type` distribution added to `crash_dists`; `ped_veh_5yr`, `bike_veh_5yr`,
+`angle_5yr`, `rear_end_5yr`, `head_on_5yr` added as top-level feature properties.
+`collision_ids` (JSON string, max 200) stored on each feature for party data lazy-load.
+
+### Feature — Party data endpoint (`main.py`)
+
+CCRS Parties table has NO `County Code` field — cannot bulk-filter by county.
+Solution: lazy per-collision-id fetch when the dashboard opens.
+
+New endpoint `POST /api/party_data`:
+- Accepts `{ids: [...]}` (max 200 collision IDs)
+- Checks `data/party_cache/{cid}.json` first
+- Fetches uncached IDs via CCRS API using `ThreadPoolExecutor(max_workers=8)`
+- Caches results to disk; empty `[]` written for misses to prevent re-fetching
+
+### Feature — Conflict & Direction dashboard panel (`static/app.js` + `index.html`)
+
+Dashboard now shows two new sections between "Crash Severity" and the existing distribution bars:
+
+**1. Conflict Type & Travel Direction** (two-column, renders immediately from rankings data):
+- Left column: horizontal bars for angle / rear-end / ped-veh / bike-veh / head-on / sideswipe
+- Right column: SVG compass rose — 8 radial bars (N/NE/E/SE/S/SW/W/NW) sized by crash count,
+  populated after async party data fetch
+
+**2. Top Movement Conflicts** (async, shows spinner while loading):
+- Top 5 `MovementPrecCollDescription` party1 × party2 combinations
+- Abbreviation map applied so labels fit in the panel
+
+New JS functions: `_fetchPartyData`, `_renderConflictBars`, `_renderDirectionRose`,
+`_renderMovementPairs`, `_abbrevMovement`, `_loadPartyDataForDash`.
+
+`_loadPartyDataForDash` checks `G_lastFacilityId` before and after the async fetch
+to guard against stale updates when the user opens a different facility mid-flight.
+
+### Status: backend complete, frontend wired — pending re-run of `build_safety_rankings.py`
+
+The backend changes (`main.py`, `build_safety_rankings.py`) and all frontend JS/CSS are in
+place. Rankings must be re-computed to emit `conflict_type` and `collision_ids` fields.
+Run: `python scripts/build_safety_rankings.py --counties humboldt` to verify, then test
+the full dashboard flow in the browser.
