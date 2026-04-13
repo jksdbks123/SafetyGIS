@@ -1280,15 +1280,19 @@ def download_rankings():
 
 @app.get("/api/rankings/bins")
 def list_ranking_bins():
-    """List all bin keys with facility counts."""
+    """List all bin keys with facility counts and group percentile stats."""
     if not os.path.exists(_get_rankings_path()):
         raise HTTPException(404, "Rankings not computed. Run scripts/build_safety_rankings.py first.")
     data = _load_rankings()
     return JSONResponse({
         "generated_at": data["generated_at"],
-        "counties": data["counties_included"],
+        "counties": data.get("counties_included", []),
         "bins": {
-            k: {"count": v["facility_count"], "has_data": "insufficient_data" not in v}
+            k: {
+                "count":       v["facility_count"],
+                "has_data":    "insufficient_data" not in v,
+                "group_stats": v.get("group_stats", {}),
+            }
             for k, v in data["bins"].items()
         },
     })
@@ -1296,7 +1300,7 @@ def list_ranking_bins():
 
 @app.get("/api/rankings/bin/{bin_key:path}")
 def get_ranking_bin(bin_key: str):
-    """Return worst/best facilities for one bin key (URL-encoded pipe separators)."""
+    """Return percentile-ranked facilities for one bin key (top LIST_N by EPDO + group stats)."""
     if not os.path.exists(_get_rankings_path()):
         raise HTTPException(404, "Rankings not computed")
     data = _load_rankings()

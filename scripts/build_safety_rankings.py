@@ -2,7 +2,7 @@
 scripts/build_safety_rankings.py
 
 Offline batch script: spatial-join crash records to OSM facilities, classify
-into multi-dimensional bins, rank worst-10 / best-10 statewide.
+into multi-dimensional bins, and assign EPDO percentile ranks within peer groups.
 
 Output: data/rankings/statewide.json  (served by main.py /api/rankings/*)
 
@@ -16,6 +16,7 @@ Usage:
 """
 
 import argparse
+import bisect
 import gc
 import json
 import math
@@ -126,7 +127,7 @@ LEG_COUNT_R    = 30.0   # way endpoint → node (for leg count)
 SNAP_R         = 25.0   # infra node → centroid (for control-type derivation)
 
 MIN_FACILITIES = 20   # minimum per bin to produce rankings
-TOP_N          = 10   # worst / best count
+LIST_N         = 20   # facilities returned in top-by-EPDO list per bin
 
 # ---------------------------------------------------------------------------
 # CA_COUNTIES  (county_name → (ccrs_code, (south, west, north, east)))
@@ -772,9 +773,59 @@ def process_county(county_name: str, global_stats: dict,
 
 _SEV_CODE = {"fatal": "f", "severe_injury": "s"}  # default = "p" (PDO)
 
+
+# ---------------------------------------------------------------------------
+# Percentile helpers
+# ---------------------------------------------------------------------------
+
+def _pct(sorted_vals: list, p: float) -> float:
+    """Compute pth percentile (0-100) from a sorted list via linear interpolation."""
+    n = len(sorted_vals)
+    if n == 0:
+        return 0.0
+    if n == 1:
+        return float(sorted_vals[0])
+    idx = p / 100.0 * (n - 1)
+    lo  = int(idx)
+    hi  = min(lo + 1, n - 1)
+    frac = idx - lo
+    return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
+
+
+def _epdo_pct_rank(epdo: float, sorted_vals: list) -> float:
+    """Return the mid-rank percentile of epdo within sorted_vals (0-100).
+    Uses (lo + hi) / 2 to handle ties, matching scipy.stats.percentileofscore(kind='mean')."""
+    n = len(sorted_vals)
+    if n == 0:
+        return 50.0
+    lo = bisect.bisect_left(sorted_vals, epdo)
+    hi = bisect.bisect_right(sorted_vals, epdo)
+    return (lo + hi) / 2.0 / n * 100.0
+
+
+def _epdo_band(pct: float) -> str:
+    """Assign an objective band label based on EPDO percentile rank within the peer group.
+
+    Bin justification (EPDO is right-skewed — most facilities have 0-few crashes):
+      P50 (median)  — more robust "typical" reference than mean for skewed data
+      P75           — upper-quartile boundary; standard IQR threshold in engineering
+      P90           — top decile; common high-priority threshold in HSM literature
+      P95           — top 5%; critical tier where intervention is most urgent
+    """
+    if pct >= 95:
+        return "critical"       # top 5%
+    if pct >= 90:
+        return "high_priority"  # top 10%
+    if pct >= 75:
+        return "elevated"       # top 25%
+    if pct >= 50:
+        return "above_median"   # upper half, below top quartile
+    return "below_median"       # lower half
+
+
 def _make_feature(fid: str, stats: dict,
-                  rank_worst: int | None, rank_best: int | None,
-                  similar_best: list) -> dict:
+                  epdo_percentile: float,
+                  group_stats: dict) -> dict:
     # Compact crash coords: [[lon, lat, sev_code], ...]  (max 200 crashes stored)
     crash_list = stats.get("crash_list", [])
     crash_coords = json.dumps([
@@ -807,48 +858,58 @@ def _make_feature(fid: str, stats: dict,
         "type":     "Feature",
         "geometry": stats["geometry"],
         "properties": {
-            "facility_id":   fid,
-            "facility_type": stats["facility_type"],
-            "bin_key":       stats["bin_key"],
-            "rank_worst":    rank_worst,
-            "rank_best":     rank_best,
-            "epdo_score":    stats["epdo"],
-            "epdo_rate":     epdo_rate,       # per MV-km (segment) or per MEV (intersection)
-            "vmt_5yr":       vmt_5yr,         # million vehicle-km over analysis window (segment only)
-            "epdo_weights":  dict(EPDO),      # fatal/severe/other/pdo weights used
-            "year_window":   YEAR_WINDOW,
-            "fatal_5yr":     stats["fatal"],
-            "severe_5yr":    stats["severe"],
-            "total_5yr":     stats["total"],
-            "crash_rate_yr": round(stats["total"] / YEAR_WINDOW, 2),
-            "county":        stats["county"],
-            "road_type":     stats["road_type"],
-            "road_class":    stats["road_class"],
-            "name":          stats["name"],
-            "speed_mph":     stats["speed_mph"],
-            "lanes":         stats["lanes"],
-            "length_m":      stats["length_m"],
-            "similar_best":  similar_best,
-            "crash_dists":   stats.get("dists", {}),
-            "crash_coords":  crash_coords,
-            "collision_ids": collision_ids,
-            "aadt":          aadt,
-            # Conflict type counts (from crash_dists.conflict_type, pre-computed for quick access)
-            "ped_veh_5yr":   stats.get("dists", {}).get("conflict_type", {}).get("ped_veh",  0),
-            "bike_veh_5yr":  stats.get("dists", {}).get("conflict_type", {}).get("bike_veh", 0),
-            "angle_5yr":     stats.get("dists", {}).get("conflict_type", {}).get("angle",    0),
-            "rear_end_5yr":  stats.get("dists", {}).get("conflict_type", {}).get("rear_end", 0),
-            "head_on_5yr":   stats.get("dists", {}).get("conflict_type", {}).get("head_on",  0),
+            "facility_id":    fid,
+            "facility_type":  stats["facility_type"],
+            "bin_key":        stats["bin_key"],
+            "epdo_score":     stats["epdo"],
+            "epdo_rate":      epdo_rate,      # per MV-km (segment) or per MEV (intersection)
+            "vmt_5yr":        vmt_5yr,        # million vehicle-km over analysis window (segment only)
+            "epdo_weights":   dict(EPDO),     # fatal/severe/other/pdo weights used
+            "year_window":    YEAR_WINDOW,
+            "epdo_percentile": round(epdo_percentile, 1),  # 0-100, mid-rank within peer group
+            "epdo_band":       _epdo_band(epdo_percentile),
+            "group_stats":    json.dumps(group_stats),  # {n, mean, p50, p75, p90, p95}
+            "fatal_5yr":      stats["fatal"],
+            "severe_5yr":     stats["severe"],
+            "total_5yr":      stats["total"],
+            "crash_rate_yr":  round(stats["total"] / YEAR_WINDOW, 2),
+            "county":         stats["county"],
+            "road_type":      stats["road_type"],
+            "road_class":     stats["road_class"],
+            "control_type":   stats.get("control_type"),
+            "name":           stats["name"],
+            "speed_mph":      stats["speed_mph"],
+            "lanes":          stats["lanes"],
+            "length_m":       stats["length_m"],
+            "crash_dists":    stats.get("dists", {}),
+            "crash_coords":   crash_coords,
+            "collision_ids":  collision_ids,
+            "aadt":           aadt,
+            # Conflict type counts (pre-computed for quick access in popup)
+            "ped_veh_5yr":    stats.get("dists", {}).get("conflict_type", {}).get("ped_veh",  0),
+            "bike_veh_5yr":   stats.get("dists", {}).get("conflict_type", {}).get("bike_veh", 0),
+            "angle_5yr":      stats.get("dists", {}).get("conflict_type", {}).get("angle",    0),
+            "rear_end_5yr":   stats.get("dists", {}).get("conflict_type", {}).get("rear_end", 0),
+            "head_on_5yr":    stats.get("dists", {}).get("conflict_type", {}).get("head_on",  0),
             # Future enrichment placeholders:
             "turn_channelization": None,
-            "median_type":       None,
+            "median_type":         None,
         },
     }
 
 
 def rank_statewide(global_stats: dict) -> dict:
-    """Group all facilities by bin_key, produce worst/best lists per bin."""
-    # Group
+    """Group facilities by bin_key; compute percentile distribution and top-LIST_N list per bin.
+
+    Percentile approach replaces worst/best rank positions:
+      - Each facility receives an epdo_percentile (0-100) relative to its peer group.
+      - Percentile bins: P50 (median), P75, P90, P95 — chosen because EPDO is right-skewed
+        and these thresholds align with engineering practice (IQR boundary, HSM top-decile).
+      - Band labels are objective: below_median / above_median / elevated / high_priority / critical.
+      - top_by_epdo returns the LIST_N facilities with highest EPDO (sorted desc) for the browser.
+        No 'best' list — zero crashes means no recorded crashes, not inherent safety.
+    """
+    # Group by bin_key
     groups: dict = {}
     for fid, stats in global_stats.items():
         groups.setdefault(stats["bin_key"], []).append((fid, stats))
@@ -860,34 +921,50 @@ def rank_statewide(global_stats: dict) -> dict:
             result[bin_key] = {
                 "facility_count": count,
                 "insufficient_data": True,
-                "worst": [],
-                "best":  [],
+                "top_by_epdo": [],
+                "group_stats": {},
             }
             continue
 
-        # Worst: sort by epdo desc, require ≥2 crashes
-        sorted_worst = sorted(entries, key=lambda x: (-x[1]["epdo"], -x[1]["total"]))
-        # Best: sort by epdo asc (zero-crash facilities are safest)
-        sorted_best  = sorted(entries, key=lambda x: (x[1]["epdo"], x[1]["total"]))
+        # Build sorted EPDO value list for percentile computation
+        epdo_vals = sorted(s["epdo"] for _, s in entries)
+        n = len(epdo_vals)
+        mean_epdo = sum(epdo_vals) / n
+        p50  = _pct(epdo_vals, 50)
+        p75  = _pct(epdo_vals, 75)
+        p90  = _pct(epdo_vals, 90)
+        p95  = _pct(epdo_vals, 95)
 
-        worst_entries = [(fid, s) for fid, s in sorted_worst if s["total"] >= 2][:TOP_N]
-        best_entries  = sorted_best[:TOP_N]
+        group_stats = {
+            "n":    n,
+            "mean": round(mean_epdo, 2),
+            "p50":  round(p50, 2),
+            "p75":  round(p75, 2),
+            "p90":  round(p90, 2),
+            "p95":  round(p95, 2),
+        }
 
-        # similar_best: best facilities sharing the same road_class as each worst entry
-        best_by_class: dict = {}
-        for fid_b, s_b in best_entries:
-            best_by_class.setdefault(s_b["road_class"], []).append(fid_b)
+        # Assign per-facility percentile rank
+        pct_map = {
+            fid: _epdo_pct_rank(s["epdo"], epdo_vals)
+            for fid, s in entries
+        }
+
+        # Top-LIST_N by EPDO descending (require ≥1 crash so zero-crash facilities
+        # don't occupy all slots when most of the group has no recorded crashes)
+        sorted_by_epdo = sorted(entries, key=lambda x: (-x[1]["epdo"], -x[1]["total"]))
+        top_entries = [(fid, s) for fid, s in sorted_by_epdo if s["total"] >= 1][:LIST_N]
+        # If fewer than LIST_N have crashes, backfill with zero-crash entries
+        if len(top_entries) < LIST_N:
+            zero_entries = [(fid, s) for fid, s in sorted_by_epdo if s["total"] == 0]
+            top_entries += zero_entries[:LIST_N - len(top_entries)]
 
         result[bin_key] = {
             "facility_count": count,
-            "worst": [
-                _make_feature(fid, s, rank + 1, None,
-                              best_by_class.get(s["road_class"], [])[:3])
-                for rank, (fid, s) in enumerate(worst_entries)
-            ],
-            "best": [
-                _make_feature(fid, s, None, rank + 1, [])
-                for rank, (fid, s) in enumerate(best_entries)
+            "group_stats":    group_stats,
+            "top_by_epdo": [
+                _make_feature(fid, s, pct_map[fid], group_stats)
+                for fid, s in top_entries
             ],
         }
 

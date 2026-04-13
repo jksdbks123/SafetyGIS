@@ -2261,9 +2261,11 @@ function setupRankingInteractions() {
   });
 }
 
-// Stores for full feature props (needed because MapLibre truncates properties in tiles)
-const G_rankWorstMap = new Map();  // facility_id → GeoJSON Feature
-const G_rankBestMap  = new Map();
+// Store for full feature props (needed because MapLibre truncates properties in tiles)
+const G_rankFacilityMap = new Map();  // facility_id → GeoJSON Feature (all ranked facilities)
+// Aliases kept for any internal references during refactor
+const G_rankWorstMap = G_rankFacilityMap;
+const G_rankBestMap  = G_rankFacilityMap;
 
 function _rankPopupHtml(p) {
   const isInt  = (p.facility_type || '') === 'intersection';
@@ -2292,9 +2294,16 @@ function _rankPopupHtml(p) {
   const epdoRate  = p.epdo_rate  != null ? p.epdo_rate.toFixed(3)  : null;
   const rateUnit  = isInt ? '/MEV' : '/MV-km';
 
-  const rankW  = p.rank_worst != null ? `<span style="color:#f87171;font-weight:600">#${p.rank_worst} worst</span>` : '';
-  const rankB  = p.rank_best  != null ? `<span style="color:#4ade80;font-weight:600">#${p.rank_best} best</span>` : '';
-  const rankStr = [rankW, rankB].filter(Boolean).join(' &nbsp;·&nbsp; ');
+  const pct       = p.epdo_percentile != null ? Math.round(p.epdo_percentile) : null;
+  const band      = p.epdo_band || '';
+  const BAND_COLORS = { critical: '#ef4444', high_priority: '#f97316', elevated: '#facc15',
+                        above_median: '#9ca3af', below_median: '#4b5563' };
+  const BAND_LABELS = { critical: 'Critical (top 5%)', high_priority: 'High Priority (top 10%)',
+                        elevated: 'Elevated (top 25%)', above_median: 'Above Median',
+                        below_median: 'Below Median' };
+  const pctStr = pct != null
+    ? `<span style="color:${BAND_COLORS[band] || '#9ca3af'};font-weight:600">P${pct} &mdash; ${BAND_LABELS[band] || band}</span>`
+    : '';
 
   function row(label, val) {
     if (val == null || val === '—' || val === '') return '';
@@ -2307,7 +2316,7 @@ function _rankPopupHtml(p) {
   return `<div style="font-size:0.72rem;line-height:1.6;font-family:inherit;min-width:200px">
     <div style="font-weight:700;color:#fff;margin-bottom:2px;font-size:0.8rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:240px">${name}</div>
     <div style="color:#6b7280;margin-bottom:6px;font-size:0.63rem">${county} &nbsp;·&nbsp; ${ftype}</div>
-    ${rankStr ? `<div style="margin-bottom:6px;font-size:0.72rem">${rankStr}</div>` : ''}
+    ${pctStr ? `<div style="margin-bottom:6px;font-size:0.68rem">${pctStr}</div>` : ''}
     <table style="width:100%;border-collapse:collapse;margin-bottom:7px">
       ${isInt ? row('Control', ctrl) : ''}
       ${row('Road class', cls)}
@@ -2335,37 +2344,28 @@ function _rankPopupHtml(p) {
 
 let G_lastFacilityId = null;  // last facility opened via openRankDash, for overlay restore
 
-function _renderRankingsMap(worst, best) {
-  G_rankWorstMap.clear();
-  G_rankBestMap.clear();
-  worst.forEach(f => G_rankWorstMap.set(f.properties?.facility_id, f));
-  best.forEach(f  => G_rankBestMap.set(f.properties?.facility_id, f));
+function _renderRankingsMap(facilities) {
+  G_rankFacilityMap.clear();
+  facilities.forEach(f => G_rankFacilityMap.set(f.properties?.facility_id, f));
 
   const worstSrc = map.getSource('rankings-worst');
   const bestSrc  = map.getSource('rankings-best');
-  if (worstSrc) worstSrc.setData({ type: 'FeatureCollection', features: worst });
-  if (bestSrc)  bestSrc.setData({ type: 'FeatureCollection', features: best });
+  if (worstSrc) worstSrc.setData({ type: 'FeatureCollection', features: facilities });
+  if (bestSrc)  bestSrc.setData({ type: 'FeatureCollection', features: [] });
 }
 
 // After a basemap style switch, sources are recreated empty. Re-populate from in-memory Maps.
 function _restoreRankingsData() {
-  if (G_rankWorstMap.size > 0) {
-    map.getSource('rankings-worst')?.setData({
-      type: 'FeatureCollection', features: [...G_rankWorstMap.values()],
-    });
+  if (G_rankFacilityMap.size > 0) {
+    const feats = [...G_rankFacilityMap.values()];
+    map.getSource('rankings-worst')?.setData({ type: 'FeatureCollection', features: feats });
+    map.getSource('rankings-best')?.setData({ type: 'FeatureCollection', features: [] });
     LAYER_VISIBILITY['rankings-worst'] = true;
     _syncLayerVisibility('rankings-worst');
   }
-  if (G_rankBestMap.size > 0) {
-    map.getSource('rankings-best')?.setData({
-      type: 'FeatureCollection', features: [...G_rankBestMap.values()],
-    });
-    LAYER_VISIBILITY['rankings-best'] = true;
-    _syncLayerVisibility('rankings-best');
-  }
   // Restore facility overlay if a facility was open
   if (G_lastFacilityId) {
-    const feat = G_rankWorstMap.get(G_lastFacilityId) ?? G_rankBestMap.get(G_lastFacilityId);
+    const feat = G_rankFacilityMap.get(G_lastFacilityId);
     if (feat) _renderFacilityOverlay(feat);
   }
 }
@@ -2584,6 +2584,93 @@ async function _loadPartyDataForDash(facilityId, collisionIds) {
 }
 
 // ---------------------------------------------------------------------------
+// Crash Dashboard Panel — percentile chart
+// ---------------------------------------------------------------------------
+
+/**
+ * Render an SVG strip showing where this facility sits within its peer-group EPDO distribution.
+ *
+ * Layout (left→right):
+ *   [gray 0–P50][amber P50–P75][orange P75–P90][red P90–P95][dark-red P95–100]
+ *   Tick marks at P50, P75, P90, P95; triangle indicator at this facility's percentile.
+ *
+ * @param {number} epdoScore  — EPDO value of this facility
+ * @param {number} pct        — percentile rank (0-100)
+ * @param {object} gs         — {n, mean, p50, p75, p90, p95}
+ */
+function _renderPercentileChart(epdoScore, pct, gs) {
+  const W = 240, H = 28, BAR_H = 10, BAR_Y = 6;
+  const pctToX = p => Math.round(p / 100 * W);
+
+  // Coloured bands
+  const bands = [
+    { from: 0,   to: 50,  color: '#374151' },
+    { from: 50,  to: 75,  color: '#78350f' },
+    { from: 75,  to: 90,  color: '#9a3412' },
+    { from: 90,  to: 95,  color: '#991b1b' },
+    { from: 95,  to: 100, color: '#7f1d1d' },
+  ];
+  let barsHtml = bands.map(b =>
+    `<rect x="${pctToX(b.from)}" y="${BAR_Y}" width="${pctToX(b.to) - pctToX(b.from)}" height="${BAR_H}" fill="${b.color}"/>`
+  ).join('');
+
+  // Tick marks + labels at P50, P75, P90, P95
+  const ticks = [
+    { p: 50,  label: 'P50',  val: gs.p50 },
+    { p: 75,  label: 'P75',  val: gs.p75 },
+    { p: 90,  label: 'P90',  val: gs.p90 },
+    { p: 95,  label: 'P95',  val: gs.p95 },
+  ];
+  let ticksHtml = ticks.map(t => {
+    const x = pctToX(t.p);
+    return `<line x1="${x}" y1="${BAR_Y - 2}" x2="${x}" y2="${BAR_Y + BAR_H + 2}" stroke="#6b7280" stroke-width="0.8"/>
+      <text x="${x}" y="${BAR_Y + BAR_H + 10}" text-anchor="middle" font-size="6" fill="#6b7280">${t.label}</text>`;
+  }).join('');
+
+  // Mean indicator (dashed line)
+  const meanPct = gs.p50 != null ? null : null;  // mean position unknown without all values; skip
+  // (we don't store mean's percentile position — just annotate the bar visually)
+
+  // Facility indicator triangle + EPDO label
+  const indX = pctToX(pct);
+  const DBAND_FG = { critical: '#ef4444', high_priority: '#f97316', elevated: '#facc15',
+                     above_median: '#9ca3af', below_median: '#6b7280' };
+  const band = (epdoScore != null && gs.p95 != null)
+    ? (pct >= 95 ? 'critical' : pct >= 90 ? 'high_priority' : pct >= 75 ? 'elevated' : pct >= 50 ? 'above_median' : 'below_median')
+    : 'above_median';
+  const indColor = DBAND_FG[band] || '#9ca3af';
+  // Downward-pointing triangle at top of bar
+  const triY = BAR_Y - 1;
+  const triSize = 4;
+  const triPts = `${indX},${triY + triSize} ${indX - triSize},${triY - triSize} ${indX + triSize},${triY - triSize}`;
+
+  // EPDO value label near indicator (above if near right edge, else above)
+  const labelAnchor = indX > W - 30 ? 'end' : indX < 30 ? 'start' : 'middle';
+  const labelX = Math.min(W - 2, Math.max(2, indX));
+  const indicatorHtml = `
+    <polygon points="${triPts}" fill="${indColor}"/>
+    <text x="${labelX}" y="${triY - triSize - 2}" text-anchor="${labelAnchor}" font-size="6.5" fill="${indColor}" font-weight="bold">
+      EPDO ${typeof epdoScore === 'number' ? epdoScore.toFixed(1) : epdoScore} · P${Math.round(pct)}
+    </text>`;
+
+  // Scale labels: 0 and 100 at ends
+  const scaleHtml = `
+    <text x="1" y="${BAR_Y + BAR_H + 10}" text-anchor="start" font-size="6" fill="#4b5563">0</text>
+    <text x="${W - 1}" y="${BAR_Y + BAR_H + 10}" text-anchor="end" font-size="6" fill="#4b5563">100</text>`;
+
+  return `<div style="padding:4px 0 8px;overflow:hidden">
+    <svg viewBox="0 0 ${W} ${H}" width="100%" height="${H}" style="display:block;overflow:visible">
+      ${barsHtml}${ticksHtml}${indicatorHtml}${scaleHtml}
+    </svg>
+    <div style="font-size:0.58rem;color:#4b5563;line-height:1.7;margin-top:2px">
+      Peer group mean EPDO: <span style="color:#9ca3af">${gs.mean}</span> &nbsp;·&nbsp;
+      Median (P50): <span style="color:#9ca3af">${gs.p50}</span> &nbsp;·&nbsp;
+      n = <span style="color:#9ca3af">${gs.n.toLocaleString()}</span>
+    </div>
+  </div>`;
+}
+
+// ---------------------------------------------------------------------------
 // Crash Dashboard Panel
 // ---------------------------------------------------------------------------
 
@@ -2607,13 +2694,20 @@ function openRankDash(facilityId) {
   const sev   = p.severe_5yr || 0;
   const pdo   = Math.max(0, total - fatal - sev);
 
-  const rankWorst = p.rank_worst != null ? `#${p.rank_worst} worst` : null;
-  const rankBest  = p.rank_best  != null ? `#${p.rank_best} safest` : null;
-  const rankBadge = rankWorst
-    ? `<span style="background:#7f1d1d;color:#fca5a5;padding:1px 6px;border-radius:3px">${rankWorst}</span>`
-    : rankBest
-      ? `<span style="background:#14532d;color:#86efac;padding:1px 6px;border-radius:3px">${rankBest}</span>`
-      : '';
+  const epdo_pct  = p.epdo_percentile != null ? Math.round(p.epdo_percentile) : null;
+  const epdo_band = p.epdo_band || '';
+  const DBAND_BG  = { critical: '#7f1d1d', high_priority: '#431407', elevated: '#422006',
+                      above_median: '#1f2937', below_median: '#111827' };
+  const DBAND_FG  = { critical: '#fca5a5', high_priority: '#fed7aa', elevated: '#fde68a',
+                      above_median: '#9ca3af', below_median: '#6b7280' };
+  const DBAND_LBL = { critical: 'Critical (top 5%)', high_priority: 'High Priority (top 10%)',
+                      elevated: 'Elevated (top 25%)', above_median: 'Above Median (top 50%)',
+                      below_median: 'Below Median' };
+  const rankBadge = epdo_pct != null
+    ? `<span style="background:${DBAND_BG[epdo_band]||'#1f2937'};color:${DBAND_FG[epdo_band]||'#9ca3af'};padding:1px 8px;border-radius:3px">
+        P${epdo_pct} &mdash; ${DBAND_LBL[epdo_band] || epdo_band}
+      </span>`
+    : '';
 
   const title = p.name || p.facility_id || 'Facility';
   document.getElementById('rank-dash-title').textContent = title;
@@ -2673,6 +2767,13 @@ function openRankDash(facilityId) {
   const rateExplain = epdoRate
     ? `<div><span style="color:#6b7280">EPDO rate:</span> <span style="color:#d1d5db">${epdo} / ${isInt_d ? (aadt_d * yw / 1_000_000).toFixed(4) + ' MEV' : (aadt_d * len_km_d * yw / 1_000_000).toFixed(4) + ' M veh-km'} = <strong style="color:#fbbf24">${epdoRate}${rateUnit}</strong></span></div>`
     : `<div style="color:#4b5563;font-style:italic">EPDO rate unavailable — no AADT assigned to this facility</div>`;
+
+  // ── Percentile chart ──────────────────────────────────────────────
+  const gs = typeof p.group_stats === 'string' ? JSON.parse(p.group_stats || '{}') : (p.group_stats || {});
+  if (gs.n && epdo_pct != null) {
+    html += `<div class="dash-chart-title">EPDO Percentile in Peer Group (n=${gs.n.toLocaleString()})</div>
+    ${_renderPercentileChart(p.epdo_score, epdo_pct, gs)}`;
+  }
 
   html += `<div class="dash-chart-title">Calculation Details</div>
   <div style="font-size:0.62rem;line-height:1.8;background:#0f1117;border:1px solid #1f2937;border-radius:4px;padding:7px 9px">
@@ -2790,20 +2891,6 @@ function openRankDash(facilityId) {
       });
     }
 
-    // ── Similar safe facilities ────────────────────────────────────
-    const similar = Array.isArray(p.similar_best) ? p.similar_best
-      : (typeof p.similar_best === 'string' ? JSON.parse(p.similar_best || '[]') : []);
-    if (similar.length) {
-      html += `<div class="dash-chart-title">Similar Safe Facilities</div>
-      <div style="font-size:0.62rem;color:#6b7280;line-height:1.6">`;
-      similar.forEach(fid => {
-        const sf = G_rankBestMap.get(fid);
-        const sn = sf?.properties?.name || fid;
-        const se = sf?.properties?.epdo_score != null ? ` · EPDO ${sf.properties.epdo_score.toFixed(1)}` : '';
-        html += `<div style="cursor:pointer;color:#86efac" onclick="openRankDash('${fid}')">${sn}${se}</div>`;
-      });
-      html += `</div>`;
-    }
   }
 
   document.getElementById('rank-dash-body').innerHTML = html;
@@ -3458,21 +3545,19 @@ async function anaLoadRanking(binKey) {
     }
 
     // Render on map
-    _renderRankingsMap(data.worst || [], data.best || []);
+    const facilities = data.top_by_epdo || [];
+    _renderRankingsMap(facilities);
     if (typeof LAYER_VISIBILITY !== 'undefined') {
       LAYER_VISIBILITY['rankings-worst'] = true;
-      LAYER_VISIBILITY['rankings-best']  = true;
       if (typeof _syncLayerVisibility === 'function') {
         _syncLayerVisibility('rankings-worst');
-        _syncLayerVisibility('rankings-best');
       }
     }
 
-    // Fly to bounding box of all ranked facilities
-    const allFeats = [...(data.worst || []), ...(data.best || [])];
-    if (allFeats.length) {
-      const lngs = allFeats.map(f => f.geometry?.coordinates?.[0]).filter(Number.isFinite);
-      const lats = allFeats.map(f => f.geometry?.coordinates?.[1]).filter(Number.isFinite);
+    // Fly to bounding box of shown facilities
+    if (facilities.length) {
+      const lngs = facilities.map(f => f.geometry?.coordinates?.[0]).filter(Number.isFinite);
+      const lats = facilities.map(f => f.geometry?.coordinates?.[1]).filter(Number.isFinite);
       if (lngs.length) {
         map.fitBounds(
           [[Math.min(...lngs), Math.min(...lats)], [Math.max(...lngs), Math.max(...lats)]],
@@ -3482,7 +3567,7 @@ async function anaLoadRanking(binKey) {
     }
 
     // Render table
-    _anaRenderRankTable(data.worst || [], data.best || []);
+    _anaRenderRankTable(facilities, data.group_stats || {});
 
     // Update bin label with count
     if (binLabel && data.facility_count) {
@@ -3498,35 +3583,52 @@ async function anaLoadRanking(binKey) {
   }
 }
 
-function _anaRenderRankTable(worst, best) {
+const _BAND_COLORS = { critical: '#ef4444', high_priority: '#f97316', elevated: '#facc15',
+                       above_median: '#9ca3af', below_median: '#4b5563' };
+const _BAND_SHORT  = { critical: 'Critical', high_priority: 'High', elevated: 'Elevated',
+                       above_median: 'Above Median', below_median: 'Below Median' };
+
+function _anaRenderRankTable(facilities, groupStats) {
   const el = document.getElementById('ana-rank-results');
   if (!el) return;
 
-  function rowHtml(feat, rankProp, side) {
+  // Group stats summary bar
+  let statsHtml = '';
+  if (groupStats && groupStats.n) {
+    const gs = groupStats;
+    statsHtml = `<div style="font-size:0.6rem;color:#6b7280;background:#0f1117;border:1px solid #1f2937;border-radius:4px;padding:6px 8px;margin-bottom:8px;line-height:1.8">
+      <span style="color:#9ca3af;font-weight:600">Peer group (n=${gs.n.toLocaleString()})</span> &nbsp;·&nbsp;
+      Mean <span style="color:#d1d5db">${gs.mean}</span> &nbsp;·&nbsp;
+      P50 <span style="color:#d1d5db">${gs.p50}</span> &nbsp;·&nbsp;
+      P75 <span style="color:#facc15">${gs.p75}</span> &nbsp;·&nbsp;
+      P90 <span style="color:#f97316">${gs.p90}</span> &nbsp;·&nbsp;
+      P95 <span style="color:#ef4444">${gs.p95}</span>
+    </div>`;
+  }
+
+  function rowHtml(feat) {
     if (!feat) return '';
     const p    = feat.properties ?? {};
-    const rank = p[rankProp] ?? '—';
     const name = p.name || (p.facility_id ? p.facility_id.replace(/^[nw]/, '#') : '—');
     const epdo = typeof p.epdo_score === 'number' ? p.epdo_score.toFixed(1) : '—';
     const f    = p.fatal_5yr ?? 0;
     const s    = p.severe_5yr ?? 0;
     const fid  = p.facility_id || '';
-    return `<div class="ana-rank-row" onclick="openRankDash('${fid}')" title="Click to inspect on map">
-      <span class="ana-rank-num">#${rank}</span> ${name}<br>
-      <span class="ana-rank-epdo ${side}">EPDO ${epdo}</span>
-      <span style="color:#6b7280;font-size:0.58rem"> ${f}K ${s}S</span>
+    const pct  = p.epdo_percentile != null ? Math.round(p.epdo_percentile) : null;
+    const band = p.epdo_band || '';
+    const pctLabel = pct != null
+      ? `<span style="color:${_BAND_COLORS[band] || '#9ca3af'};font-size:0.58rem">P${pct} ${_BAND_SHORT[band] || ''}</span>`
+      : '';
+    return `<div class="ana-rank-row" onclick="openRankDash('${fid}')" title="Click to open crash dashboard">
+      ${name}<br>
+      <span class="ana-rank-epdo worst">EPDO ${epdo}</span>
+      <span style="color:#6b7280;font-size:0.58rem"> ${f}K ${s}S &nbsp;</span>${pctLabel}
     </div>`;
   }
 
-  el.innerHTML = `<div class="ana-rank-grid">
-    <div>
-      <div class="ana-rank-col-hdr worst">Worst 10</div>
-      ${worst.map(f => rowHtml(f, 'rank_worst', 'worst')).join('')}
-    </div>
-    <div>
-      <div class="ana-rank-col-hdr best">Best 10</div>
-      ${best.map(f => rowHtml(f, 'rank_best', 'best')).join('')}
-    </div>
+  el.innerHTML = statsHtml + `<div>
+    <div class="ana-rank-col-hdr" style="color:#9ca3af">Top ${facilities.length} by EPDO Score</div>
+    ${facilities.map(f => rowHtml(f)).join('')}
   </div>`;
 }
 
