@@ -1213,79 +1213,62 @@ function cancelPegmanMode() {
 // Panel drag + resize (shared utility for all floating panels)
 // ---------------------------------------------------------------------------
 
+// Single active operation shared across all panels — one mousemove/mouseup pair total.
+let _piActiveOp = null;  // { type: 'drag'|'resize', panel?, offX?, offY?, sX?, sY?, sW?, sH?, onMove? }
+document.addEventListener('mousemove', e => {
+  const op = _piActiveOp;
+  if (!op) return;
+  if (op.type === 'drag') {
+    const x = Math.max(0, Math.min(window.innerWidth  - 40, e.clientX - op.offX));
+    const y = Math.max(0, Math.min(window.innerHeight - 40, e.clientY - op.offY));
+    op.panel.style.left = x + 'px'; op.panel.style.top = y + 'px';
+    op.panel.style.right = 'auto';  op.panel.style.bottom = 'auto';
+  } else {
+    op.onMove(e.clientX - op.sX, e.clientY - op.sY, op.sW, op.sH);
+  }
+});
+document.addEventListener('mouseup', () => { _piActiveOp = null; });
+
 /**
- * Make a panel draggable by its header and resizable at its edges/corners.
- * Works for panels that are position:absolute or position:fixed.
- * Call once per panel; safe to call again (guards with _piInited flag).
- *
- * @param {HTMLElement} panelEl  — the panel root
- * @param {HTMLElement} handleEl — drag handle (header bar / h2 element)
- * @param {{ minW?: number, minH?: number }} opts
+ * Make a panel draggable by its header and resizable at right/bottom/corner.
+ * Works for position:absolute or position:fixed panels. Idempotent (_piInited flag).
  */
 function _initPanelInteractive(panelEl, handleEl, { minW = 180, minH = 120 } = {}) {
   if (panelEl._piInited) return;
   panelEl._piInited = true;
 
-  // Snapshot explicit size so position:absolute bottom/right handles work correctly
   if (!panelEl.style.width)  panelEl.style.width  = panelEl.offsetWidth  + 'px';
   if (!panelEl.style.height) panelEl.style.height = panelEl.offsetHeight + 'px';
   panelEl.style.maxHeight = 'none';
   panelEl.style.maxWidth  = 'none';
 
-  // ── Drag by header ───────────────────────────────────────────────────────
-  let dragOffX = 0, dragOffY = 0, dragging = false;
   handleEl.style.cursor = 'move';
   handleEl.addEventListener('mousedown', e => {
     if (e.button !== 0) return;
     const r = panelEl.getBoundingClientRect();
-    dragOffX = e.clientX - r.left;
-    dragOffY = e.clientY - r.top;
-    dragging = true;
+    _piActiveOp = { type: 'drag', panel: panelEl, offX: e.clientX - r.left, offY: e.clientY - r.top };
     e.preventDefault();
   });
-  document.addEventListener('mousemove', e => {
-    if (!dragging) return;
-    const x = Math.max(0, Math.min(window.innerWidth  - 40, e.clientX - dragOffX));
-    const y = Math.max(0, Math.min(window.innerHeight - 40, e.clientY - dragOffY));
-    panelEl.style.left   = x + 'px';
-    panelEl.style.top    = y + 'px';
-    panelEl.style.right  = 'auto';
-    panelEl.style.bottom = 'auto';
-  });
-  document.addEventListener('mouseup', () => { dragging = false; });
 
-  // ── Resize handles ───────────────────────────────────────────────────────
   function addResizeHandle(cls, onMove) {
     const h = document.createElement('div');
     h.className = cls;
     panelEl.appendChild(h);
-    let resizing = false, sX, sY, sW, sH;
     h.addEventListener('mousedown', e => {
       if (e.button !== 0) return;
-      resizing = true;
-      sX = e.clientX; sY = e.clientY;
-      sW = panelEl.offsetWidth; sH = panelEl.offsetHeight;
+      _piActiveOp = { type: 'resize', sX: e.clientX, sY: e.clientY,
+                      sW: panelEl.offsetWidth, sH: panelEl.offsetHeight, onMove };
       e.preventDefault(); e.stopPropagation();
     });
-    document.addEventListener('mousemove', e => {
-      if (!resizing) return;
-      onMove(e.clientX - sX, e.clientY - sY, sW, sH);
-    });
-    document.addEventListener('mouseup', () => { resizing = false; });
   }
 
-  addResizeHandle('panel-resize-e',  (dx, dy, sW)      => { panelEl.style.width  = Math.max(minW, sW + dx) + 'px'; });
-  addResizeHandle('panel-resize-s',  (dx, dy, sW, sH)  => { panelEl.style.height = Math.max(minH, sH + dy) + 'px'; });
-  addResizeHandle('panel-resize-se', (dx, dy, sW, sH)  => {
+  addResizeHandle('panel-resize-e',  (dx, dy, sW)     => { panelEl.style.width  = Math.max(minW, sW + dx) + 'px'; });
+  addResizeHandle('panel-resize-s',  (dx, dy, sW, sH) => { panelEl.style.height = Math.max(minH, sH + dy) + 'px'; });
+  addResizeHandle('panel-resize-se', (dx, dy, sW, sH) => {
     panelEl.style.width  = Math.max(minW, sW + dx) + 'px';
     panelEl.style.height = Math.max(minH, sH + dy) + 'px';
   });
 }
-
-// One-time init flags for lazily-opened panels
-let _mlyPanelInited  = false;
-let _helpPanelInited = false;
-let _rankDashInited  = false;
 
 function showStreetView(lat, lng) {
   const panel       = document.getElementById('mly-panel');
@@ -1293,10 +1276,7 @@ function showStreetView(lat, lng) {
   const placeholder = document.getElementById('sv-placeholder');
 
   panel.style.display = 'flex';
-  if (!_mlyPanelInited) {
-    _initPanelInteractive(panel, document.getElementById('mly-header'), { minW: 280, minH: 280 });
-    _mlyPanelInited = true;
-  }
+  _initPanelInteractive(panel, document.getElementById('mly-header'), { minW: 280, minH: 280 });
   panoDiv.innerHTML         = '';
   placeholder.style.display = 'flex';
   placeholder.textContent   = 'Loading Street View…';
@@ -1343,10 +1323,7 @@ function closeSidePanel() {
 function openHelpPanel() {
   const panel = document.getElementById('help-panel');
   panel.style.display = 'flex';
-  if (!_helpPanelInited) {
-    _initPanelInteractive(panel, document.getElementById('help-header'), { minW: 320, minH: 350 });
-    _helpPanelInited = true;
-  }
+  _initPanelInteractive(panel, document.getElementById('help-header'), { minW: 320, minH: 350 });
 }
 
 function closeHelpPanel() {
@@ -2323,7 +2300,7 @@ function setupRankingInteractions() {
     map.on('mouseenter', layerId, e => {
       map.getCanvas().style.cursor = 'pointer';
       const rawId  = e.features[0]?.properties?.facility_id;
-      const feat   = G_rankWorstMap.get(rawId) ?? G_rankBestMap.get(rawId);
+      const feat   = G_rankFacilityMap.get(rawId);
       const p      = feat ? feat.properties : (e.features[0]?.properties ?? {});
       rankPopup
         .setLngLat(e.lngLat)
@@ -2357,11 +2334,8 @@ function setupRankingInteractions() {
   });
 }
 
-// Store for full feature props (needed because MapLibre truncates properties in tiles)
-const G_rankFacilityMap = new Map();  // facility_id → GeoJSON Feature (all ranked facilities)
-// Aliases kept for any internal references during refactor
-const G_rankWorstMap = G_rankFacilityMap;
-const G_rankBestMap  = G_rankFacilityMap;
+// facility_id → GeoJSON Feature (full props; MapLibre truncates tile properties)
+const G_rankFacilityMap = new Map();
 
 function _rankPopupHtml(p) {
   const isInt  = (p.facility_type || '') === 'intersection';
@@ -2390,15 +2364,10 @@ function _rankPopupHtml(p) {
   const epdoRate  = p.epdo_rate  != null ? p.epdo_rate.toFixed(3)  : null;
   const rateUnit  = isInt ? '/MEV' : '/MV-km';
 
-  const pct       = p.epdo_percentile != null ? Math.round(p.epdo_percentile) : null;
-  const band      = p.epdo_band || '';
-  const BAND_COLORS = { critical: '#ef4444', high_priority: '#f97316', elevated: '#facc15',
-                        above_median: '#9ca3af', below_median: '#4b5563' };
-  const BAND_LABELS = { critical: 'Critical (top 5%)', high_priority: 'High Priority (top 10%)',
-                        elevated: 'Elevated (top 25%)', above_median: 'Above Median',
-                        below_median: 'Below Median' };
+  const pct    = p.epdo_percentile != null ? Math.round(p.epdo_percentile) : null;
+  const band   = p.epdo_band || '';
   const pctStr = pct != null
-    ? `<span style="color:${BAND_COLORS[band] || '#9ca3af'};font-weight:600">P${pct} &mdash; ${BAND_LABELS[band] || band}</span>`
+    ? `<span style="color:${_BAND_COLORS[band] || '#9ca3af'};font-weight:600">P${pct} &mdash; ${_BAND_LABELS[band] || band}</span>`
     : '';
 
   function row(label, val) {
@@ -2467,7 +2436,7 @@ function _restoreRankingsData() {
 }
 
 function _flyToRankFacility(facilityId) {
-  const feat = G_rankWorstMap.get(facilityId) ?? G_rankBestMap.get(facilityId);
+  const feat = G_rankFacilityMap.get(facilityId);
   if (!feat) return;
   const geom = feat.geometry;
   if (!geom) return;
@@ -2684,23 +2653,17 @@ async function _loadPartyDataForDash(facilityId, collisionIds) {
 // ---------------------------------------------------------------------------
 
 /**
- * Render an SVG strip showing where this facility sits within its peer-group EPDO distribution.
- *
- * Layout (left→right):
- *   [gray 0–P50][amber P50–P75][orange P75–P90][red P90–P95][dark-red P95–100]
- *   Tick marks at P50, P75, P90, P95; triangle indicator at this facility's percentile.
+ * Render an SVG CDF curve showing this facility's EPDO within its peer group.
+ * x-axis = EPDO value, y-axis = cumulative percentile (0–100).
+ * Facility position marked with a colored dot + crosshair lines.
  *
  * @param {number} epdoScore  — EPDO value of this facility
- * @param {number} pct        — percentile rank (0-100)
- * @param {object} gs         — {n, mean, p50, p75, p90, p95}
+ * @param {number} pct        — percentile rank within peer group (0-100)
+ * @param {object} gs         — group stats: {n, mean, p50, p75, p90, p95, max, cdf}
  */
 function _renderPercentileChart(epdoScore, pct, gs) {
-  // True CDF curve: x-axis = EPDO value, y-axis = cumulative percentile (0–100).
-  // The CDF data is stored as gs.cdf — an array of 21 EPDO values at percentiles
-  // 0, 5, 10, …, 100. We draw the curve as a polyline and mark the facility's
-  // position with a dot + crosshair lines.
-  //
-  // Layout (SVG coordinate system, y increases downward):
+  // gs.cdf: 21 EPDO values at percentiles 0, 5, …, 100 (index i → EPDO at pct i*5).
+  // SVG coordinate system: y increases downward; yScale inverts percentile to SVG y.
   //   Total SVG: W×H with PAD margins on all sides.
   //   Plot area: x in [PAD_L, PAD_L+PW], y in [PAD_T, PAD_T+PH]
   //   x maps EPDO value 0 → xMax into plot width.
@@ -2768,11 +2731,9 @@ function _renderPercentileChart(epdoScore, pct, gs) {
     <text x="6" y="${PAD_T + PH / 2}" text-anchor="middle" font-size="7.5" fill="#6b7280" transform="rotate(-90,6,${PAD_T + PH / 2})">%ile</text>`;
 
   // --- Facility position: dot + crosshair lines ---
-  const BAND_COLORS = { critical: '#ef4444', high_priority: '#f97316', elevated: '#facc15',
-                        above_median: '#9ca3af', below_median: '#6b7280' };
-  const band = pct >= 95 ? 'critical' : pct >= 90 ? 'high_priority' : pct >= 75 ? 'elevated'
-             : pct >= 50 ? 'above_median' : 'below_median';
-  const dotColor = BAND_COLORS[band];
+  const band     = pct >= 95 ? 'critical' : pct >= 90 ? 'high_priority' : pct >= 75 ? 'elevated'
+                 : pct >= 50 ? 'above_median' : 'below_median';
+  const dotColor = _BAND_COLORS[band];
   const dotX = xScale(epdoScore);
   const dotY = yScale(pct);
 
@@ -2819,7 +2780,7 @@ function _renderPercentileChart(epdoScore, pct, gs) {
 // ---------------------------------------------------------------------------
 
 function openRankDash(facilityId) {
-  const feat = G_rankWorstMap.get(facilityId) ?? G_rankBestMap.get(facilityId);
+  const feat = G_rankFacilityMap.get(facilityId);
   if (!feat) return;
   G_lastFacilityId = facilityId;
   _flyToRankFacility(facilityId);
@@ -2840,16 +2801,9 @@ function openRankDash(facilityId) {
 
   const epdo_pct  = p.epdo_percentile != null ? Math.round(p.epdo_percentile) : null;
   const epdo_band = p.epdo_band || '';
-  const DBAND_BG  = { critical: '#7f1d1d', high_priority: '#431407', elevated: '#422006',
-                      above_median: '#1f2937', below_median: '#111827' };
-  const DBAND_FG  = { critical: '#fca5a5', high_priority: '#fed7aa', elevated: '#fde68a',
-                      above_median: '#9ca3af', below_median: '#6b7280' };
-  const DBAND_LBL = { critical: 'Critical (top 5%)', high_priority: 'High Priority (top 10%)',
-                      elevated: 'Elevated (top 25%)', above_median: 'Above Median (top 50%)',
-                      below_median: 'Below Median' };
   const rankBadge = epdo_pct != null
-    ? `<span style="background:${DBAND_BG[epdo_band]||'#1f2937'};color:${DBAND_FG[epdo_band]||'#9ca3af'};padding:1px 8px;border-radius:3px">
-        P${epdo_pct} &mdash; ${DBAND_LBL[epdo_band] || epdo_band}
+    ? `<span style="background:${_DBAND_BG[epdo_band]||'#1f2937'};color:${_DBAND_FG[epdo_band]||'#9ca3af'};padding:1px 8px;border-radius:3px">
+        P${epdo_pct} &mdash; ${_BAND_LABELS[epdo_band] || epdo_band}
       </span>`
     : '';
 
@@ -3040,13 +2994,10 @@ function openRankDash(facilityId) {
   document.getElementById('rank-dash-body').innerHTML = html;
   const rdPanel = document.getElementById('rank-dash-panel');
   rdPanel.classList.add('open');
-  if (!_rankDashInited) {
-    _rankDashInited = true;
-    requestAnimationFrame(() => {
-      _initPanelInteractive(rdPanel, document.getElementById('rank-dash-header'),
-        { minW: 280, minH: 200 });
-    });
-  }
+  requestAnimationFrame(() => {
+    _initPanelInteractive(rdPanel, document.getElementById('rank-dash-header'),
+      { minW: 280, minH: 200 });
+  });
   // Async: fetch party data and populate direction rose + movement pairs
   _loadPartyDataForDash(facilityId, collisionIds);
 }
@@ -3742,10 +3693,17 @@ async function anaLoadRanking(binKey) {
   }
 }
 
-const _BAND_COLORS = { critical: '#ef4444', high_priority: '#f97316', elevated: '#facc15',
-                       above_median: '#9ca3af', below_median: '#4b5563' };
-const _BAND_SHORT  = { critical: 'Critical', high_priority: 'High', elevated: 'Elevated',
-                       above_median: 'Above Median', below_median: 'Below Median' };
+const _BAND_COLORS  = { critical: '#ef4444', high_priority: '#f97316', elevated: '#facc15',
+                        above_median: '#9ca3af', below_median: '#4b5563' };
+const _BAND_SHORT   = { critical: 'Critical', high_priority: 'High', elevated: 'Elevated',
+                        above_median: 'Above Median', below_median: 'Below Median' };
+const _BAND_LABELS  = { critical: 'Critical (top 5%)', high_priority: 'High Priority (top 10%)',
+                        elevated: 'Elevated (top 25%)', above_median: 'Above Median',
+                        below_median: 'Below Median' };
+const _DBAND_BG     = { critical: '#7f1d1d', high_priority: '#431407', elevated: '#422006',
+                        above_median: '#1f2937', below_median: '#111827' };
+const _DBAND_FG     = { critical: '#fca5a5', high_priority: '#fed7aa', elevated: '#fde68a',
+                        above_median: '#9ca3af', below_median: '#6b7280' };
 
 function _anaRenderRankTable(facilities, groupStats) {
   const el = document.getElementById('ana-rank-results');

@@ -715,7 +715,8 @@ def process_county(county_name: str, global_stats: dict,
     print(f"  {n_matched:,} facilities with >=1 crash", flush=True)
 
     # 6. Classify and accumulate
-    way_reg = {fid: registry[fid] for fid in way_ids}  # quick lookup subset
+    way_reg      = {fid: registry[fid] for fid in way_ids}  # quick lookup subset
+    node_id_to_i = {fid: i for i, fid in enumerate(node_ids)}  # O(1) index lookup
 
     new_facs = 0
     for fid, fac in registry.items():
@@ -732,7 +733,7 @@ def process_county(county_name: str, global_stats: dict,
             continue
 
         if is_node:
-            idx     = node_ids.index(fid)
+            idx     = node_id_to_i[fid]
             bin_key = classify_node(fac, node_geoms[idx],
                                     way_geoms, way_ids, way_tree, way_reg,
                                     infra_geoms, infra_types, infra_tree)
