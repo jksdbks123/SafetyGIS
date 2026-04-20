@@ -37,21 +37,54 @@ No database required — all data is fetched on-demand and cached as local GeoJS
 
 ## Quick Start
 
-### 1. Clone & install
+### 1. Clone the repository
 
 ```bash
 git clone https://github.com/jksdbks123/SafetyGIS.git
 cd SafetyGIS
+```
 
+### 2. Create a virtual environment and install dependencies
+
+**macOS / Linux:**
+```bash
 python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 2. Configure API keys
+**Windows (Command Prompt):**
+```cmd
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+```
 
+**Windows (PowerShell):**
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+> **Windows PowerShell note:** If script execution is blocked, run
+> `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser` once, then retry.
+
+### 3. Configure API keys
+
+**macOS / Linux:**
 ```bash
 cp .env.example .env
+```
+
+**Windows (Command Prompt):**
+```cmd
+copy .env.example .env
+```
+
+**Windows (PowerShell):**
+```powershell
+Copy-Item .env.example .env
 ```
 
 Open `.env` and fill in your keys:
@@ -63,18 +96,42 @@ Open `.env` and fill in your keys:
 
 The app runs fully without either key; Mapillary layers and Street View will be unavailable.
 
-### 3. Run
+### 4. Run
 
+**macOS / Linux (Makefile shortcut):**
 ```bash
 make dev
-# or: source .venv/bin/activate && uvicorn main:app --reload
+# custom port:
+make dev PORT=9000
 ```
 
-Open **http://localhost:8000**.
+**macOS / Linux (manual):**
+```bash
+source .venv/bin/activate
+uvicorn main:app --reload
+```
 
-### 4. Load data
+**Windows (Command Prompt):**
+```cmd
+.venv\Scripts\activate
+uvicorn main:app --reload
+```
 
-Data loads automatically as you pan/zoom in Inspect mode. To pre-seed or compute rankings:
+**Windows (PowerShell):**
+```powershell
+.venv\Scripts\Activate.ps1
+uvicorn main:app --reload
+```
+
+> **Windows note:** `make` is not available by default on Windows. Either run `uvicorn`
+> directly (shown above) or install GNU Make via [Chocolatey](https://chocolatey.org/)
+> (`choco install make`) or run commands inside Git Bash / WSL.
+
+Open **http://localhost:8000** in your browser.
+
+### 5. Load data
+
+Data loads automatically as you pan and zoom in Inspect mode. To pre-seed or compute rankings:
 
 ```bash
 # Switch to Analysis mode in the app (header toggle) and click any county chip
@@ -91,18 +148,30 @@ python scripts/build_safety_rankings.py --counties sacramento,alameda --min-osm-
 
 ## Docker Deployment
 
+Docker is the recommended path for production deployments and Raspberry Pi hosting.
+It works identically on macOS, Linux, and Windows (Docker Desktop with WSL2 backend).
+
 ```bash
-# Build and start
+# Build and start (detached)
 docker compose up -d
 
 # View logs
 docker compose logs -f
 
-# Update and rebuild
+# Stop
+docker compose down
+
+# Update code and rebuild
 git pull && docker compose up -d --build
 ```
 
-API keys are read from `.env` (never baked into the image). The `data/` cache directory is mounted as a volume so it persists across rebuilds.
+> **Windows note:** Docker Desktop for Windows requires WSL2. Install it from
+> [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/).
+> Once Docker Desktop is running, all `docker compose` commands work identically in
+> PowerShell, Command Prompt, or WSL.
+
+API keys are read from `.env` (never baked into the image). The `data/` directory is
+mounted as a volume so the cache survives container rebuilds.
 
 See [TUTORIAL.md](TUTORIAL.md) for Raspberry Pi 5 deployment, Cloudflare Tunnel setup, and the full deployment guide.
 

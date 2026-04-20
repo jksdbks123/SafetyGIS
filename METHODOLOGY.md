@@ -195,11 +195,14 @@ EPDO_score = (w_F × N_fatal)
            + (w_OI × N_other_injury)
            + (w_PDO × N_pdo)
 
-Default weights:
-  w_F   = 10.0   (configurable via --weights)
-  w_SI  = 2.0
-  w_OI  = 2.0
-  w_PDO = 0.2
+Default weights (FHWA Rural/Local Roads Toolkit, normalized PDO = 1.0):
+  w_F   = 9.5    (fatal — KABCO K)
+  w_SI  = 3.5    (incapacitating injury — KABCO A)
+  w_OI  = 1.0    (non-incapacitating / possible injury — KABCO B/C combined)
+  w_PDO = 1.0    (property damage only — KABCO O)
+
+Configurable via --weights fatal,injury,pdo (3 args, A and B/C equal)
+                       or --weights fatal,severe,other,pdo (4 args, full control)
 ```
 
 All crashes matched to the facility over the 5-year window are included.
@@ -217,18 +220,22 @@ All crashes matched to the facility over the 5-year window are included.
 
 EPDO (Equivalent Property Damage Only) scoring was formalized in FHWA's HSIP guidance and is codified in the *Highway Safety Manual* (AASHTO, 2010, 1st ed.), Chapter 4 — "Network Screening." The method converts mixed-severity crash records into a single comparable score by weighting each crash by the relative societal cost of its severity.
 
-The default GIS-Track weight ratio (10 : 2 : 2 : 0.2) simplifies from FHWA's 2020 unit crash cost data:
+The default GIS-Track weights come from the **FHWA "Improving Safety on Rural Local and Tribal Roads" Safety Toolkit** (FHWA-SA-14-073), Step 2 — Network Screening, which provides KABCO-based EPDO factors normalized to PDO = 1.0:
 
-| Severity | FHWA 2020 Unit Cost | Simplified Ratio |
-|----------|--------------------|--------------------|
-| Fatal (K) | ~$11.7 M | 10.0 |
-| Incapacitating injury (A) | ~$630 K | 2.0 |
-| Non-incapacitating injury (B/C) | ~$125 K | 2.0 * |
-| PDO (O) | ~$12,800 | 0.2 |
+| KABCO | Severity | FHWA Toolkit Factor | GIS-Track Default |
+|-------|----------|---------------------|-------------------|
+| K | Fatal | 9.5 | 9.5 |
+| A | Incapacitating injury | 3.5 | 3.5 |
+| B | Non-incapacitating visible injury | 1.5 | — |
+| C | Possible / complaint-of-pain injury | 1.0 | — |
+| B/C | (CHP CCRS "Other Injury" — B+C undifferentiated) | — | 1.0 * |
+| O | Property damage only | 1.0 | 1.0 |
 
-*Note: The current implementation weights A and B/C injuries equally at 2.0. The HSM treats them differently; see Section 8.1 for the recommended fix.*
+*CHP CCRS does not distinguish KABCO B from C within its "Other Injury" category. GIS-Track uses 1.0 (the C lower bound) as a conservative choice. Agencies expecting primarily B-level injuries may raise this to 1.5 via `--weights 9.5,3.5,1.5,1.0`.*
 
-The weights are configurable via `--weights F,I,P` (fatal, injury, PDO) to allow agencies to substitute locally calibrated cost ratios.
+These toolkit factors derive from NHTSA's societal crash cost estimates normalized relative to PDO = 1.0. They differ from the absolute 2020 FHWA crash costs (Fatal ≈ $11.7 M, PDO ≈ $12,800) but provide a stable, widely-used standard for network screening comparisons across agencies.
+
+The weights are configurable via `--weights F,I,P` (3 args, A = B/C) or `--weights F,A,BC,P` (4 args, full KABCO control) to allow agencies to substitute locally calibrated cost ratios.
 
 ### 6.4 Attribute Distributions Stored per Facility
 
@@ -328,9 +335,9 @@ The most significant limitation. A signalized arterial intersection processing 6
 
 Sites selected for high EPDO in one 5-year period statistically tend to show lower scores in the next period, even without any treatment — this is purely a statistical artifact (regression to the mean), not an improvement. The HSM's Empirical Bayes (EB) method was specifically developed to correct for this (*HSM*, Chapter 4, Section 4.2). Without EB correction, agencies that treat top-ranked sites and re-evaluate in 3 years may overestimate the effectiveness of their interventions.
 
-### 8.3 Equal Treatment of Injury Severity Levels
+### 8.3 CCRS B/C Injury Indistinction
 
-Both `severe_injury` (KABCO A) and `other_injury` (KABCO B/C) currently receive a weight of 2.0. This understates the severity gap between an incapacitating injury (~$630K societal cost) and a possible injury (~$125K). A corrected weighting (A = 3.5, B/C = 1.0, using FHWA 2020 ratios) would better reflect relative harm.
+CHP CCRS does not distinguish KABCO B (non-incapacitating visible injury) from KABCO C (possible injury) within its "Other Injury" severity code. Both map to `other_injury` and receive weight 1.0. The FHWA toolkit assigns B = 1.5 and C = 1.0 separately. Since California cannot supply this distinction from police reports alone, the 1.0 conservative floor is used. Agencies with supplemental trauma registry data could split the CCRS "Other Injury" pool and apply the toolkit's differentiated weights.
 
 ### 8.4 No Temporal Trend Detection
 
@@ -362,9 +369,9 @@ Crash Rate = (EPDO_score / (entering_vehicles_per_day × years × 365)) × 1,000
 
 Caltrans PeMS provides AADT for most California state highways. Local road counts require municipal data or traffic model estimates.
 
-**2. Correct injury severity weights**
+**2. Differentiate KABCO B from C when source data permits**
 
-Revise `other_injury` weight from 2.0 to 1.0 (keeping `severe_injury` at 2.0–3.5 depending on local cost calibration). This better reflects the KABCO A vs. B/C distinction.
+Current CCRS "Other Injury" conflates B and C. If a supplemental injury severity source (e.g., trauma registry) becomes available, split `other_injury` into `injury_b` (weight 1.5) and `injury_c` (weight 1.0) per the FHWA toolkit's full 5-level table.
 
 **3. Grade separation filtering**
 
@@ -442,5 +449,6 @@ In the rankings output, identify any intersection node ranked in the worst-5 who
 - FHWA. (2010). *Using GIS for Crash Location and Analysis at State DOTs*. FHWA-HRT-10-043. Federal Highway Administration.
 - FHWA. (2020). *Crash Costs for Highway Safety Analysis*. FHWA-SA-20-021. Federal Highway Administration.
 - NCHRP. (2013). *NCHRP Report 17-50: Implementation of the Highway Safety Manual*. Transportation Research Board.
+- FHWA. (2014). *Improving Safety on Rural Local and Tribal Roads — Safety Toolkit*. FHWA-SA-14-073. Federal Highway Administration. Step 2: Conduct Network Screening. https://highways.dot.gov/safety/local-rural/improving-safety-rural-local-and-tribal-roads-safety-toolkit/step-2-conduct
 - OSM Wiki. (2024). *Key:bridge*. OpenStreetMap Foundation. https://wiki.openstreetmap.org/wiki/Key:bridge
 - OSM Wiki. (2024). *Key:layer*. OpenStreetMap Foundation. https://wiki.openstreetmap.org/wiki/Key:layer

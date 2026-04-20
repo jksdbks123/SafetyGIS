@@ -1,11 +1,12 @@
 # GIS-Track — Complete Development & Deployment Tutorial
 
 > Author: Zhihui | Vibe Coding Exercise  
-> Last updated: 2026-04-10
+> Last updated: 2026-04-19
 
 This tutorial documents the full hands-on workflow for GIS-Track — from local development
-through Raspberry Pi deployment — including architecture explanations, data source details,
-and troubleshooting guides.
+through production deployment — including architecture explanations, data source details,
+and troubleshooting guides. Platform-specific instructions are provided for macOS, Linux,
+Windows, Docker, and Raspberry Pi 5.
 
 ---
 
@@ -59,32 +60,88 @@ GIS-Track is a browser-based transportation safety GIS tool covering all of Cali
 ## 2. Local Development Setup
 
 ### Prerequisites
-- macOS (this tutorial is macOS-based)
-- Python 3.11 or 3.12 (recommended; local dev uses 3.14 but Docker targets 3.12)
-- Git
 
-### Steps
+| Item | macOS | Linux | Windows |
+|------|-------|-------|---------|
+| Python | 3.11–3.12 recommended | 3.11–3.12 recommended | 3.11–3.12 recommended |
+| Git | `brew install git` or Xcode CLT | `apt install git` / `dnf install git` | [git-scm.com](https://git-scm.com/download/win) |
+| Make (optional) | pre-installed | `apt install make` | `choco install make` or use Git Bash |
+
+Docker targets Python 3.12. Local dev works with 3.11–3.14.
+
+---
+
+### Step 1 — Clone the repository
 
 ```bash
-# 1. Clone the repository
 git clone https://github.com/jksdbks123/SafetyGIS.git
 cd SafetyGIS
-
-# 2. Create a virtual environment
-python3 -m venv .venv
-source .venv/bin/activate     # Windows: .venv\Scripts\activate
-
-# 3. Install dependencies
-pip install -r requirements.txt
-
-# 4. Configure API keys
-cp .env.example .env
-# Open .env in a text editor and fill in:
-#   MAPILLARY_TOKEN=MLY|...
-#   GOOGLE_MAPS_KEY=AIza...
-# Both keys are optional — the app runs without them;
-# Mapillary layers and Street View are simply unavailable.
 ```
+
+---
+
+### Step 2 — Create a virtual environment
+
+**macOS / Linux:**
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+**Windows — Command Prompt:**
+```cmd
+python -m venv .venv
+.venv\Scripts\activate
+```
+
+**Windows — PowerShell:**
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+> **PowerShell execution policy:** If `.ps1` scripts are blocked, run once:
+> ```powershell
+> Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+> ```
+
+---
+
+### Step 3 — Install dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+(Same command on all platforms once the venv is activated.)
+
+---
+
+### Step 4 — Configure API keys
+
+**macOS / Linux:**
+```bash
+cp .env.example .env
+```
+
+**Windows — Command Prompt:**
+```cmd
+copy .env.example .env
+```
+
+**Windows — PowerShell:**
+```powershell
+Copy-Item .env.example .env
+```
+
+Open `.env` in any text editor and fill in:
+
+```
+MAPILLARY_TOKEN=MLY|...
+GOOGLE_MAPS_KEY=AIza...
+```
+
+Both keys are optional — the app runs without them; Mapillary layers and Street View are simply unavailable.
 
 ### How to get API keys
 
@@ -163,24 +220,73 @@ Frontend: received fetching → poll again after 25 seconds
 
 ### Start the local server
 
+**macOS / Linux — Makefile shortcut (recommended):**
+```bash
+make dev            # starts on port 8000
+make dev PORT=9000  # custom port — kills any process already on that port first
+```
+
+**macOS / Linux — manual:**
 ```bash
 source .venv/bin/activate
 uvicorn main:app --reload
-# Open http://localhost:8000 in your browser
 ```
+
+**Windows — Command Prompt:**
+```cmd
+.venv\Scripts\activate
+uvicorn main:app --reload
+```
+
+**Windows — PowerShell:**
+```powershell
+.venv\Scripts\Activate.ps1
+uvicorn main:app --reload
+```
+
+> **Windows + Makefile:** `make` is not installed by default on Windows.
+> To use Makefile shortcuts, either:
+> - Install GNU Make via Chocolatey: `choco install make`
+> - Run commands inside **Git Bash** (ships with Git for Windows) or **WSL**
+> - Or just run `uvicorn` directly as shown above.
 
 `--reload` watches Python files and restarts on changes. For JS/HTML/CSS changes,
 just refresh the browser.
 
+Open **http://localhost:8000** in your browser.
+
+---
+
 ### Reading logs
 
-```bash
+```
 # Backend logs stream to the terminal where uvicorn is running.
 # Crash data fetch progress looks like:
 #   [sacramento] county=34 year=2024… 117066 total
 
-# Frontend logs: open browser DevTools → Console tab
+# Frontend logs: open browser DevTools → Console tab (F12)
 ```
+
+---
+
+### Killing a stuck port
+
+**macOS / Linux:**
+```bash
+lsof -ti:8000 | xargs kill -9
+```
+
+**Windows — Command Prompt:**
+```cmd
+FOR /F "tokens=5" %P IN ('netstat -ano ^| findstr :8000') DO taskkill /F /PID %P
+```
+
+**Windows — PowerShell:**
+```powershell
+Get-NetTCPConnection -LocalPort 8000 | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }
+```
+
+---
 
 ### Manually pre-fetch data
 
@@ -312,33 +418,38 @@ Facilities are ranked within peer groups (bins) so that a rural two-lane road is
 
 ## 7. Docker Packaging
 
+Docker is the recommended way to run SafetyGIS in production. The image is
+multi-arch (`linux/amd64` + `linux/arm64`) and runs identically on macOS,
+Linux, Windows, and Raspberry Pi 5.
+
 ### File overview
 
 | File | Purpose |
 |------|---------|
-| `Dockerfile` | Defines image build steps |
-| `docker-compose.yml` | Service orchestration: port, volume, env |
-| `.dockerignore` | Excludes venv, caches, secrets from image |
+| `Dockerfile` | Image build steps |
+| `docker-compose.yml` | Service orchestration: port, volume, env, healthcheck |
+| `.dockerignore` | Excludes `.venv/`, `data/`, `.env` from image build context |
 
 ### Dockerfile explained
 
 ```dockerfile
-FROM python:3.12-slim          # ~130 MB, official arm64 support
+FROM python:3.12-slim          # ~130 MB base; official arm64 + amd64 support
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt   # separate layer — cached by Docker
+RUN pip install --no-cache-dir -r requirements.txt   # separate layer — skipped on code-only changes
 COPY main.py .
 COPY static/ ./static/
 COPY scripts/ ./scripts/
-RUN mkdir -p data/crash_cache data/osm_cache data/mapillary_cache
+RUN mkdir -p data/crash_cache data/osm_cache data/mapillary_cache data/rankings data/enrichment
 EXPOSE 8000
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/mapillary/token')"
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
 ```
 
 **Why is `data/` not copied into the image?**  
-The cache directory holds hundreds of MB of GeoJSON that grows over time. It is provided
-via a volume mount at runtime so it persists across container rebuilds. Baking it into
-the image would bloat every build.
+The cache grows to hundreds of MB. It is provided via a volume mount at runtime
+so it persists across container rebuilds without bloating every image layer.
 
 ### docker-compose.yml explained
 
@@ -349,31 +460,75 @@ services:
     ports:
       - "8000:8000"
     env_file:
-      - .env                  # API keys never baked into the image
+      - .env                  # API keys loaded at runtime, never baked into the image
     volumes:
       - ./data:/app/data      # cache persists on the host filesystem
-    restart: unless-stopped   # auto-restarts after Pi reboots
+    restart: unless-stopped   # auto-restarts after reboots
 ```
 
-### Testing Docker locally (macOS)
+---
+
+### Installing Docker
+
+**macOS:**
+```bash
+brew install --cask docker
+# Launch Docker Desktop from Applications, wait for the whale icon in the menu bar
+```
+
+**Linux (Debian / Ubuntu):**
+```bash
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER
+# Log out and back in for the docker group to take effect
+```
+
+**Linux (Fedora / RHEL / CentOS):**
+```bash
+sudo dnf install docker-ce docker-ce-cli containerd.io docker-compose-plugin
+sudo systemctl enable --now docker
+sudo usermod -aG docker $USER
+```
+
+**Windows:**  
+Download and install [Docker Desktop for Windows](https://www.docker.com/products/docker-desktop/).  
+Requires Windows 10 64-bit (build 19041+) with WSL2 enabled.
+
+```powershell
+# Enable WSL2 first (run as Administrator, then reboot)
+wsl --install
+# After reboot, install Docker Desktop and enable the WSL2 backend in Settings
+```
+
+Once Docker Desktop is running, all `docker compose` commands below work identically
+in PowerShell, Command Prompt, and WSL.
+
+---
+
+### Common Docker commands (all platforms)
 
 ```bash
-# Install Docker Desktop
-brew install --cask docker
-# Launch Docker Desktop from Applications
-
-# Build and start
+# Build and start in the foreground (shows logs)
 docker compose up
 
-# Run in background
+# Build and start detached (background)
 docker compose up -d
 
-# View logs
+# View live logs
 docker compose logs -f
 
-# Stop
+# Stop and remove containers (data volume is preserved)
 docker compose down
+
+# Update code, rebuild image, restart
+git pull && docker compose up -d --build
+
+# Check container health
+docker ps
 ```
+
+> **After `.env` changes:** `docker compose restart` does NOT re-read `env_file`.
+> Always use `docker compose up -d` (recreates the container) when `.env` changes.
 
 ---
 
@@ -481,9 +636,9 @@ cd ~/SafetyGIS && git pull && sudo docker compose up -d --build
 ## 9. Public Access via Cloudflare Tunnel
 
 Cloudflare Tunnel exposes your local service to the public internet without a public IP,
-port forwarding, or firewall changes. The free tier requires no account registration.
+port forwarding, or firewall changes. The free quick-tunnel tier requires no account.
 
-### Temporary tunnel from Mac
+### Temporary tunnel — macOS
 
 ```bash
 # Install
@@ -494,7 +649,32 @@ cloudflared tunnel --url http://localhost:8000
 # Output: https://random-name.trycloudflare.com
 ```
 
-### Persistent tunnel on the Pi
+### Temporary tunnel — Linux
+
+```bash
+# Download the binary (amd64 example)
+wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+  -O /usr/local/bin/cloudflared
+chmod +x /usr/local/bin/cloudflared
+
+# Start
+cloudflared tunnel --url http://localhost:8000
+```
+
+### Temporary tunnel — Windows
+
+```powershell
+# Option 1 — winget
+winget install Cloudflare.cloudflared
+
+# Option 2 — Chocolatey
+choco install cloudflared
+
+# Start
+cloudflared tunnel --url http://localhost:8000
+```
+
+### Persistent tunnel on the Raspberry Pi (Docker)
 
 ```bash
 sudo docker run -d \
@@ -504,7 +684,7 @@ sudo docker run -d \
   cloudflare/cloudflared:latest \
   tunnel --url http://localhost:8000
 
-# Find the public URL
+# Find the public URL in the logs
 sudo docker logs cloudflared 2>&1 | grep trycloudflare
 ```
 
@@ -519,17 +699,30 @@ sudo docker logs cloudflared 2>&1 | grep trycloudflare
 
 **Symptoms:** No red crash points on the map; loading banner disappears without data.
 
+**macOS / Linux:**
 ```bash
 # 1. Test CCRS API reachability
 curl -s "https://data.ca.gov/api/3/action/package_show?id=ccrs" \
   | python3 -c "import json,sys; print(json.load(sys.stdin)['success'])"
 # Expected: True
 
-# 2. Check cache file sizes (files ~45 bytes = empty = fetch failed)
+# 2. Check cache file sizes (~45 bytes = empty = fetch failed)
 ls -la data/crash_cache/
 
 # 3. Run fetch script manually to see the error
 python scripts/fetch_crash_data.py 2>&1 | head -30
+```
+
+**Windows:**
+```powershell
+# 1. Test CCRS API reachability
+Invoke-WebRequest "https://data.ca.gov/api/3/action/package_show?id=ccrs" | Select-Object -ExpandProperty Content | python -c "import json,sys; print(json.load(sys.stdin)['success'])"
+
+# 2. Check cache files
+dir data\crash_cache
+
+# 3. Run fetch script
+python scripts\fetch_crash_data.py
 ```
 
 **Common errors and fixes:**
@@ -540,14 +733,42 @@ python scripts/fetch_crash_data.py 2>&1 | head -30
 | 0 records, HTTP 200 | Empty duplicate resource selected | Add `if year not in crashes` guard |
 | HTTP 404 | Resource ID changed upstream | Re-run resource discovery |
 
+---
+
 ### OSM data not loading
 
+**macOS / Linux:**
 ```bash
-# Test the Overpass mirror chain
 curl -s -o /dev/null -w "%{http_code}" "https://overpass-api.de/api/interpreter"
-
-# 504 or timeout on all mirrors = Overpass under heavy load; retry later
 ```
+
+**Windows:**
+```powershell
+(Invoke-WebRequest "https://overpass-api.de/api/interpreter").StatusCode
+```
+
+504 or timeout on all mirrors = Overpass under heavy load; retry later.
+
+---
+
+### Port 8000 already in use
+
+**macOS / Linux:**
+```bash
+lsof -ti:8000 | xargs kill -9
+```
+
+**Windows — Command Prompt:**
+```cmd
+FOR /F "tokens=5" %P IN ('netstat -ano ^| findstr :8000') DO taskkill /F /PID %P
+```
+
+**Windows — PowerShell:**
+```powershell
+Get-NetTCPConnection -LocalPort 8000 | ForEach-Object { Stop-Process -Id $_.OwningProcess -Force }
+```
+
+---
 
 ### Cannot SSH into the Pi
 
@@ -558,18 +779,37 @@ nc -z -w 3 raspberrypi.local 22      # is SSH port open?
 ssh -v pi@raspberrypi.local          # verbose output for auth debugging
 ```
 
+---
+
 ### Docker container fails to start
 
 ```bash
 sudo docker logs safetygis-app-1
 
 # Common causes:
-# .env missing              → cp .env.example .env
-# Port 8000 in use          → lsof -i :8000
+# .env missing              → cp .env.example .env  (Linux/macOS)
+#                             copy .env.example .env  (Windows CMD)
+# Port 8000 in use          → see "Port 8000 already in use" above
 # Build failed              → docker compose build (check output)
+# WSL2 not enabled (Win)    → wsl --install, then reboot
 ```
 
-### USB-C direct connection (Gadget Mode)
+---
+
+### Windows: `.venv\Scripts\activate` not recognized
+
+```powershell
+# If you see "cannot be loaded because running scripts is disabled":
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
+
+# If python is not found:
+# Install Python 3.12 from https://www.python.org/downloads/
+# Check "Add Python to PATH" during installation
+```
+
+---
+
+### USB-C direct connection to Pi (Gadget Mode)
 
 The Pi 5 USB-C port delivers power only by default. To use it as a USB Ethernet
 interface, pre-configure the SD card boot partition before first boot:
@@ -588,29 +828,50 @@ link-local address when connected via USB-C.
 
 ## 11. Code Update Workflow
 
-### Mac → GitHub → Pi pipeline
+### Develop locally → push to GitHub → deploy to Pi
 
+**macOS / Linux:**
 ```bash
 # Step 1: develop and test locally
 source .venv/bin/activate
 uvicorn main:app --reload
 
 # Step 2: commit and push
-git add .
+git add -p          # stage changes interactively
 git commit -m "describe the change"
 git push origin main
 
-# Step 3: deploy to Pi from Mac (no need to SSH manually)
+# Step 3: deploy to Pi from your machine (no manual SSH session needed)
 ssh -i ~/.ssh/id_pi pi@192.168.1.157 \
   "cd ~/SafetyGIS && git pull && sudo docker compose up -d --build"
 ```
+
+**Windows — PowerShell:**
+```powershell
+# Step 1: develop and test locally
+.venv\Scripts\Activate.ps1
+uvicorn main:app --reload
+
+# Step 2: commit and push
+git add -p
+git commit -m "describe the change"
+git push origin main
+
+# Step 3: deploy to Pi from Windows PowerShell
+ssh -i $HOME\.ssh\id_pi pi@192.168.1.157 "cd ~/SafetyGIS && git pull && sudo docker compose up -d --build"
+```
+
+> SSH is built into Windows 10/11. If it is missing, install it via
+> **Settings → Apps → Optional features → OpenSSH Client**.
 
 ### Notes on rebuilding
 
 - **Frontend-only changes (JS/HTML/CSS):** Require image rebuild, but Docker layer cache
   skips `pip install` (unchanged) — typically under 15 seconds.
 - **After `.env` changes:** `docker compose restart` does NOT re-read `env_file`.
-  Always use `docker compose up -d` to recreate the container.
+  Always use `docker compose up -d` (recreates the container) when `.env` changes.
+- **After `requirements.txt` changes:** The `pip install` layer is invalidated; full
+  rebuild required — expect 2–5 minutes on Pi, under 1 minute on a fast desktop.
 
 ---
 

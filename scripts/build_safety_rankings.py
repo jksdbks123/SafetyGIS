@@ -57,21 +57,28 @@ def _load_aadt_lookup() -> dict:
     return {k: v["aadt"] for k, v in raw.items()}
 
 # ---------------------------------------------------------------------------
-# EPDO weights  (FHWA Highway Safety Manual)
+# EPDO weights  (FHWA "Improving Safety on Rural Local and Tribal Roads" Toolkit)
 # ---------------------------------------------------------------------------
 
-# Default EPDO weights (user-configurable via --weights fatal,injury,pdo)
-# injury weight applies to both severe_injury and other_injury
-EPDO_DEFAULTS = (10.0, 2.0, 0.2)   # fatal, injury, pdo
-EPDO = {"fatal": 10.0, "severe_injury": 2.0, "other_injury": 2.0, "pdo": 0.2}
+# Default EPDO weights per FHWA Rural/Local Roads Safety Toolkit (FHWA-SA-14-073),
+# normalized to PDO = 1.0.  Mirrors the KABCO cost ratios in that document:
+#   K (fatal)              = 9.5
+#   A (incapacitating)     = 3.5
+#   B/C (other injury)     = 1.0   (conservative lower bound; B≈1.5, C≈1.0 in toolkit)
+#   O (PDO)                = 1.0
+#
+# --weights CLI accepts 3 args (fatal,injury,pdo) or 4 args (fatal,severe,other,pdo).
+# With 3 args, severe_injury and other_injury receive the same value (legacy behavior).
+EPDO_DEFAULTS = (9.5, 3.5, 1.0, 1.0)   # fatal, severe_injury, other_injury, pdo
+EPDO = {"fatal": 9.5, "severe_injury": 3.5, "other_injury": 1.0, "pdo": 1.0}
 YEAR_WINDOW = 5
 
 
-def set_epdo_weights(fatal: float, injury: float, pdo: float) -> None:
+def set_epdo_weights(fatal: float, severe: float, other: float, pdo: float) -> None:
     """Override module-level EPDO weights (called from main() after arg parsing)."""
-    EPDO["fatal"]        = fatal
-    EPDO["severe_injury"] = injury
-    EPDO["other_injury"]  = injury   # treat severe + other as same tier
+    EPDO["fatal"]         = fatal
+    EPDO["severe_injury"] = severe
+    EPDO["other_injury"]  = other
     EPDO["pdo"]           = pdo
 
 # ---------------------------------------------------------------------------
@@ -1010,15 +1017,25 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         help="Print stats only, do not write output")
     parser.add_argument("--weights", default="",
-                        help="EPDO weights as fatal,injury,pdo  e.g. 10,2,0.2")
+                        help="EPDO weights — 3 args (fatal,injury,pdo) treats A and B/C equally; "
+                             "4 args (fatal,severe,other,pdo) sets them independently.  "
+                             "Default: 9.5,3.5,1.0,1.0  (FHWA Rural/Local Roads Toolkit)")
     args = parser.parse_args()
 
     if args.weights:
         try:
             parts = [float(x) for x in args.weights.split(",")]
             if len(parts) == 3:
+                # Legacy 3-arg form: treat severe and other injuries equally
+                set_epdo_weights(parts[0], parts[1], parts[1], parts[2])
+                print(f"EPDO weights: fatal={parts[0]}, severe_injury={parts[1]}, "
+                      f"other_injury={parts[1]}, pdo={parts[2]}")
+            elif len(parts) == 4:
                 set_epdo_weights(*parts)
-                print(f"EPDO weights: fatal={parts[0]}, injury={parts[1]}, pdo={parts[2]}")
+                print(f"EPDO weights: fatal={parts[0]}, severe_injury={parts[1]}, "
+                      f"other_injury={parts[2]}, pdo={parts[3]}")
+            else:
+                print(f"WARNING: --weights expects 3 or 4 comma-separated values, got {len(parts)}")
         except ValueError:
             print(f"WARNING: Invalid --weights '{args.weights}', using defaults")
 

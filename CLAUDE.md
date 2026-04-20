@@ -32,21 +32,30 @@ uvicorn main:app --reload
 # Open http://localhost:8000
 ```
 
-**Local (Windows):**
-```bash
+**Local (Windows — Command Prompt):**
+```cmd
 .venv\Scripts\activate
 uvicorn main:app --reload
 ```
 
-**Makefile shortcut (any OS):**
+**Local (Windows — PowerShell):**
+```powershell
+.venv\Scripts\Activate.ps1
+uvicorn main:app --reload
+```
+
+**Makefile shortcut (macOS/Linux only — requires GNU Make):**
 ```bash
 make dev        # starts uvicorn on PORT=8000 (default)
 make dev PORT=9000
 ```
 
-**Docker:**
+Note: `make` is not available on Windows by default. Use `uvicorn` directly, or install
+GNU Make via Chocolatey (`choco install make`) or run inside Git Bash / WSL.
+
+**Docker (macOS / Linux / Windows with Docker Desktop):**
 ```bash
-docker compose up --build
+docker compose up -d --build
 # App at http://localhost:8000
 # data/ is mounted as a volume — cache survives container rebuilds
 ```
@@ -82,7 +91,7 @@ python scripts/assign_aadt_to_osm.py --mainline-radius 2000 --ramp-radius 500
 # Requires osm_aadt_lookup.json to populate aadt field on facilities
 python scripts/build_safety_rankings.py --counties sacramento,humboldt
 python scripts/build_safety_rankings.py --counties all --min-osm-pct 80
-python scripts/build_safety_rankings.py --weights 10,2,0.2   # fatal,injury,PDO
+python scripts/build_safety_rankings.py --weights 9.5,3.5,1.0,1.0   # fatal,severe_injury,other_injury,pdo (FHWA toolkit defaults)
 ```
 
 `fetch_osm.py` uses a 3-mirror fallback chain:  
@@ -94,7 +103,7 @@ Key constants in `build_safety_rankings.py`:
 - `YEAR_WINDOW = 5` — crash analysis window
 - `INTERSECTION_R = 50.0` m — crash-to-node match radius
 - `SEGMENT_R = 30.0` m — crash-to-way match radius
-- `EPDO_DEFAULTS = (10.0, 2.0, 0.2)` — fatal / injury / PDO weights
+- `EPDO_DEFAULTS = (9.5, 3.5, 1.0, 1.0)` — fatal / severe_injury / other_injury / PDO weights (FHWA toolkit, normalized PDO=1)
 
 ## Architecture
 
