@@ -111,6 +111,7 @@ Key constants in `build_safety_rankings.py`:
 Browser (MapLibre GL JS + static/app.js + static/index.html)
     │
     ├─ GET  /api/osm/dynamic?bbox=          → Overpass tile fetch, z12 cached in data/osm_cache/
+    ├─ GET  /api/osm/topology?node_id=&…    → intersection topology for clicked node (nearest-centroid fallback)
     ├─ GET  /api/crashes/dynamic?bbox=      → CCRS per-county, cached in data/crash_cache/
     ├─ GET  /api/counties                   → {county_name: county_code} for all 58 CA counties
     ├─ GET  /api/crashes/stats              → aggregated crash counts by scope + group_by field
@@ -129,6 +130,30 @@ FastAPI backend (main.py)
     └─ External: Overpass API, CCRS/data.ca.gov, Mapillary API, Google Maps JS API
 ```
 
+### OSM Tile Processing Pipeline (`main.py`)
+
+Each z12 tile is processed by `_osm_tile_features()` using a 3-pass strategy:
+
+```
+Pass 1: collect all node coordinates (tagged + skel untagged) → nodes_dict
+Pass 2: process ways → geometry, wtype, node_degree tracking, ways_lookup
+Pass 3: parse relations (restrictions + future: routes) → restrictions[]
+
+→ _compute_tile_topologies(nodes_dict, ways_lookup, node_degree, restrictions)
+      ↳ per-node approach metadata (bearing, lanes, oneway, speed, name)
+      ↳ configuration classification (ROUNDABOUT / CHANNELIZED_RT / DIVIDED / UNDIVIDED)
+      ↳ conflict points (Garber & Hoel formula)
+      ↳ roundabout compound grouping (ring nodes → one primary)
+      ↳ embed lon/lat on each topology entry (needed for nearest-centroid fallback)
+
+→ emit intersection_centroid Point features (skip roundabout secondaries)
+→ write tile GeoJSON cache + relation cache (topologies dict)
+```
+
+Relation cache lives alongside the OSM tile cache:
+- OSM tile: `data/osm_cache/{x}_{y}.json` — GeoJSON FeatureCollection
+- Relation cache: `data/osm_cache/{x}_{y}_rel.json` — `{"topologies": {...}, "restrictions": [...]}`
+
 **Key design choices:**
 - No framework on the frontend — vanilla JS + MapLibre GL JS 4.7.1
 - All crash properties from CCRS stored as-is in GeoJSON (full fidelity)
@@ -141,9 +166,10 @@ FastAPI backend (main.py)
 
 ### App Mode
 
-`G_appMode = 'inspect' | 'analysis'` is the master switch:
+`G_appMode = 'inspect' | 'analysis' | 'debug'` is the master switch:
 - **Inspect mode:** Layers load lazily on viewport pan/zoom (`scheduleViewportLoad()`)
 - **Analysis mode:** Viewport loading is suppressed; data is controlled by county chip downloads
+- **Debug mode:** *(planned — Phase 2A)* Renders infra cell polygons, core markers, approach territories; no crash/rankings layers
 
 `setAppMode(mode)` handles the transition. When switching back to Inspect, it must cancel `_anaComputePollTimer` (rankings polling timer) — this is already implemented but must be preserved in future refactors.
 
@@ -160,9 +186,29 @@ MapLibre truncates GeoJSON properties when converting to VectorTile internally. 
 
 Never rely on `e.features[0].properties` alone for data-rich popups.
 
+### Topology Panel
+
+Clicking any node on `intersections-pt-layer` or `signals-layer` opens the topology panel:
+- Fires `GET /api/osm/topology?node_id={id}&lon={lon}&lat={lat}&tile_x={x}&tile_y={y}`
+- Backend looks up the node in the relation cache; if not found, falls back to nearest primary
+  intersection_centroid within 50 m using embedded `lon`/`lat` on each topology entry
+- Panel renders: SVG approach diagram (bearing arrows), configuration badge, conflict points,
+  per-approach table (name, highway class, lanes, bearing)
+- Panel is draggable and closeable; `#topo-panel` in `index.html`
+- Key functions: `_openTopologyPanel`, `_renderTopologyPanel`, `_renderTopologySVG`,
+  `_renderApproachHighlight`, `closeTopoPanel`, `_ensureTopoPanelDraggable`
+
+The `intersections-pt-layer` filter includes `intersection_centroid` (teal, 0.7 opacity) in
+addition to `stop`, `give_way`, and `roundabout`. Roundabout secondary ring nodes are
+suppressed — only the primary (most non-roundabout approaches) is rendered.
+
 ### Analysis Mode Components
 
-- **County Data Manager** — chip grid, `_pollAnaCounty()` at 4 s interval, `_countyChipClass()` for color state
+- **County Data Manager** — chip grid, `_pollAnaCounty()` at 2 s interval during active downloads
+  (accelerated from 4 s when `fetching_crash || fetching_osm`), `_countyChipClass()` for color state
+- **Active Downloads Panel** (`_renderActiveDownloads`) — shown above the county grid when any
+  county is downloading; per-county cards with OSM % bar, crash records count, real-time
+  download speed (tiles/s for OSM, records/s for crash), and ETA estimate
 - **Rankings compute** — `POST /api/rankings/compute`, `_anaComputePollTimer` polls status at 1.5 s
 - **Bin Browser** — chip grid grouped by intersection/segment, `G_rankWorstMap` / `G_rankBestMap` populated on chip click
 - **Crash Dashboard** (`openRankDash`) — EPDO score strip, distribution bars, crash point overlay on map
@@ -261,6 +307,32 @@ Plain `load_dotenv()` does NOT override inherited OS environment variables. If t
 
 Always call `load_dotenv(override=True)` in `main.py`.
 
+### Roundabout compound grouping — `roundabout_primary` flag
+
+Every node on a roundabout ring (`junction=roundabout`) that touches 2+ rankable ways would
+naively become its own `intersection_centroid` — producing 4–10 dots per roundabout. To
+collapse to one logical entity, `_compute_tile_topologies` groups all topology nodes sharing
+the same roundabout way_id, elects the primary (node with most non-roundabout approaches),
+merges leg-road approaches from secondaries into the primary, and sets `roundabout_primary`
+on each secondary. Secondaries are then skipped in the `intersection_centroid` emission loop.
+
+The `roundabout_primary` field is also the signal used by the nearest-centroid fallback to
+skip secondary nodes during the spatial search.
+
+### `_compute_tile_topologies` — pass ordering is critical
+
+Topology computation must happen **before** intersection_centroid emission, because
+`roundabout_primary` flags (set during topology) gate which nodes are emitted. If the
+order is swapped, all ring nodes appear as individual centroids.
+
+Current order in `_osm_tile_features()`:
+1. Pass 1 (nodes) + Pass 2 (ways) + Pass 3 (relations)
+2. `_compute_tile_topologies(...)` — sets `roundabout_primary` on secondaries
+3. Embed `lon`/`lat` on each topology entry
+4. Emit `intersection_centroid` features (skip any node with `roundabout_primary`)
+5. Write GeoJSON tile cache
+6. Write relation cache (`{x}_{y}_rel.json`)
+
 ### Rankings — `crash_coords` is a JSON-encoded string
 
 `crash_coords` in the rankings GeoJSON is stored as a **JSON-encoded string** (not a nested array) to keep file size manageable — each facility caps at 200 crash coordinates.
@@ -272,7 +344,46 @@ const coords = JSON.parse(p.crash_coords || "[]");
 
 Do not assume it is a native JS array from `e.features[0].properties`.
 
-## Phase 2 Scope (next)
+## Phase 2 Scope (active)
+
+Phase 2 has diverged from the original PostGIS/drawing-tools plan. The current direction
+is richer infrastructure entity modeling (see `CELL_MODEL.md`).
+
+### Phase 2A — Composite Infra Entity ("Cell Model")
+
+The road network is modeled as a tessellation of mutually exclusive **infra cells**.
+Each cell = one ranked facility = a nucleus node/way + its approach ways + OSM relations.
+See `CELL_MODEL.md` for full design spec, schema, and open questions.
+
+**Phase 0** (frontend only — no backend changes):
+- Add `'debug'` as a third app mode
+- `_renderDebugCells()`: draw cell polygons (convex hull of nucleus + approach midpoints),
+  core dots, compound-node connector lines, colored by configuration type
+- Click a cell → raw entity JSON inspector panel
+- Validates cell model visually before any backend schema changes
+
+**Phase A** (backend — extend approach attributes):
+- Add `speed_mph`, `surface`, `sidewalk`, `bicycle`, `turn:lanes` to each approach entry
+  in `_compute_tile_topologies`
+- Compute `approach_length_m` (haversine nucleus → terminus)
+- Parse `turn:lanes` → `turn_lanes_list`
+
+**Phase B** (backend — route relations):
+- Add `type=route` (bus/bicycle/foot/road) to Pass 3 relation parsing
+
+**Phase C** (rankings enrichment):
+- Attach composite approach attributes to each ranked facility
+- Use `sum(approach_aadt)` as entering-volume denominator for intersections
+- Extend bin key with `max_approach_speed_bin`
+
+**Phase D** (new API endpoint):
+- `GET /api/osm/facility/{fid}` — return full composite entity JSON on demand
+
+**Phase E** (frontend):
+- Replace topology panel `/api/osm/topology` call with `/api/osm/facility/{fid}`
+- Render approach ways as colored polylines; per-approach speed/lanes/AADT table
+
+### Original Phase 2 Items (deferred to Phase 2B)
 
 - PostGIS database (SQLAlchemy + GeoAlchemy2)
 - `@mapbox/mapbox-gl-draw` for drawing tools in the frontend
@@ -281,6 +392,9 @@ Do not assume it is a native JS array from `e.features[0].properties`.
 
 ## Future Development Notes
 
+- `CELL_MODEL.md` — the active design document for the composite infra entity model.
+  Read before touching `_compute_tile_topologies`, `build_safety_rankings.py`, or the
+  topology panel. This document lives in the repo and is the source of truth for Phase 2A.
 - `data/enrichment/` is pre-created in the Dockerfile but currently unused. Reserved for AADT data (Caltrans PeMS) and SPF calibration files needed for Phase 3 crash-rate normalization and Empirical Bayes PSI scoring.
 - `METHODOLOGY.md` documents the full rankings algorithm (data sources, spatial join, EPDO, bin classification, grade-separation gap, recommended improvements). Reference it before touching `build_safety_rankings.py`.
 - The Raspberry Pi 5 at `raspberrypi.local` is a live deployment target. Always verify Docker images build and run correctly on arm64 before pushing.

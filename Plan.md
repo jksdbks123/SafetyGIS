@@ -32,9 +32,16 @@
 - ✅ Statistics panel — Chart.js bar/donut, 8 group-by fields, 4 scopes
 - ✅ Basemap switching — OpenFreeMap / Esri satellite
 - ✅ Data source info modals + disclaimer
+- ✅ Intersection topology panel — click any signal/stop/intersection → draggable panel with
+    SVG approach diagram, configuration badge (ROUNDABOUT/DIVIDED/etc.), conflict points,
+    per-approach table; nearest-centroid fallback for infrastructure nodes
+- ✅ `intersection_centroid` features — teal dots for computed topological intersection
+    centers; roundabout ring nodes collapsed to single primary via compound grouping
 
 ### Analysis Mode (rankings computation)
 - ✅ County data manager — click to trigger download, per-county progress chips
+- ✅ Active downloads panel — real-time OSM % progress bars, crash record counts,
+    download speed (tiles/s, records/s), ETA estimate; updates every 2 s
 - ✅ Safety rankings computation — EPDO-weighted scoring via `build_safety_rankings.py`
 - ✅ Configurable EPDO weights (fatal / injury / PDO)
 - ✅ Bin browser — intersections and segments, multi-dimension filter chips
@@ -47,14 +54,35 @@
 
 ---
 
-## Phase 2 — Core Interaction & Tracking (Next)
+## Phase 2A — Composite Infra Entity / Cell Model (Active)
 
-**Goal:** Make the map interactive — support drawing, editing, and persisting infrastructure project records.
+**Goal:** Model each infrastructure facility as a composite entity (nucleus + approaches +
+relations) rather than a bare point/line. See `CELL_MODEL.md` for full design spec.
 
-- [ ] 2.1 PostGIS database design — SQLAlchemy + GeoAlchemy2 models for project geometries and attributes
-- [ ] 2.2 Frontend drawing tools — `@mapbox/mapbox-gl-draw` for points, lines, and polygons
-- [ ] 2.3 Attribute forms & API — HTML forms submit project metadata via `fetch` → FastAPI → PostGIS
-- [ ] 2.4 Status-driven styling — layer colors driven by project phase/status field
+**Key concept:** The road network is a tessellation of mutually exclusive **infra cells**.
+Each cell = one ranked facility. A cell may have multiple cores (roundabout, divided intersection).
+Cell boundaries lie at the midpoint of each approach way.
+
+- [ ] P0 — Debug mode: third app mode visualizing cell polygons, core markers, approach
+      territories, cell connections; JSON inspector panel on click (frontend only)
+- [ ] PA — Extend approach attributes in `_compute_tile_topologies`:
+      `speed_mph`, `surface`, `sidewalk`, `bicycle`, `turn:lanes` → `turn_lanes_list`,
+      `approach_length_m`, `has_bike_lane`, `has_sidewalk`
+- [ ] PB — Route relation parsing: `type=route` (bus/bicycle/foot/road) in Pass 3
+- [ ] PC — Rankings enrichment: composite approach attributes in facility features;
+      `sum(approach_aadt)` as entering-volume denominator; richer bin key
+- [ ] PD — New `GET /api/osm/facility/{fid}` endpoint for full composite entity JSON
+- [ ] PE — Frontend topology panel upgraded to use `/api/osm/facility/{fid}`;
+      approach polylines on map; per-approach speed/lanes/AADT table
+
+## Phase 2B — Core Interaction & Tracking (Deferred)
+
+**Goal:** Make the map interactive — support drawing, editing, and persisting project records.
+
+- [ ] 2B.1 PostGIS database design — SQLAlchemy + GeoAlchemy2 models
+- [ ] 2B.2 Frontend drawing tools — `@mapbox/mapbox-gl-draw`
+- [ ] 2B.3 Attribute forms & API — HTML forms → FastAPI → PostGIS
+- [ ] 2B.4 Status-driven styling — layer colors by project phase/status
 
 ---
 
@@ -66,5 +94,6 @@
 - [ ] 3.2 Performance optimization — backend vector tile serving for large datasets
 - [ ] 3.3 AI features (exploratory)
   - AADT integration from Caltrans PeMS for exposure-normalized rankings
+  - Empirical Bayes PSI scoring (requires calibrated SPFs)
   - Natural language map queries ("show me all uncontrolled intersections in Sacramento")
   - Before/after safety analysis tools

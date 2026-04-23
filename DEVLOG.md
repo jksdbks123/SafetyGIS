@@ -387,3 +387,144 @@ The backend changes (`main.py`, `build_safety_rankings.py`) and all frontend JS/
 place. Rankings must be re-computed to emit `conflict_type` and `collision_ids` fields.
 Run: `python scripts/build_safety_rankings.py --counties humboldt` to verify, then test
 the full dashboard flow in the browser.
+
+---
+
+## Session 2026-04-19 — Intersection Topology Panel + Roundabout Compound Grouping
+
+### Problem: topology panel never fired; roundabouts showed as 6–8 dots
+
+Two root-cause bugs were identified:
+
+1. `intersections-pt-layer` filtered `['stop', 'give_way', 'roundabout']` but the click
+   handler checked `p.type === 'intersection_centroid'` — mutually exclusive, so topology
+   panel never opened.
+
+2. Each node on a roundabout ring with degree ≥ 2 became its own `intersection_centroid`.
+   The 80 m + named-road compound detection failed because the ring way has no `name` tag.
+
+### Fix 1 — Roundabout compound grouping (`main.py`)
+
+Added to `_compute_tile_topologies`:
+- Group all topology nodes sharing the same roundabout `way_id` into a compound group
+- Elect primary: node with most non-roundabout approaches
+- Merge leg-road approaches from secondaries into primary
+- Set `roundabout_primary = primary_node_id` on each secondary
+- Recompute `conflict_points` for primary using merged approach count
+
+Secondary nodes are then skipped in the `intersection_centroid` emission loop.
+Result: one teal dot per roundabout instead of 6–8.
+
+### Fix 2 — Layer filter + click trigger (`static/app.js`)
+
+- Added `'intersection_centroid'` to `intersections-pt-layer` filter (teal, 0.7 opacity)
+- Broadened click condition from `p.type === 'intersection_centroid'` to
+  `layerId === 'intersections-pt-layer' || layerId === 'signals-layer'`
+- Topology panel now fires for any infra node click; backend handles nodes that
+  aren't intersection centroids via nearest-centroid fallback
+
+### New: `/api/osm/topology` endpoint + nearest-centroid fallback (`main.py`)
+
+New `GET /api/osm/topology?node_id=&lon=&lat=&tile_x=&tile_y=` endpoint:
+- Loads relation cache for the requested tile
+- Looks up `str(node_id)` in `topologies` dict
+- If not found (e.g., clicked a stop-sign node): spatial search for nearest primary
+  intersection_centroid within 50 m using `lon`/`lat` embedded on each topology entry
+- Returns topology JSON; `node_id` field set to the resolved primary
+
+`lon`/`lat` are now embedded in every topology entry immediately after
+`_compute_tile_topologies` returns — required for the nearest-centroid search.
+
+### New: Topology Panel UI (`static/app.js`, `static/index.html`)
+
+- `#topo-panel` — draggable, closeable panel
+- `_renderTopologyPanel(topo)` — renders configuration badge, conflict points, compound note
+- `_renderTopologySVG(approaches)` — SVG compass diagram with bearing arrows
+- `_renderApproachHighlight(approaches)` — map highlight polylines for hovered approach
+- Roundabout note: "N ring nodes merged" shown when `compound_nodes.length > 0`
+
+### Refactor: pass ordering in `_osm_tile_features` (`main.py`)
+
+Moved Pass 3 (relation parsing) and `_compute_tile_topologies` call to BEFORE the
+`intersection_centroid` emission loop — required because `roundabout_primary` flags
+(set during topology computation) gate which nodes are emitted as centroids.
+
+### Moved: `_retopology_bg` to module level (`main.py`)
+
+The background re-fetch worker was previously defined as a nested closure inside an
+`if` block inside a `with` block. Extracted to module level for clarity.
+
+### Code quality fixes (`main.py`, `static/app.js`)
+
+- Moved `from collections import defaultdict` to top-level import
+- Inlined `_non_rbt_count` lambda into `max()` call (was redundantly re-defined each loop iteration)
+- Fixed wrong coordinate guard `if not cand_lat and not cand_lon` → `if "lat" not in cand`
+  (the old guard would skip valid coordinates at 0.0, 0.0)
+- Removed redundant `else` branch in `_pollAnaCounty` that reset the poll interval on
+  every tick (caused timer drift; interval was already set correctly on first start)
+
+### Updated: `scripts/fetch_osm.py`
+
+Switched from `out geom;` to `out body;>;out skel qt;` with two-pass parsing to match
+`_osm_tile_features`. Added `relation["type"="restriction"]` to the query. Added
+`junction=roundabout` → `wtype=roundabout` classification.
+
+### Updated: `METHODOLOGY.md`
+
+Added "Intersection Configuration Classification" section documenting:
+- Configuration types and priority order
+- Conflict points formula
+- Approach metadata fields
+- Roundabout compound grouping algorithm (5 steps)
+- Nearest-centroid fallback description
+
+---
+
+## Session 2026-04-19 — Active Downloads Progress Panel
+
+### Problem: county download grid gave no progress feedback during downloads
+
+Chips changed color (downloading → ready) but no real-time progress was shown.
+
+### Added: `_renderActiveDownloads()` (`static/app.js`, `static/index.html`)
+
+New `#ana-active-downloads` panel above the county chip grid, visible only when
+downloads are active:
+
+- Per-county "download card" with OSM progress bar (%) and crash records count
+- Real-time speed display: OSM tiles/s and crash records/s
+- ETA estimate for OSM download (tiles_remaining / tiles_per_second)
+- OSM bar turns green with "✓ done" when osm_pct ≥ 95; crash bar same when crash_ready
+
+Speed computation (`_dlComputeSpeeds`): snapshots `osm_tile_cached` and `crash_records_fetched`
+every 2 s poll; computes delta/elapsed using module-level `_dlPrevState` dict.
+
+Poll interval accelerated from 4 s → 2 s when any county is actively downloading
+(set in `_anaClickCounty` and not reset on each tick).
+
+Empty-state guard: when `active.length === 0` and DOM is already empty, skips the
+redundant `classList.remove + innerHTML = ''` on every poll tick.
+
+---
+
+## Session 2026-04-22 — Cell Model Design Document
+
+### Added: `CELL_MODEL.md`
+
+Comprehensive design document for the next major architecture evolution:
+
+**Core concept:** Infrastructure facilities are modeled as mutually exclusive **infra cells**
+rather than bare points/lines. Each cell = nucleus node(s) + approach ways + relations.
+Adjacent cells share a boundary at the midpoint of each approach way.
+
+**Key sections:**
+- Cell metaphor with ASCII diagram
+- Debug mode spec (third app mode; visualizes cell polygons, approach territories,
+  compound-node connections; validates mutual exclusivity invariant)
+- OSM data model alignment table
+- Full composite entity JSON schema
+- What this unlocks for safety ranking (richer bins, approach-level AADT, multimodal exposure)
+- Open questions (approach length cutoff, cell boundary assignment, storage strategy)
+- Phased implementation roadmap (Phase 0 = debug mode, Phases A–E = backend + frontend)
+
+See `CELL_MODEL.md` and `Plan.md` Phase 2A for the implementation roadmap.
