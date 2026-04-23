@@ -29,7 +29,6 @@ OVERPASS_URLS = [
     "https://overpass.openstreetmap.ru/api/interpreter",
 ]
 
-# out geom; returns coordinates directly on each element — no node resolution needed.
 OVERPASS_QUERY = """
 [out:json][timeout:90];
 (
@@ -47,8 +46,11 @@ OVERPASS_QUERY = """
   way["highway"="path"]["foot"!="no"]({bbox});
   way["footway"="sidewalk"]({bbox});
   way["highway"="pedestrian"]({bbox});
+  relation["type"="restriction"]({bbox});
 );
-out geom;
+out body;
+>;
+out skel qt;
 """
 
 
@@ -68,37 +70,34 @@ def fetch_area(name: str, config: dict) -> dict:
     if raw is None:
         raise RuntimeError("All Overpass mirrors failed")
 
+    elements = raw.get("elements", [])
+
+    # Pass 1: collect node coordinates (tagged infra nodes + untagged skel nodes)
+    nodes_dict = {}
+    tagged_nodes = []
+    for el in elements:
+        if el["type"] != "node":
+            continue
+        nodes_dict[el["id"]] = (el["lon"], el["lat"])
+        if el.get("tags"):
+            tagged_nodes.append(el)
+
+    # Pass 2: process ways using node-ID lists
     features = []
-    for el in raw.get("elements", []):
-        if el["type"] == "node":
+    for el in elements:
+        if el["type"] == "way":
             tags = el.get("tags", {})
-            if not tags:
-                continue
-            hw = tags.get("highway")
-            am = tags.get("amenity")
-            tc = tags.get("traffic_calming")
-            if hw:
-                ftype = hw
-            elif am:
-                ftype = am
-            elif tc:
-                ftype = "traffic_calming"
-            else:
-                ftype = "unknown"
-            features.append({
-                "type": "Feature",
-                "geometry": {"type": "Point", "coordinates": [el["lon"], el["lat"]]},
-                "properties": {"id": el["id"], "type": ftype, **tags}
-            })
-        elif el["type"] == "way":
-            tags = el.get("tags", {})
-            coords = [(g["lon"], g["lat"]) for g in el.get("geometry", []) if g]
+            nid_list = el.get("nodes", [])
+            coords = [(nodes_dict[n][0], nodes_dict[n][1]) for n in nid_list if n in nodes_dict]
             if len(coords) < 2:
                 continue
             hw = tags.get("highway", "")
             cy = tags.get("cycleway", "")
             ft = tags.get("footway", "")
-            if hw == "cycleway" or cy:
+            jn = tags.get("junction", "")
+            if jn == "roundabout":
+                wtype = "roundabout"
+            elif hw == "cycleway" or cy:
                 wtype = "cycleway"
             elif hw in ("footway", "path", "pedestrian") or ft == "sidewalk":
                 wtype = "footway"
@@ -109,6 +108,26 @@ def fetch_area(name: str, config: dict) -> dict:
                 "geometry": {"type": "LineString", "coordinates": coords},
                 "properties": {"id": el["id"], "type": wtype, **tags}
             })
+
+    for el in tagged_nodes:
+        tags = el.get("tags", {})
+        hw = tags.get("highway")
+        am = tags.get("amenity")
+        tc = tags.get("traffic_calming")
+        if hw:
+            ftype = hw
+        elif am:
+            ftype = am
+        elif tc:
+            ftype = "traffic_calming"
+        else:
+            ftype = "unknown"
+        lon, lat = nodes_dict[el["id"]]
+        features.append({
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [lon, lat]},
+            "properties": {"id": el["id"], "type": ftype, **tags}
+        })
 
     geojson = {"type": "FeatureCollection", "features": features}
     out_path = os.path.join(OUTPUT_DIR, f"{name}_osm.geojson")

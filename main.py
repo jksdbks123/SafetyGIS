@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
@@ -23,17 +24,19 @@ DATA_DIR    = os.path.join(BASE_DIR, "data")
 STATIC_DIR  = os.path.join(BASE_DIR, "static")
 MLY_CACHE   = os.path.join(DATA_DIR, "mapillary_cache")
 
-OSM_CACHE    = os.path.join(DATA_DIR, "osm_cache")
+OSM_CACHE          = os.path.join(DATA_DIR, "osm_cache")
+OSM_RELATION_CACHE = os.path.join(DATA_DIR, "osm_relation_cache")
 CRASH_CACHE  = os.path.join(DATA_DIR, "crash_cache")
 PARTY_CACHE  = os.path.join(DATA_DIR, "party_cache")
 RANKINGS_DIR = os.environ.get("RANKINGS_DIR", os.path.join(DATA_DIR, "rankings"))
 AADT_FILE    = os.path.join(DATA_DIR, "CaltransAADT", "aadt_geocoded.geojson")
 
-os.makedirs(MLY_CACHE,   exist_ok=True)
-os.makedirs(OSM_CACHE,   exist_ok=True)
-os.makedirs(CRASH_CACHE, exist_ok=True)
-os.makedirs(PARTY_CACHE, exist_ok=True)
-os.makedirs(RANKINGS_DIR, exist_ok=True)
+os.makedirs(MLY_CACHE,          exist_ok=True)
+os.makedirs(OSM_CACHE,          exist_ok=True)
+os.makedirs(OSM_RELATION_CACHE, exist_ok=True)
+os.makedirs(CRASH_CACHE,        exist_ok=True)
+os.makedirs(PARTY_CACHE,        exist_ok=True)
+os.makedirs(RANKINGS_DIR,       exist_ok=True)
 
 # CCRS API constants
 CCRS_BASE_URL    = "https://data.ca.gov/api/3/action"
@@ -111,9 +114,17 @@ _CC_TO_NAME: dict[int, str] = {code: name for name, (code, _) in CA_COUNTIES.ite
 _fetching_counties: set = set()
 _fetching_lock = threading.Lock()
 
+# Crash download progress: county_name → {"fetched": int, "year": int}
+# Written by the background fetch thread; read-only in the status endpoint.
+_crash_progress: dict = {}
+
 # OSM background-fetch state (per-county systematic tile download)
 _fetching_osm_counties: set = set()
 _fetching_osm_lock = threading.Lock()
+
+# Tiles currently being re-fetched to build missing relation cache
+_retopology_pending: set = set()
+_retopology_lock = threading.Lock()
 
 MAPILLARY_TOKEN  = os.getenv("MAPILLARY_TOKEN", "")
 GOOGLE_MAPS_KEY  = os.getenv("GOOGLE_MAPS_KEY", "")
@@ -147,6 +158,7 @@ OVERPASS_QUERY = """
   way["highway"="path"]["foot"!="no"]({bbox});
   way["footway"="sidewalk"]({bbox});
   way["highway"="pedestrian"]({bbox});
+  relation["type"="restriction"]({bbox});
 );
 out body;
 >;
@@ -184,6 +196,217 @@ def _tile2bbox(x: int, y: int, z: int):
     lat_max = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
     lat_min = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n))))
     return lon_min, lat_min, lon_max, lat_max
+
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    R = 6_371_000.0
+    φ1, φ2 = math.radians(lat1), math.radians(lat2)
+    dφ = math.radians(lat2 - lat1)
+    dλ = math.radians(lon2 - lon1)
+    a = math.sin(dφ / 2) ** 2 + math.cos(φ1) * math.cos(φ2) * math.sin(dλ / 2) ** 2
+    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def _bearing(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    dlon = math.radians(lon2 - lon1)
+    lat1r, lat2r = math.radians(lat1), math.radians(lat2)
+    x = math.sin(dlon) * math.cos(lat2r)
+    y = math.cos(lat1r) * math.sin(lat2r) - math.sin(lat1r) * math.cos(lat2r) * math.cos(dlon)
+    return (math.degrees(math.atan2(x, y)) + 360) % 360
+
+
+def _compute_tile_topologies(
+    nodes_dict: dict,
+    ways_lookup: dict,   # way_id → {"tags": {}, "nid_list": [...], "wtype": str}
+    node_degree: dict,
+    restrictions: list,
+) -> dict:
+    """Compute intersection topology for all intersection nodes in a tile."""
+    # Build node → connected way IDs index
+    node_ways: dict = {}
+    for wid, wdata in ways_lookup.items():
+        for nid in wdata["nid_list"]:
+            node_ways.setdefault(nid, []).append(wid)
+
+    # Index restrictions by via_node
+    restr_by_node: dict = {}
+    for r in restrictions:
+        restr_by_node.setdefault(r["via_node"], []).append(r)
+
+    topologies: dict = {}
+
+    for nid, deg in node_degree.items():
+        if deg < 2 or nid not in nodes_dict:
+            continue
+        lon, lat = nodes_dict[nid]
+
+        # Build approach list: one entry per rankable way connected at this node
+        approaches = []
+        for wid in node_ways.get(nid, []):
+            wdata = ways_lookup.get(wid)
+            if not wdata or wdata["wtype"] not in _RANKABLE_HIGHWAY_FOR_CENTROIDS:
+                continue
+            tags     = wdata["tags"]
+            nid_list = wdata["nid_list"]
+            try:
+                idx = nid_list.index(nid)
+            except ValueError:
+                continue
+            # Pick adjacent node: prefer forward (idx+1), fall back to backward (idx-1)
+            if idx + 1 < len(nid_list) and nid_list[idx + 1] in nodes_dict:
+                adj_nid = nid_list[idx + 1]
+                fwd = True
+            elif idx - 1 >= 0 and nid_list[idx - 1] in nodes_dict:
+                adj_nid = nid_list[idx - 1]
+                fwd = False
+            else:
+                continue
+            adj_lon, adj_lat = nodes_dict[adj_nid]
+            brg = _bearing(lon, lat, adj_lon, adj_lat)
+
+            oneway_tag = tags.get("oneway", "")
+            if oneway_tag == "yes":
+                oneway = 1 if fwd else -1
+            elif oneway_tag == "-1":
+                oneway = -1 if fwd else 1
+            else:
+                oneway = 0
+
+            approaches.append({
+                "way_id":     wid,
+                "name":       tags.get("name") or tags.get("ref", ""),
+                "highway":    wdata["wtype"],
+                "oneway":     oneway,
+                "lanes":      int(tags.get("lanes", 1)),
+                "turn_lanes": tags.get("turn:lanes", ""),
+                "bearing":    round(brg, 1),
+            })
+
+        if not approaches:
+            continue
+
+        # Classify configuration
+        wtypes = {a["highway"] for a in approaches}
+        names  = [a["name"] for a in approaches if a["name"]]
+        oneways = [a["oneway"] for a in approaches]
+
+        if "roundabout" in wtypes:
+            config = "ROUNDABOUT"
+        elif any(hw.endswith("_link") for hw in wtypes):
+            link_brgs  = [a["bearing"] for a in approaches if a["highway"].endswith("_link")]
+            other_brgs = [a["bearing"] for a in approaches if not a["highway"].endswith("_link")]
+            config = "UNDIVIDED"
+            for lb in link_brgs:
+                for ob in other_brgs:
+                    if abs((lb - ob + 180) % 360 - 180) <= 30:
+                        config = "CHANNELIZED_RT"
+                        break
+                if config == "CHANNELIZED_RT":
+                    break
+        elif names and any(oneways):
+            name_counts: dict = {}
+            for a in approaches:
+                if a["name"]:
+                    name_counts[a["name"]] = name_counts.get(a["name"], 0) + 1
+            config = "DIVIDED" if any(v >= 2 for v in name_counts.values()) else "UNDIVIDED"
+        else:
+            config = "UNDIVIDED"
+
+        # Conflict points (Garber & Hoel, capped at 56)
+        n  = len(approaches)
+        cp = min(3 * n * (n - 1) // 2, 56)
+        node_restrictions = restr_by_node.get(nid, [])
+        no_count = sum(1 for r in node_restrictions if r["restriction"].startswith("no_"))
+        cp = max(0, cp - 2 * no_count)
+
+        topologies[str(nid)] = {
+            "configuration":  config,
+            "approaches":     approaches,
+            "restrictions":   [
+                {"id": r["id"], "restriction": r["restriction"],
+                 "from_way": r["from_way"], "to_way": r["to_way"]}
+                for r in node_restrictions
+            ],
+            "conflict_points": cp,
+            "compound_nodes":  [],
+        }
+
+    # Compound node detection: pair nodes within 80 m sharing a named road
+    topo_ids = list(topologies.keys())
+    for i, a_str in enumerate(topo_ids):
+        a_int = int(a_str)
+        lon_a, lat_a = nodes_dict[a_int]
+        names_a = {
+            ways_lookup[wid]["tags"].get("name") or ways_lookup[wid]["tags"].get("ref", "")
+            for wid in node_ways.get(a_int, [])
+            if wid in ways_lookup and
+               (ways_lookup[wid]["tags"].get("name") or ways_lookup[wid]["tags"].get("ref"))
+        }
+        for b_str in topo_ids[i + 1:]:
+            b_int = int(b_str)
+            lon_b, lat_b = nodes_dict[b_int]
+            if _haversine_m(lat_a, lon_a, lat_b, lon_b) > 80:
+                continue
+            names_b = {
+                ways_lookup[wid]["tags"].get("name") or ways_lookup[wid]["tags"].get("ref", "")
+                for wid in node_ways.get(b_int, [])
+                if wid in ways_lookup and
+                   (ways_lookup[wid]["tags"].get("name") or ways_lookup[wid]["tags"].get("ref"))
+            }
+            if names_a & names_b:
+                topologies[a_str]["compound_nodes"].append(b_int)
+                topologies[b_str]["compound_nodes"].append(a_int)
+
+    # Roundabout-way grouping: all topology nodes sharing a roundabout way → one compound group.
+    # The 80 m + named-road detection above misses roundabout rings because the ring way has no
+    # name. Group by shared way_id instead, pick one primary node, merge all leg-road approaches
+    # into it, and mark the rest as secondaries (roundabout_primary = primary node_id).
+    roundabout_groups: dict = defaultdict(set)
+    for nid_str in topologies:
+        nid_int = int(nid_str)
+        for wid in node_ways.get(nid_int, []):
+            if wid in ways_lookup and ways_lookup[wid]["wtype"] == "roundabout":
+                roundabout_groups[wid].add(nid_str)
+
+    for _wid, members in roundabout_groups.items():
+        if len(members) < 2:
+            continue
+
+        primary_str = max(
+            members,
+            key=lambda n: sum(
+                1 for a in topologies[n].get("approaches", [])
+                if ways_lookup.get(a["way_id"], {}).get("wtype") != "roundabout"
+            ),
+        )
+
+        # Merge non-roundabout approaches from secondaries into primary
+        primary_way_ids = {a["way_id"] for a in topologies[primary_str].get("approaches", [])}
+        for m_str in members:
+            if m_str == primary_str:
+                continue
+            for appr in topologies[m_str].get("approaches", []):
+                if (appr["way_id"] not in primary_way_ids and
+                        ways_lookup.get(appr["way_id"], {}).get("wtype") != "roundabout"):
+                    topologies[primary_str]["approaches"].append(appr)
+                    primary_way_ids.add(appr["way_id"])
+            topologies[m_str]["roundabout_primary"] = int(primary_str)
+            if int(primary_str) not in topologies[m_str]["compound_nodes"]:
+                topologies[m_str]["compound_nodes"].append(int(primary_str))
+            if int(m_str) not in topologies[primary_str]["compound_nodes"]:
+                topologies[primary_str]["compound_nodes"].append(int(m_str))
+
+        # Recompute conflict points now that primary has merged approaches
+        n_ap     = len(topologies[primary_str]["approaches"])
+        no_count = sum(
+            1 for r in topologies[primary_str].get("restrictions", [])
+            if r.get("restriction", "").startswith("no_")
+        )
+        topologies[primary_str]["conflict_points"] = max(
+            0, min(3 * n_ap * (n_ap - 1) // 2, 56) - 2 * no_count
+        )
+
+    return topologies
 
 
 # ---------------------------------------------------------------------------
@@ -307,8 +530,13 @@ def _crash_record_to_feature(r: dict) -> dict | None:
     }
 
 
-def _fetch_county_crashes(county_code: int) -> list:
-    """Fetch all crash GeoJSON features for a county from CCRS (all target years)."""
+def _fetch_county_crashes(county_code: int, county_name: str | None = None) -> list:
+    """Fetch all crash GeoJSON features for a county from CCRS (all target years).
+
+    If county_name is provided and present in _crash_progress, updates progress
+    (fetched record count + current year) after each page so the status endpoint
+    can expose real-time download speed.
+    """
     resources = _get_ccrs_resources()
     if not resources:
         return []
@@ -341,6 +569,8 @@ def _fetch_county_crashes(county_code: int) -> list:
                 if fid not in seen_ids:
                     seen_ids.add(fid)
                     features.append(feat)
+            if county_name and county_name in _crash_progress:
+                _crash_progress[county_name] = {"fetched": len(features), "year": year}
             if len(batch) < CCRS_PAGE_SIZE:
                 break
             offset += CCRS_PAGE_SIZE
@@ -350,14 +580,16 @@ def _fetch_county_crashes(county_code: int) -> list:
 
 def _cache_county_bg(county_name: str, county_code: int) -> None:
     """Fetch and cache county crash data in a background thread."""
+    _crash_progress[county_name] = {"fetched": 0, "year": 0}
     try:
-        features = _fetch_county_crashes(county_code)
+        features = _fetch_county_crashes(county_code, county_name)
         with open(os.path.join(CRASH_CACHE, f"{county_name}.geojson"), "w") as f:
             json.dump({"type": "FeatureCollection", "features": features}, f)
         print(f"[crash] {county_name}: {len(features)} records cached")
     except Exception as e:
         print(f"[crash] Background fetch failed for {county_name}: {e}")
     finally:
+        _crash_progress.pop(county_name, None)
         with _fetching_lock:
             _fetching_counties.discard(county_name)
 
@@ -516,6 +748,7 @@ def _osm_tile_features(x: int, y: int) -> list:
             tagged_nodes.append(el)
 
     node_degree: dict = {}   # node_id → count of rankable ways referencing it
+    ways_lookup: dict = {}   # way_id → {"tags", "nid_list", "wtype"} for topology
     features = []
 
     for el in elements:
@@ -544,6 +777,7 @@ def _osm_tile_features(x: int, y: int) -> list:
         if wtype in _RANKABLE_HIGHWAY_FOR_CENTROIDS:
             for nid in nid_list:
                 node_degree[nid] = node_degree.get(nid, 0) + 1
+            ways_lookup[el["id"]] = {"tags": tags, "nid_list": nid_list, "wtype": wtype}
 
         features.append({
             "type": "Feature",
@@ -577,10 +811,46 @@ def _osm_tile_features(x: int, y: int) -> list:
             "properties": {"id": el["id"], "type": ftype, **tags},
         })
 
+    # Pass 3 — parse type=restriction relations (must run before intersection_centroid
+    # emission so topology data is available to filter secondary roundabout nodes).
+    restrictions: list = []
+    for el in elements:
+        if el["type"] != "relation":
+            continue
+        tags = el.get("tags", {})
+        if tags.get("type") != "restriction":
+            continue
+        from_way = via_node = to_way = None
+        for m in el.get("members", []):
+            if m["role"] == "from"  and m["type"] == "way":  from_way = m["ref"]
+            if m["role"] == "via"   and m["type"] == "node": via_node = m["ref"]
+            if m["role"] == "to"    and m["type"] == "way":  to_way   = m["ref"]
+        if via_node and from_way and to_way:
+            restrictions.append({
+                "id":          el["id"],
+                "restriction": tags.get("restriction", ""),
+                "from_way":    from_way,
+                "via_node":    via_node,
+                "to_way":      to_way,
+            })
+
+    topologies = _compute_tile_topologies(nodes_dict, ways_lookup, node_degree, restrictions)
+
+    # Embed node coordinates in each topology entry for nearest-centroid fallback
+    for nid_str, topo in topologies.items():
+        nid_int = int(nid_str)
+        if nid_int in nodes_dict:
+            topo["lon"] = nodes_dict[nid_int][0]
+            topo["lat"] = nodes_dict[nid_int][1]
+
     # Emit topological intersection centroid features.
     # A node referenced by 2+ rankable road ways is a true intersection center.
+    # Secondary roundabout ring nodes (marked roundabout_primary) are skipped —
+    # the whole roundabout is represented by its primary node.
     for nid, deg in node_degree.items():
         if deg < 2 or nid not in nodes_dict:
+            continue
+        if topologies.get(str(nid), {}).get("roundabout_primary"):
             continue
         lon, lat = nodes_dict[nid]
         features.append({
@@ -591,6 +861,11 @@ def _osm_tile_features(x: int, y: int) -> list:
 
     with open(cache_path, "w") as f:
         json.dump(features, f)
+
+    rel_cache_path = os.path.join(OSM_RELATION_CACHE, f"{OSM_CACHE_ZOOM}_{x}_{y}.json")
+    with open(rel_cache_path, "w", encoding="utf-8") as f:
+        json.dump({"restrictions": restrictions, "topologies": topologies}, f)
+
     return features
 
 
@@ -682,6 +957,67 @@ def get_osm_dynamic(bbox: str = Query(..., description="west,south,east,north"))
                 features.append(feat)
 
     return JSONResponse({"type": "FeatureCollection", "features": features})
+
+
+def _retopology_bg(x: int, y: int) -> None:
+    """Background worker: re-fetch a tile to populate its missing relation cache."""
+    try:
+        _osm_tile_features(x, y)
+    finally:
+        with _retopology_lock:
+            _retopology_pending.discard((x, y))
+
+
+@app.get("/api/osm/topology")
+def get_osm_topology(
+    node_id: int   = Query(..., description="OSM node ID"),
+    lon:     float = Query(..., description="Longitude of the node"),
+    lat:     float = Query(..., description="Latitude of the node"),
+):
+    """Return pre-computed intersection topology for one OSM node."""
+    tx = _lon2tile(lon, OSM_CACHE_ZOOM)
+    ty = _lat2tile(lat, OSM_CACHE_ZOOM)
+    rel_path  = os.path.join(OSM_RELATION_CACHE, f"{OSM_CACHE_ZOOM}_{tx}_{ty}.json")
+    main_path = os.path.join(OSM_CACHE, f"{OSM_CACHE_ZOOM}_{tx}_{ty}.json")
+
+    if not os.path.exists(rel_path):
+        # Tile cached before relation support was added — invalidate and re-fetch so
+        # the next retry from the frontend will have topology data.
+        with _retopology_lock:
+            if os.path.exists(main_path) and (tx, ty) not in _retopology_pending:
+                _retopology_pending.add((tx, ty))
+                try:
+                    os.remove(main_path)
+                except OSError:
+                    pass
+                threading.Thread(target=_retopology_bg, args=(tx, ty), daemon=True).start()
+
+        return JSONResponse({"status": "not_cached"}, status_code=202)
+
+    with open(rel_path, encoding="utf-8") as f:
+        rel = json.load(f)
+    topo = rel["topologies"].get(str(node_id))
+
+    if not topo:
+        # Nearest-centroid fallback for control-device nodes (stop, signal, give_way)
+        # that have no topology entry of their own.
+        best_id: int | None = None
+        best_dist = 51.0
+        for cand_str, cand in rel["topologies"].items():
+            if cand.get("roundabout_primary"):
+                continue
+            if "lat" not in cand or "lon" not in cand:
+                continue
+            d = _haversine_m(lat, lon, cand["lat"], cand["lon"])
+            if d < best_dist:
+                best_dist, best_id = d, int(cand_str)
+        if best_id is None:
+            return JSONResponse({"status": "no_topology"}, status_code=404)
+        topo = rel["topologies"][str(best_id)]
+        node_id = best_id
+
+    topo["node_id"] = node_id
+    return topo
 
 
 # Dynamic crash endpoint
@@ -1152,16 +1488,19 @@ def get_county_status():
     for name, (code, bbox) in CA_COUNTIES.items():
         osm          = _county_osm_status(name)
         crash_ready  = name in crash_cached
+        crash_prog   = _crash_progress.get(name, {})
         result[name] = {
-            "code":            code,
-            "bbox":            list(bbox),
-            "crash_ready":     crash_ready,
-            "fetching_crash":  name in _fetching_counties,
-            "osm_tile_total":  osm["total"],
-            "osm_tile_cached": osm["cached"],
-            "osm_pct":         osm["pct"],
-            "fetching_osm":    name in _fetching_osm_counties,
-            "analysis_ready":  crash_ready and osm["pct"] >= 95,
+            "code":                 code,
+            "bbox":                 list(bbox),
+            "crash_ready":          crash_ready,
+            "fetching_crash":       name in _fetching_counties,
+            "crash_records_fetched": crash_prog.get("fetched", 0),
+            "crash_current_year":   crash_prog.get("year", 0),
+            "osm_tile_total":       osm["total"],
+            "osm_tile_cached":      osm["cached"],
+            "osm_pct":              osm["pct"],
+            "fetching_osm":         name in _fetching_osm_counties,
+            "analysis_ready":       crash_ready and osm["pct"] >= 95,
         }
     return JSONResponse(result)
 

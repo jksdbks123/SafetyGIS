@@ -447,17 +447,21 @@ function addOsmLayers() {
   map.addLayer({
     id: 'intersections-pt-layer', type: 'circle', source: 'osm',
     minzoom: 12,
-    filter: ['in', ['get', 'type'], ['literal', ['stop', 'give_way', 'roundabout']]],
+    filter: ['in', ['get', 'type'], ['literal', ['stop', 'give_way', 'roundabout', 'intersection_centroid']]],
     paint: {
-      'circle-radius':       ['interpolate', ['linear'], ['zoom'], 12, 4, 16, 9],
-      'circle-color':        ['match', ['get', 'type'],
-        'stop',      '#f87171',
-        'give_way',  '#fb923c',
+      'circle-radius': ['interpolate', ['linear'], ['zoom'],
+        12, ['match', ['get', 'type'], 'intersection_centroid', 3, 4],
+        16, ['match', ['get', 'type'], 'intersection_centroid', 7, 9]
+      ],
+      'circle-color': ['match', ['get', 'type'],
+        'stop',                  '#f87171',
+        'give_way',              '#fb923c',
+        'intersection_centroid', '#14b8a6',
         '#2dd4bf'
       ],
       'circle-stroke-width': 1.5,
       'circle-stroke-color': '#1a1d2e',
-      'circle-opacity':      0.9,
+      'circle-opacity': ['match', ['get', 'type'], 'intersection_centroid', 0.7, 0.9],
     },
   });
 
@@ -1147,6 +1151,7 @@ function setupPanelInteractions() {
 
   // #analysis-panel — lazy-init on first switch to analysis mode (see setAppMode)
   // #rank-dash-panel — initialized on first open (see openRankDash)
+  // #topo-panel — initialized on first open (see _openTopologyPanel)
 }
 
 function setupPegman() {
@@ -1484,6 +1489,14 @@ function setupPopups() {
           <div class="popup-row" style="opacity:0.45;font-size:0.65rem;margin-top:4px"><span class="popup-key">OSM ID</span><span>${_esc(String(p.id))}</span></div>
         </div>
       `).addTo(map);
+      // Open topology panel for any infrastructure node click; backend nearest-centroid
+      // fallback handles stop/give_way/signal nodes that aren't intersection_centroid
+      if (layerId === 'intersections-pt-layer' || layerId === 'signals-layer') {
+        const coords = fullFeature
+          ? fullFeature.geometry.coordinates
+          : [e.lngLat.lng, e.lngLat.lat];
+        _openTopologyPanel(p.id, coords[0], coords[1]);
+      }
       // Click to select — Cmd/Ctrl+click appends, plain click replaces
       const selFeat = fullFeature || { type: 'Feature', geometry: e.features[0].geometry, properties: p };
       _applyClickSelection(selFeat, e.originalEvent.metaKey || e.originalEvent.ctrlKey);
@@ -3179,6 +3192,7 @@ async function _loadCountyData(countyName) {
 let _anaCountyData       = null;   // { county_name: { crash_ready, osm_pct, ... } }
 let _anaCountyPollTimers = {};     // { county_name: intervalId } — per-county download polls
 let _anaComputePollTimer = null;
+const _dlPrevState = {};           // { county_name: { oTiles, cRecords, ts } } for speed calc
 let _anaHandoffShown     = false;
 let _anaBinsData         = null;   // cached result of /api/rankings/bins
 let _anaActiveBinKey     = null;   // currently selected bin key
@@ -3271,6 +3285,129 @@ async function _loadAnalysisCountyStatus() {
   } catch (_) {}
 }
 
+// ── Download speed helpers ────────────────────────────────────────────────
+
+function _fmtNum(n) {
+  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
+  if (n >= 1_000)     return (n / 1_000).toFixed(1) + 'k';
+  return String(n);
+}
+
+function _fmtSpeed(perSec, unit) {
+  if (perSec <= 0) return '';
+  if (perSec >= 1) return `${perSec.toFixed(1)} ${unit}/s`;
+  return `${(perSec * 60).toFixed(0)} ${unit}/min`;
+}
+
+// Return {oSpeed, cSpeed} tiles/s and records/s from previous snapshot; update snapshot.
+function _dlComputeSpeeds(name, info) {
+  const prev = _dlPrevState[name];
+  const now  = Date.now();
+  let oSpeed = 0, cSpeed = 0;
+  if (prev && prev.ts) {
+    const dt = (now - prev.ts) / 1000;
+    if (dt >= 0.5) {
+      const dTiles = (info.osm_tile_cached || 0) - (prev.oTiles || 0);
+      const dRec   = (info.crash_records_fetched || 0) - (prev.cRecords || 0);
+      oSpeed = dTiles >= 0 ? dTiles / dt : 0;
+      cSpeed = dRec   >= 0 ? dRec   / dt : 0;
+    }
+  }
+  _dlPrevState[name] = {
+    oTiles:   info.osm_tile_cached        || 0,
+    cRecords: info.crash_records_fetched  || 0,
+    ts: now,
+  };
+  return { oSpeed, cSpeed };
+}
+
+function _renderActiveDownloads() {
+  const wrap = document.getElementById('ana-active-downloads');
+  if (!wrap || !_anaCountyData) return;
+
+  const active = Object.entries(_anaCountyData)
+    .filter(([, info]) => info.fetching_crash || info.fetching_osm);
+
+  if (active.length === 0) {
+    if (wrap.classList.contains('has-items')) {
+      wrap.classList.remove('has-items');
+      wrap.innerHTML = '';
+    }
+    return;
+  }
+
+  wrap.classList.add('has-items');
+  wrap.innerHTML = active.map(([name, info]) => {
+    const label  = name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
+    const osmPct = Math.min(info.osm_pct || 0, 100);
+
+    const { oSpeed, cSpeed } = _dlComputeSpeeds(name, info);
+
+    // ── OSM row ──
+    const osmSpeedStr = info.fetching_osm ? _fmtSpeed(oSpeed, 't') : '';
+    const remaining   = Math.max(0, (info.osm_tile_total || 0) - (info.osm_tile_cached || 0));
+    let osmStatus;
+    if (info.osm_pct >= 95 && !info.fetching_osm) {
+      osmStatus = '<span style="color:#4ade80">✓ done</span>';
+    } else if (info.fetching_osm) {
+      const parts = [`${osmPct.toFixed(0)}%`];
+      if (remaining > 0) parts.push(`${remaining} left`);
+      if (osmSpeedStr)   parts.push(`<span class="ana-dl-speed">${osmSpeedStr}</span>`);
+      osmStatus = parts.join(' · ');
+    } else {
+      osmStatus = `${osmPct.toFixed(0)}%`;
+    }
+    const osmBarClass = osmPct >= 95 ? 'ana-dl-bar-fill ana-dl-bar-done' : 'ana-dl-bar-fill ana-dl-bar-osm';
+
+    // ── Crash row ──
+    const cRec  = info.crash_records_fetched || 0;
+    const cYear = info.crash_current_year    || 0;
+    // Crash bar: year-index out of 6 gives rough estimate
+    const crashBarPct = info.crash_ready ? 100
+      : (cYear >= 2019 ? Math.round((cYear - 2018) / 6 * 100) : (cRec > 0 ? 15 : 0));
+    const crashSpeedStr = info.fetching_crash ? _fmtSpeed(cSpeed, 'rec') : '';
+    let crashStatus;
+    if (info.crash_ready) {
+      crashStatus = '<span style="color:#4ade80">✓ done</span>';
+    } else if (info.fetching_crash) {
+      const parts = [];
+      if (cRec > 0)       parts.push(`${_fmtNum(cRec)} rec`);
+      if (cYear >= 2019)  parts.push(`yr ${cYear}`);
+      if (crashSpeedStr)  parts.push(`<span class="ana-dl-speed">${crashSpeedStr}</span>`);
+      crashStatus = parts.length ? parts.join(' · ') : 'fetching\u2026';
+    } else {
+      crashStatus = '\u2014';
+    }
+    const crashBarClass = info.crash_ready ? 'ana-dl-bar-fill ana-dl-bar-done' : 'ana-dl-bar-fill ana-dl-bar-crash';
+
+    // ETA hint (tiles remaining / speed)
+    let etaStr = '';
+    if (info.fetching_osm && oSpeed > 0.1 && remaining > 0) {
+      const secs = remaining / oSpeed;
+      etaStr = secs < 60  ? `~${Math.round(secs)}s`
+             : secs < 3600 ? `~${Math.round(secs/60)}m`
+             : `~${(secs/3600).toFixed(1)}h`;
+    }
+
+    return `<div class="ana-dl-card">
+  <div class="ana-dl-title">
+    <span class="ana-dl-name">${label}</span>
+    <span class="ana-dl-eta">${etaStr}</span>
+  </div>
+  <div class="ana-dl-row">
+    <span class="ana-dl-tag ana-dl-tag-osm">OSM</span>
+    <div class="ana-dl-bar-wrap"><div class="${osmBarClass}" style="width:${osmPct}%"></div></div>
+    <span class="ana-dl-status">${osmStatus}</span>
+  </div>
+  <div class="ana-dl-row">
+    <span class="ana-dl-tag ana-dl-tag-crash">CRS</span>
+    <div class="ana-dl-bar-wrap"><div class="${crashBarClass}" style="width:${crashBarPct}%"></div></div>
+    <span class="ana-dl-status">${crashStatus}</span>
+  </div>
+</div>`;
+  }).join('');
+}
+
 function _renderAnaCountyGrid() {
   const grid = document.getElementById('ana-county-grid');
   if (!grid || !_anaCountyData) return;
@@ -3318,9 +3455,16 @@ async function _anaClickCounty(name) {
     ]);
   } catch (_) {}
 
+  // Show download card immediately without waiting for first poll
+  if (_anaCountyData[name]) {
+    _anaCountyData[name].fetching_crash = true;
+    _anaCountyData[name].fetching_osm = true;
+  }
+  _renderActiveDownloads();
+
   // Poll until this county is ready
   if (_anaCountyPollTimers[name]) clearInterval(_anaCountyPollTimers[name]);
-  _anaCountyPollTimers[name] = setInterval(() => _pollAnaCounty(name), 4000);
+  _anaCountyPollTimers[name] = setInterval(() => _pollAnaCounty(name), 2000);
 }
 
 async function _pollAnaCounty(name) {
@@ -3339,12 +3483,14 @@ async function _pollAnaCounty(name) {
       || prev.fetching_osm  !== next?.fetching_osm;
     _anaCountyData = fresh;
     if (changed) { _renderAnaCountyGrid(); _updateAnaComputeBtn(); }
+    _renderActiveDownloads();
 
     const info = _anaCountyData[name];
-    // Stop polling when download fully completes (success or stalled) — not still actively fetching
-    if (!info || info.analysis_ready || (!info.fetching_crash && !info.fetching_osm)) {
+    const stillActive = info && (info.fetching_crash || info.fetching_osm);
+    if (!info || info.analysis_ready || !stillActive) {
       clearInterval(_anaCountyPollTimers[name]);
       delete _anaCountyPollTimers[name];
+      _renderActiveDownloads(); // clear card now that download finished
     }
   } catch (_) {}
 }
@@ -3811,5 +3957,265 @@ function _anaComputeClearAll() {
   _anaComputeCounties.clear();
   _renderAnaComputeCountyPicker();
   _updateAnaComputeBtn();
+}
+
+// =============================================================================
+// Intersection Topology Panel
+// =============================================================================
+
+let _topoPanelInited = false;
+let _topoRetryTimer  = null;
+
+function _ensureTopoPanelDraggable() {
+  if (_topoPanelInited) return;
+  _topoPanelInited = true;
+  const panel  = document.getElementById('topo-panel');
+  const handle = document.getElementById('topo-header');
+  if (panel && handle) _initPanelInteractive(panel, handle, { minW: 200, minH: 150 });
+}
+
+function closeTopoPanel() {
+  const panel = document.getElementById('topo-panel');
+  if (panel) panel.classList.remove('open');
+  if (_topoRetryTimer) { clearTimeout(_topoRetryTimer); _topoRetryTimer = null; }
+  // Remove approach highlight layer if present
+  if (map.getLayer('topo-highlight-layer')) map.removeLayer('topo-highlight-layer');
+  if (map.getSource('topo-highlight'))      map.removeSource('topo-highlight');
+}
+
+function _openTopologyPanel(nodeId, lon, lat) {
+  _ensureTopoPanelDraggable();
+  const panel   = document.getElementById('topo-panel');
+  const loading = document.getElementById('topo-loading');
+  const errDiv  = document.getElementById('topo-error');
+  const badge   = document.getElementById('topo-config-badge');
+  const stats   = document.getElementById('topo-stats');
+  const svg     = document.getElementById('topo-svg');
+
+  panel.classList.add('open');
+  loading.classList.remove('hidden');
+  errDiv.classList.add('hidden');
+  badge.textContent = '';
+  badge.className   = 'topo-config-badge';
+  stats.innerHTML   = '';
+  // Clear SVG
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+  if (_topoRetryTimer) { clearTimeout(_topoRetryTimer); _topoRetryTimer = null; }
+
+  function doFetch(attempt) {
+    fetch(`/api/osm/topology?node_id=${nodeId}&lon=${encodeURIComponent(lon)}&lat=${encodeURIComponent(lat)}`)
+      .then(r => {
+        if (r.status === 202) {
+          if (attempt === 0) loading.textContent = 'Fetching tile\u2026 retrying';
+          if (attempt < 12) {
+            _topoRetryTimer = setTimeout(() => doFetch(attempt + 1), 2500);
+          } else {
+            loading.classList.add('hidden');
+            errDiv.textContent = 'Timed out waiting for topology data.';
+            errDiv.classList.remove('hidden');
+          }
+          return null;
+        }
+        if (r.status === 404) {
+          loading.classList.add('hidden');
+          errDiv.textContent = 'No topology data for this node.';
+          errDiv.classList.remove('hidden');
+          return null;
+        }
+        return r.json();
+      })
+      .then(topo => {
+        if (!topo) return;
+        loading.classList.add('hidden');
+        _renderTopologyPanel(topo);
+        _renderApproachHighlight(topo.approaches || []);
+      })
+      .catch(err => {
+        loading.classList.add('hidden');
+        errDiv.textContent = `Error: ${err.message}`;
+        errDiv.classList.remove('hidden');
+      });
+  }
+  doFetch(0);
+}
+
+function _renderTopologyPanel(topo) {
+  const badge  = document.getElementById('topo-config-badge');
+  const stats  = document.getElementById('topo-stats');
+  const cfg    = topo.configuration || 'UNDIVIDED';
+  const cfgLabel = { UNDIVIDED: 'Undivided', DIVIDED: 'Divided', ROUNDABOUT: 'Roundabout', CHANNELIZED_RT: 'Channelized RT' }[cfg] || cfg;
+
+  badge.textContent = cfgLabel;
+  badge.className   = `topo-cfg-${cfg}`;
+
+  const approaches = topo.approaches   || [];
+  const restrs     = topo.restrictions || [];
+  const compound   = topo.compound_nodes || [];
+
+  const rbtNote = (cfg === 'ROUNDABOUT' && compound.length > 0)
+    ? `<div style="font-size:0.6rem;color:#6b7280;margin-top:2px">${compound.length + 1} ring nodes merged</div>`
+    : '';
+
+  stats.innerHTML = `
+    <div class="topo-stat-row"><span>Approaches</span><span class="topo-stat-val">${approaches.length}</span></div>
+    <div class="topo-stat-row"><span>Conflict points</span><span class="topo-stat-val">${topo.conflict_points ?? '—'}</span></div>
+    <div class="topo-stat-row"><span>Turn restrictions</span><span class="topo-stat-val">${restrs.length}</span></div>
+    ${compound.length ? `<div class="topo-stat-row"><span>Compound nodes</span><span class="topo-stat-val">${compound.length}</span></div>` : ''}
+    ${rbtNote}
+  `;
+
+  _renderTopologySVG(topo);
+}
+
+// Highway class → stroke color
+const _HW_COLOR = {
+  motorway: '#ef4444', motorway_link: '#ef4444',
+  trunk: '#f97316',    trunk_link: '#f97316',
+  primary: '#f59e0b',  primary_link: '#f59e0b',
+  secondary: '#84cc16', secondary_link: '#84cc16',
+  roundabout: '#22d3ee',
+};
+function _hwColor(hw) { return _HW_COLOR[hw] || '#94a3b8'; }
+
+function _svgEl(tag, attrs) {
+  const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  Object.entries(attrs).forEach(([k, v]) => el.setAttribute(k, v));
+  return el;
+}
+
+function _renderTopologySVG(topo) {
+  const svg      = document.getElementById('topo-svg');
+  while (svg.firstChild) svg.removeChild(svg.firstChild);
+
+  const R        = 80;
+  const approaches = topo.approaches   || [];
+  const restrs     = topo.restrictions || [];
+  const cfg        = topo.configuration || 'UNDIVIDED';
+
+  if (approaches.length === 0) return;
+
+  // Defs: arrowhead marker
+  const defs   = _svgEl('defs', {});
+  const marker = _svgEl('marker', { id: 'arrow', markerWidth: '6', markerHeight: '6',
+    refX: '5', refY: '3', orient: 'auto' });
+  const mpath  = _svgEl('path', { d: 'M0,0 L0,6 L6,3 z', fill: '#94a3b8' });
+  marker.appendChild(mpath);
+  defs.appendChild(marker);
+  svg.appendChild(defs);
+
+  // Center node
+  const centerFill = cfg === 'ROUNDABOUT' ? 'none' : cfg === 'DIVIDED' ? '#854d0e' : '#0e7490';
+  const centerStroke = cfg === 'ROUNDABOUT' ? '#4ade80' : 'none';
+  svg.appendChild(_svgEl('circle', {
+    cx: 0, cy: 0, r: 10,
+    fill: centerFill, stroke: centerStroke, 'stroke-width': 3
+  }));
+
+  // Approach spokes
+  const endpts = {};
+  approaches.forEach(ap => {
+    const θ = (ap.bearing * Math.PI) / 180;
+    const ex = R * Math.sin(θ);
+    const ey = -R * Math.cos(θ);
+    endpts[ap.way_id] = [ex, ey];
+
+    const sw = Math.max(1.5, 1 + (ap.lanes || 1) * 1.2);
+    const col = _hwColor(ap.highway);
+
+    svg.appendChild(_svgEl('line', {
+      x1: 0, y1: 0, x2: ex, y2: ey,
+      stroke: col, 'stroke-width': sw, 'stroke-linecap': 'round',
+    }));
+
+    // Oneway arrows
+    if (ap.oneway === 1) {
+      // outgoing: arrow at far end
+      svg.appendChild(_svgEl('line', {
+        x1: ex * 0.6, y1: ey * 0.6, x2: ex, y2: ey,
+        stroke: col, 'stroke-width': sw + 0.5,
+        'marker-end': 'url(#arrow)',
+      }));
+    } else if (ap.oneway === -1) {
+      // incoming: arrow at center end
+      svg.appendChild(_svgEl('line', {
+        x1: ex * 0.4, y1: ey * 0.4, x2: ex * 0.02, y2: ey * 0.02,
+        stroke: col, 'stroke-width': sw + 0.5,
+        'marker-end': 'url(#arrow)',
+      }));
+    }
+
+    // Label
+    const lx = (R + 16) * Math.sin(θ);
+    const ly = -(R + 16) * Math.cos(θ);
+    const name = (ap.name || ap.highway || '').substring(0, 14);
+    if (name) {
+      const anchor = Math.abs(lx) < 10 ? 'middle' : lx > 0 ? 'start' : 'end';
+      svg.appendChild(_svgEl('text', {
+        x: lx, y: ly,
+        fill: '#9ca3af', 'font-size': '8', 'text-anchor': anchor,
+        'dominant-baseline': 'central', 'font-family': 'sans-serif',
+      })).textContent = name;
+    }
+  });
+
+  // Restriction arcs (quadratic bezier)
+  restrs.forEach(r => {
+    const fromPt = endpts[r.from_way];
+    const toPt   = endpts[r.to_way];
+    if (!fromPt || !toPt) return;
+    // Control point at 40% radius between the two endpoints
+    const cx = (fromPt[0] + toPt[0]) * 0.2;
+    const cy = (fromPt[1] + toPt[1]) * 0.2;
+    const isNo   = r.restriction && r.restriction.startsWith('no_');
+    svg.appendChild(_svgEl('path', {
+      d: `M${fromPt[0]},${fromPt[1]} Q${cx},${cy} ${toPt[0]},${toPt[1]}`,
+      fill: 'none',
+      stroke: isNo ? '#ef4444' : '#67e8f9',
+      'stroke-width': 1.5,
+      'stroke-dasharray': isNo ? '4 3' : 'none',
+      opacity: 0.8,
+    }));
+    // No-turn symbol: ⊘ at midpoint of arc
+    if (isNo) {
+      const mx = (fromPt[0] + toPt[0]) * 0.3;
+      const my = (fromPt[1] + toPt[1]) * 0.3;
+      svg.appendChild(_svgEl('text', {
+        x: mx, y: my, fill: '#ef4444', 'font-size': '10',
+        'text-anchor': 'middle', 'dominant-baseline': 'central',
+        'font-family': 'sans-serif',
+      })).textContent = '\u2298';
+    }
+  });
+}
+
+function _renderApproachHighlight(approaches) {
+  if (!approaches || approaches.length === 0) return;
+  const wayIds = new Set(approaches.map(a => String(a.way_id)));
+  const features = [];
+  OSM_FEATURE_MAP.forEach((feat, id) => {
+    if (wayIds.has(id) && feat.geometry && feat.geometry.type === 'LineString') {
+      features.push(feat);
+    }
+  });
+  if (features.length === 0) return;
+
+  if (map.getLayer('topo-highlight-layer')) map.removeLayer('topo-highlight-layer');
+  if (map.getSource('topo-highlight'))      map.removeSource('topo-highlight');
+
+  map.addSource('topo-highlight', {
+    type: 'geojson',
+    data: { type: 'FeatureCollection', features },
+  });
+  map.addLayer({
+    id: 'topo-highlight-layer',
+    type: 'line',
+    source: 'topo-highlight',
+    paint: {
+      'line-color': '#facc15',
+      'line-width': 4,
+      'line-opacity': 0.75,
+    },
+  });
 }
 

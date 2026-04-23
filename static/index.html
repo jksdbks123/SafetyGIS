@@ -191,14 +191,34 @@
     .rank-weight-input:focus { outline: none; border-color: #3b82f6; }
 
     /* ── County Status Panel ── */
-    #county-grid, #ana-county-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 3px; margin-top: 6px; max-height: 220px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #374151 transparent; }
+    #county-grid, #ana-county-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 3px; margin-top: 6px; max-height: 180px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #374151 transparent; }
     .county-chip { font-size: 0.58rem; padding: 3px 4px; border-radius: 3px; cursor: pointer; text-align: center; border: 1px solid transparent; line-height: 1.3; transition: all 0.15s; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
     .county-chip.ready    { background: #052e16; border-color: #166534; color: #4ade80; }
     .county-chip.partial  { background: #1c1a06; border-color: #854d0e; color: #fbbf24; }
     .county-chip.uncached { background: #1f2937; border-color: #374151; color: #4b5563; }
     .county-chip.uncached:hover, .county-chip.partial:hover { background: #2a2d3e; border-color: #3b82f6; color: #93c5fd; }
-    .county-chip.loading  { background: #1e3a5f; border-color: #3b82f6; color: #93c5fd; animation: pulse 1s infinite; }
+    .county-chip.loading  { background: #1e3a5f; border-color: #3b82f6; color: #93c5fd; }
     @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+
+    /* ── Active Downloads Panel ── */
+    #ana-active-downloads { display: none; flex-direction: column; gap: 5px; margin-bottom: 8px; }
+    #ana-active-downloads.has-items { display: flex; }
+    .ana-dl-card { background: #070a12; border: 1px solid #2a2d3e; border-radius: 5px; padding: 7px 9px; }
+    .ana-dl-title { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 5px; }
+    .ana-dl-name  { font-size: 0.72rem; font-weight: 600; color: #e0e0e0; }
+    .ana-dl-eta   { font-size: 0.58rem; color: #4b5563; font-variant-numeric: tabular-nums; }
+    .ana-dl-row   { display: flex; align-items: center; gap: 5px; margin-bottom: 3px; }
+    .ana-dl-row:last-child { margin-bottom: 0; }
+    .ana-dl-tag   { font-size: 0.52rem; font-weight: 700; letter-spacing: 0.05em; padding: 1px 4px; border-radius: 2px; flex-shrink: 0; width: 26px; text-align: center; }
+    .ana-dl-tag-osm   { background: #2e1065; color: #a78bfa; }
+    .ana-dl-tag-crash { background: #450a0a; color: #fca5a5; }
+    .ana-dl-bar-wrap  { flex: 1; height: 5px; background: #1a1d2e; border-radius: 3px; overflow: hidden; }
+    .ana-dl-bar-fill  { height: 100%; border-radius: 3px; transition: width 0.8s linear; }
+    .ana-dl-bar-osm   { background: linear-gradient(90deg, #7c3aed, #a78bfa); }
+    .ana-dl-bar-crash { background: linear-gradient(90deg, #b91c1c, #f87171); }
+    .ana-dl-bar-done  { background: #166534; }
+    .ana-dl-status { font-size: 0.6rem; color: #6b7280; min-width: 88px; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .ana-dl-speed { color: #60a5fa; font-size: 0.58rem; }
 
     /* ── Compute county picker ── */
     .ana-compute-county-row { display:flex;align-items:center;gap:5px;font-size:0.62rem;color:#d1d5db;padding:2px 0;cursor:pointer; }
@@ -276,6 +296,26 @@
     #disclaimer-bar { background: #0d0f19; border-top: 1px solid #1f2937; padding: 4px 16px; font-size: 0.6rem; color: #374151; text-align: center; flex-shrink: 0; line-height: 1.5; }
     #disclaimer-bar a { color: #4b5563; text-decoration: none; }
     #disclaimer-bar a:hover { color: #6b7280; }
+
+    /* ── Intersection Topology Panel ── */
+    #topo-panel { position: absolute; left: 12px; bottom: 28px; width: 260px; background: rgba(26,29,46,0.97); border: 1px solid #2a2d3e; border-radius: 8px; z-index: 20; display: none; backdrop-filter: blur(6px); }
+    #topo-panel.open { display: block; }
+    #topo-header { padding: 8px 10px 6px; border-bottom: 1px solid #2a2d3e; display: flex; align-items: center; justify-content: space-between; cursor: move; border-radius: 8px 8px 0 0; background: rgba(255,255,255,0.03); }
+    #topo-header .panel-title { font-size: 0.72rem; font-weight: 600; color: #fff; }
+    #topo-close { background: none; border: none; color: #6b7280; font-size: 1rem; cursor: pointer; padding: 0 4px; line-height: 1; }
+    #topo-close:hover { color: #fff; }
+    #topo-body { padding: 8px 10px 10px; }
+    #topo-config-badge { font-size: 0.62rem; font-weight: 700; letter-spacing: 0.06em; padding: 2px 8px; border-radius: 4px; margin-bottom: 6px; display: inline-block; text-transform: uppercase; }
+    .topo-cfg-UNDIVIDED    { background: #1e3a5f; color: #93c5fd; }
+    .topo-cfg-DIVIDED      { background: #1c1a06; color: #fbbf24; }
+    .topo-cfg-ROUNDABOUT   { background: #1a2a1a; color: #86efac; }
+    .topo-cfg-CHANNELIZED_RT { background: #2a1a2a; color: #d8b4fe; }
+    #topo-svg { display: block; margin: 0 auto 6px; }
+    #topo-stats { font-size: 0.62rem; color: #6b7280; line-height: 1.6; }
+    #topo-stats .topo-stat-row { display: flex; justify-content: space-between; }
+    #topo-stats .topo-stat-val { color: #e0e0e0; font-weight: 600; }
+    #topo-loading { font-size: 0.68rem; color: #60a5fa; padding: 8px 0; text-align: center; }
+    #topo-error   { font-size: 0.68rem; color: #f87171; padding: 4px 0; }
 
     /* ── Loading overlay ── */
     #loading { position: absolute; inset: 0; background: rgba(15,17,23,0.85); display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 100; gap: 10px; }
@@ -387,6 +427,21 @@
         <button id="rank-dash-close" onclick="closeRankDash()">&#x2715;</button>
       </div>
       <div id="rank-dash-body"></div>
+    </div>
+
+    <!-- Intersection Topology Panel -->
+    <div id="topo-panel">
+      <div id="topo-header">
+        <span class="panel-title">Intersection Topology</span>
+        <button id="topo-close" onclick="closeTopoPanel()">&#x2715;</button>
+      </div>
+      <div id="topo-body">
+        <div id="topo-config-badge"></div>
+        <svg id="topo-svg" width="220" height="220" viewBox="-110 -110 220 220"></svg>
+        <div id="topo-stats"></div>
+        <div id="topo-loading" class="hidden">Loading topology&hellip;</div>
+        <div id="topo-error"   class="hidden"></div>
+      </div>
     </div>
 
     <!-- Crash data loading indicator -->
@@ -644,6 +699,8 @@
           Click any county to download its crash + OSM data.
           Data cached during Inspect mode carries over automatically.
         </div>
+        <!-- Active download progress cards (shown only while fetching) -->
+        <div id="ana-active-downloads"></div>
         <div id="ana-county-grid"></div>
       </div>
 

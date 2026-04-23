@@ -442,6 +442,61 @@ In the rankings output, identify any intersection node ranked in the worst-5 who
 
 ---
 
+## Intersection Configuration Classification
+
+Each intersection facility receives a `configuration` label derived from the OSM ways connected to its centroid node. The classification is computed by `_compute_tile_topologies()` in `main.py`.
+
+### Configuration Types (priority order)
+
+| Label | Condition |
+|-------|-----------|
+| `ROUNDABOUT` | Any connecting way has `junction=roundabout` |
+| `CHANNELIZED_RT` | Any connecting way is a `*_link` highway type **and** its bearing is within 30° of another approach (slip-road geometry) |
+| `DIVIDED` | Two or more ways share the same `name` or `ref`, and at least one is `oneway=yes` |
+| `UNDIVIDED` | None of the above |
+
+### Conflict Points
+
+The number of theoretical vehicle–vehicle conflict points is estimated using the Garber & Hoel simplified formula, capped at 56 (the theoretical maximum for an 8-leg intersection):
+
+```
+conflict_points = min(3 × n × (n−1) / 2, 56)
+```
+
+where `n` = number of approach legs. Each `no_*` turn restriction (e.g., `no_left_turn`) reduces conflict points by 2, reflecting one eliminated crossing movement. `only_*` restrictions are noted but do not reduce conflict points directly.
+
+### Approach Metadata
+
+For each approach leg the following fields are computed:
+
+| Field | Source |
+|-------|--------|
+| `bearing` | Compass bearing from intersection node toward the next node on the way |
+| `oneway` | +1 if node is the start of a `oneway=yes` way; −1 if end; 0 otherwise |
+| `lanes` | `int(tags["lanes"])` if present, else 1 |
+| `highway` | OSM highway class of the connecting way |
+| `name` | OSM `name` or `ref` tag of the connecting way |
+
+### Roundabout Compound Grouping
+
+A single physical roundabout is modelled in OSM as a closed `way` with `junction=roundabout`. Each node on the ring that connects to two or more rankable road ways (the ring itself plus at least one leg road) would naively produce a separate `intersection_centroid` feature — resulting in 4–10 individual points per roundabout.
+
+To collapse this to one logical intersection:
+
+1. **Group by way membership**: all topology nodes that share the same roundabout `way_id` form a compound group.
+2. **Elect a primary node**: the node with the most non-roundabout approach legs (i.e., the most leg-road connections) becomes the canonical representative.
+3. **Merge approaches**: non-roundabout approaches from secondary ring nodes are merged into the primary node's approach list.
+4. **Mark secondaries**: secondary nodes receive a `roundabout_primary` field pointing to the primary node's ID. These nodes are suppressed from the `intersection_centroid` feature layer — only the primary node is rendered.
+5. **Recompute conflict points** for the primary using the merged approach count.
+
+The resulting topology entry for the primary node reflects the whole roundabout: all leg roads, correct conflict point count, and a `compound_nodes` list containing all secondary ring-node IDs.
+
+### Nearest-Centroid Fallback
+
+The `/api/osm/topology` endpoint accepts any OSM node ID (not just intersection centroids). If the exact node_id is not found in the topology cache — e.g., the user clicked a stop-sign node or a traffic signal — the endpoint performs a spatial search for the nearest primary intersection_centroid within 50 m using the `lon`/`lat` fields embedded in each topology entry. This allows topology data to surface for any infrastructure click, not just clicks on the computed centroid node.
+
+---
+
 ## References
 
 - AASHTO. (2010). *Highway Safety Manual*, 1st Edition. Washington, DC: American Association of State Highway and Transportation Officials.
