@@ -4284,31 +4284,35 @@ function _projectPoint(lon, lat, bearingDeg, distM) {
   return [λ2 * 180 / Math.PI, φ2 * 180 / Math.PI];
 }
 
-// Clip a LineString to the near half closest to a given point
-function _clipNearHalf(coords, nucleusLon, nucleusLat) {
+// Clip a LineString starting from the end nearest to nucleus, capped at maxDistM metres.
+// Returns coordinates ordered from nucleus outward.
+function _clipToMaxDist(coords, nucleusLon, nucleusLat, maxDistM) {
   if (coords.length < 2) return coords;
-  // Determine which end is the nucleus
-  const distFirst = Math.hypot(coords[0][0] - nucleusLon, coords[0][1] - nucleusLat);
-  const distLast  = Math.hypot(coords[coords.length - 1][0] - nucleusLon, coords[coords.length - 1][1] - nucleusLat);
-  const fromStart = distFirst <= distLast;
-  const ordered   = fromStart ? coords : [...coords].reverse();
-  // Take coordinates up to ~half total arc length
-  let totalLen = 0;
-  const segs = [];
+  const cosLat = Math.cos(nucleusLat * Math.PI / 180);
+  const mPerDeg = 111320;
+  function mDist(c) {
+    const dx = (c[0] - nucleusLon) * mPerDeg * cosLat;
+    const dy = (c[1] - nucleusLat) * mPerDeg;
+    return Math.hypot(dx, dy);
+  }
+  // Order so index 0 is closest to nucleus
+  const ordered = mDist(coords[0]) <= mDist(coords[coords.length - 1])
+    ? coords : [...coords].reverse();
+  const result = [ordered[0]];
   for (let i = 1; i < ordered.length; i++) {
-    const d = Math.hypot(ordered[i][0] - ordered[i-1][0], ordered[i][1] - ordered[i-1][1]);
-    totalLen += d;
-    segs.push(d);
+    const d = mDist(ordered[i]);
+    if (d >= maxDistM) {
+      // Interpolate to exact cap distance
+      const prev = ordered[i - 1];
+      const dPrev = mDist(prev);
+      const t = dPrev < d ? (maxDistM - dPrev) / (d - dPrev) : 0;
+      result.push([prev[0] + t * (ordered[i][0] - prev[0]),
+                   prev[1] + t * (ordered[i][1] - prev[1])]);
+      break;
+    }
+    result.push(ordered[i]);
   }
-  const half = totalLen / 2;
-  let acc = 0;
-  const clipped = [ordered[0]];
-  for (let i = 0; i < segs.length; i++) {
-    acc += segs[i];
-    clipped.push(ordered[i + 1]);
-    if (acc >= half) break;
-  }
-  return clipped;
+  return result;
 }
 
 function _clearDebugHighlight() {
@@ -4357,6 +4361,8 @@ function _debugClickWay(e) {
   _openTopologyPanel(best.properties.id, coords[0], coords[1]);
 }
 
+const _ARM_DIST_M = 100;   // how far each approach arm extends from nucleus
+
 function _renderDebugCell(topo) {
   _clearDebugHighlight();
 
@@ -4368,55 +4374,49 @@ function _renderDebugCell(topo) {
   const cfg        = topo.configuration || 'UNDIVIDED';
   const color      = _cfgColor(cfg);
 
-  // ── 1. Approach way geometries (near half, colored by highway class) ──────
-  const wayIds = new Set(approaches.map(a => String(a.way_id)));
+  // ── 1. Approach arm geometry: actual road coords capped at _ARM_DIST_M ────
   const approachFeats = [];
-  OSM_FEATURE_MAP.forEach((feat, id) => {
-    if (!wayIds.has(id) || !feat.geometry || feat.geometry.type !== 'LineString') return;
-    const ap    = approaches.find(a => String(a.way_id) === id);
-    const hw    = ap?.highway || feat.properties?.type || 'road';
-    const clipped = _clipNearHalf(feat.geometry.coordinates, nucleusLon, nucleusLat);
+  // Also build cell polygon vertices (one per approach, at arm tip)
+  const armTips = [];
+
+  const sortedApproaches = [...approaches].sort((a, b) => a.bearing - b.bearing);
+  sortedApproaches.forEach(ap => {
+    const feat = OSM_FEATURE_MAP.get(String(ap.way_id));
+    let armCoords;
+    if (feat?.geometry?.type === 'LineString') {
+      armCoords = _clipToMaxDist(feat.geometry.coordinates, nucleusLon, nucleusLat, _ARM_DIST_M);
+    } else {
+      // No geometry cached — just draw a straight line along bearing
+      armCoords = [[nucleusLon, nucleusLat], _projectPoint(nucleusLon, nucleusLat, ap.bearing, _ARM_DIST_M)];
+    }
     approachFeats.push({
       type: 'Feature',
-      geometry: { type: 'LineString', coordinates: clipped },
-      properties: { highway: hw, way_id: id },
+      geometry: { type: 'LineString', coordinates: armCoords },
+      properties: { highway: ap.highway || 'road' },
     });
+    armTips.push(armCoords[armCoords.length - 1]);
   });
 
-  // ── 2. Cell polygon: nucleus + approach midpoints sorted by bearing ────────
-  // Use actual clipped line endpoints as midpoints; fall back to projected bearing
-  const bearingMidpoints = approaches
-    .sort((a, b) => a.bearing - b.bearing)
-    .map(ap => {
-      const feat = OSM_FEATURE_MAP.get(String(ap.way_id));
-      if (feat?.geometry?.type === 'LineString') {
-        const clipped = _clipNearHalf(feat.geometry.coordinates, nucleusLon, nucleusLat);
-        return clipped[clipped.length - 1];     // far end of near half = cell boundary
-      }
-      return _projectPoint(nucleusLon, nucleusLat, ap.bearing, 60);
-    });
-
+  // ── 2. Cell polygon: connect arm tips in bearing order ────────────────────
   let cellCoords;
-  if (bearingMidpoints.length >= 3) {
-    cellCoords = [...bearingMidpoints, bearingMidpoints[0]];
-  } else if (bearingMidpoints.length === 2) {
-    // Two approaches: diamond shape around nucleus
-    const left  = _projectPoint(nucleusLon, nucleusLat, (approaches[0].bearing + 90) % 360, 20);
-    const right = _projectPoint(nucleusLon, nucleusLat, (approaches[0].bearing + 270) % 360, 20);
-    cellCoords = [bearingMidpoints[0], left, bearingMidpoints[1], right, bearingMidpoints[0]];
+  if (armTips.length >= 3) {
+    cellCoords = [...armTips, armTips[0]];
+  } else if (armTips.length === 2) {
+    // Two-arm stub: add lateral flanking points to form a lozenge
+    const perp1 = _projectPoint(nucleusLon, nucleusLat, (approaches[0].bearing + 90)  % 360, _ARM_DIST_M * 0.3);
+    const perp2 = _projectPoint(nucleusLon, nucleusLat, (approaches[0].bearing + 270) % 360, _ARM_DIST_M * 0.3);
+    cellCoords = [armTips[0], perp1, armTips[1], perp2, armTips[0]];
   } else {
-    // 0–1 approaches: small circle placeholder
-    const pts = [0, 90, 180, 270].map(b => _projectPoint(nucleusLon, nucleusLat, b, 30));
+    const pts = [0, 90, 180, 270].map(b => _projectPoint(nucleusLon, nucleusLat, b, _ARM_DIST_M * 0.5));
     cellCoords = [...pts, pts[0]];
   }
 
-  // ── 3. Compound ring nodes (for ROUNDABOUT) ───────────────────────────────
+  // ── 3. Compound ring nodes ────────────────────────────────────────────────
   const compoundFeats = [];
   (topo.compound_nodes || []).forEach(nid => {
     const feat = OSM_FEATURE_MAP.get(String(nid));
     if (feat?.geometry?.type === 'Point') {
       compoundFeats.push(feat);
-      // Line from nucleus to each compound node
       compoundFeats.push({
         type: 'Feature',
         geometry: { type: 'LineString', coordinates: [[nucleusLon, nucleusLat], feat.geometry.coordinates] },
@@ -4428,14 +4428,11 @@ function _renderDebugCell(topo) {
   // ── Add sources and layers ─────────────────────────────────────────────────
   map.addSource('debug-cell', {
     type: 'geojson',
-    data: {
-      type: 'FeatureCollection',
-      features: [{
-        type: 'Feature',
-        geometry: { type: 'Polygon', coordinates: [cellCoords] },
-        properties: { cfg },
-      }],
-    },
+    data: { type: 'FeatureCollection', features: [{
+      type: 'Feature',
+      geometry: { type: 'Polygon', coordinates: [cellCoords] },
+      properties: { cfg },
+    }]},
   });
   map.addLayer({ id: 'debug-cell-fill', type: 'fill', source: 'debug-cell',
     paint: { 'fill-color': color, 'fill-opacity': 0.12 } });
@@ -4453,38 +4450,26 @@ function _renderDebugCell(topo) {
           'secondary', '#84cc16', 'secondary_link', '#84cc16',
           'roundabout', '#22d3ee',
           '#94a3b8'],
-        'line-width': 4,
-        'line-opacity': 0.9,
+        'line-width': 4, 'line-opacity': 0.9,
       },
     });
   }
 
-  // Nucleus marker
   map.addSource('debug-nucleus-src', {
     type: 'geojson',
     data: { type: 'Feature', geometry: { type: 'Point', coordinates: [nucleusLon, nucleusLat] }, properties: {} },
   });
   map.addLayer({ id: 'debug-nucleus', type: 'circle', source: 'debug-nucleus-src',
-    paint: {
-      'circle-radius': 9,
-      'circle-color': color,
-      'circle-stroke-color': '#fff',
-      'circle-stroke-width': 2,
-      'circle-opacity': 0.95,
-    },
+    paint: { 'circle-radius': 9, 'circle-color': color, 'circle-stroke-color': '#fff', 'circle-stroke-width': 2, 'circle-opacity': 0.95 },
   });
 
-  // Compound nodes + connector lines
   if (compoundFeats.length > 0) {
     map.addSource('debug-compound-src', { type: 'geojson', data: { type: 'FeatureCollection', features: compoundFeats } });
     map.addLayer({ id: 'debug-compound', type: 'circle', source: 'debug-compound-src',
       filter: ['==', ['geometry-type'], 'Point'],
-      paint: { 'circle-radius': 5, 'circle-color': color, 'circle-opacity': 0.7,
-               'circle-stroke-color': '#fff', 'circle-stroke-width': 1.5 },
+      paint: { 'circle-radius': 5, 'circle-color': color, 'circle-opacity': 0.7, 'circle-stroke-color': '#fff', 'circle-stroke-width': 1.5 },
     });
-    // Connector lines rendered via a separate line layer on same source
-    map.addLayer({
-      id: 'debug-compound-lines', type: 'line', source: 'debug-compound-src',
+    map.addLayer({ id: 'debug-compound-lines', type: 'line', source: 'debug-compound-src',
       filter: ['==', ['geometry-type'], 'LineString'],
       paint: { 'line-color': color, 'line-width': 1.5, 'line-dasharray': [3, 3], 'line-opacity': 0.6 },
     });
