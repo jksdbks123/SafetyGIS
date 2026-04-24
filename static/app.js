@@ -52,7 +52,7 @@ const CA_BBOX = { west: -124.48, south: 32.53, east: -114.13, north: 42.01 };
 
 // ---- Global state ------------------------------------------------------------
 
-let G_osmData        = null;
+let G_osmData        = { type: 'FeatureCollection', features: [] };
 let G_crashData      = { type: 'FeatureCollection', features: [] };
 let G_mlyToken       = null;
 let G_hasMly         = false;
@@ -202,20 +202,22 @@ map.on('load', async () => {
     console.error('Data load failed:', err);
   }
   G_dataReady = true;
-  rebuildLayers();
-  setupPopups();
-  setupDraw();
-  setupPegman();
-  setupRankingInteractions();
-  setupPanelInteractions();
-  // Wire up AI input Enter key
-  document.getElementById('ai-input').addEventListener('keydown', e => {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendAiQuery(); }
-  });
-  // Wire up Escape to cancel pegman mode
-  document.addEventListener('keydown', e => {
-    if (e.key === 'Escape' && G_pegmanMode) cancelPegmanMode();
-  });
+  try {
+    rebuildLayers();
+    setupPopups();
+    setupDraw();
+    setupPegman();
+    setupRankingInteractions();
+    setupPanelInteractions();
+    document.getElementById('ai-input').addEventListener('keydown', e => {
+      if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendAiQuery(); }
+    });
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape' && G_pegmanMode) cancelPegmanMode();
+    });
+  } catch (err) {
+    console.error('App init error:', err);
+  }
   document.getElementById('loading').classList.add('hidden');
   scheduleViewportLoad();   // load OSM + crashes for initial viewport
 });
