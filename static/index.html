@@ -355,6 +355,12 @@
     .panel-resize-se { position: absolute; bottom: 0; right: 0; width: 12px; height: 12px; cursor: nwse-resize; z-index: 101; }
     #btn-mode-inspect.ana-active  { background: transparent; color: #6b7280; }
     #btn-mode-analysis.ana-active { background: #7c3aed; color: #fff; }
+    #debug-hint {
+      position: absolute; top: 48px; left: 50%; transform: translateX(-50%);
+      background: rgba(5,150,105,0.92); color: #fff; padding: 5px 14px;
+      border-radius: 20px; font-size: 0.72rem; pointer-events: none;
+      z-index: 200; white-space: nowrap; letter-spacing: 0.02em;
+    }
     /* County list */
     #ana-county-list { display: flex; flex-direction: column; gap: 2px; max-height: 210px; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #374151 transparent; margin-top: 4px; }
     .ana-county-row { display: flex; align-items: center; gap: 6px; padding: 5px 6px; border-radius: 4px; border: 1px solid #2a2d3e; cursor: pointer; transition: border-color 0.15s; }
@@ -398,6 +404,8 @@
       style="padding:3px 11px;font-size:0.72rem;border:none;cursor:pointer;background:#1d4ed8;color:#fff;font-family:inherit;transition:background 0.15s">Inspect</button>
     <button id="btn-mode-analysis" onclick="setAppMode('analysis')"
       style="padding:3px 11px;font-size:0.72rem;border:none;cursor:pointer;background:transparent;color:#6b7280;font-family:inherit;transition:background 0.15s">Analysis</button>
+    <button id="btn-mode-debug" onclick="setAppMode('debug')"
+      style="padding:3px 11px;font-size:0.72rem;border:none;cursor:pointer;background:transparent;color:#6b7280;font-family:inherit;transition:background 0.15s">Debug</button>
   </div>
   <!-- Basemap toggle (always visible in both modes) -->
   <div style="display:flex;align-items:center;gap:0;margin-left:10px;flex-shrink:0;border:1px solid #374151;border-radius:6px;overflow:hidden">
@@ -414,6 +422,7 @@
 <div id="main">
   <div id="map-container">
     <div id="map"></div>
+    <div id="debug-hint" class="hidden">&#128270; Debug — click any road or intersection to explore its cell</div>
 
     <div id="loading">
       <div class="spinner"></div>

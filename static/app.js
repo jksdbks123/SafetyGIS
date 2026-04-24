@@ -76,7 +76,7 @@ let G_aadtLoading = false;
 let _crashPollTimer = null;    // polls after background county fetch
 
 // App mode
-let G_appMode = 'inspect';     // 'inspect' | 'analysis'
+let G_appMode = 'inspect';     // 'inspect' | 'analysis' | 'debug'
 
 // Draw tool state
 let G_drawMode      = null;    // null | 'rect' | 'poly'
@@ -277,6 +277,7 @@ let _viewportTimer = null;
 
 function scheduleViewportLoad() {
   if (G_appMode === 'analysis') return;   // Analysis mode manages its own data
+  // debug mode uses inspect-mode viewport loading
   clearTimeout(_viewportTimer);
   clearTimeout(_crashPollTimer);   // cancel any pending poll when user moves
   _viewportTimer = setTimeout(() => {
@@ -1472,10 +1473,29 @@ function setupPopups() {
    'roads-layer', 'footway-layer', 'calming-layer', 'streetlamp-layer'].forEach(layerId => {
     map.on('click', layerId, e => {
       if (G_drawActive) return;
+
+      // Debug mode: road/way clicks find the nearest intersection centroid and show its cell
+      if (G_appMode === 'debug' && layerId === 'roads-layer') {
+        _debugClickWay(e);
+        return;
+      }
+
       // MapLibre may truncate properties in e.features — look up full feature from OSM_FEATURE_MAP
       const renderedId = String(e.features[0].properties.id ?? '');
       const fullFeature = OSM_FEATURE_MAP.get(renderedId);
       const p = fullFeature ? fullFeature.properties : e.features[0].properties;
+
+      // Debug mode: for node clicks just open topology + cell, skip the popup
+      if (G_appMode === 'debug') {
+        if (layerId === 'intersections-pt-layer' || layerId === 'signals-layer') {
+          const coords = fullFeature
+            ? fullFeature.geometry.coordinates
+            : [e.lngLat.lng, e.lngLat.lat];
+          _openTopologyPanel(p.id, coords[0], coords[1]);
+        }
+        return;
+      }
+
       const label = OSM_LABEL_EXT[layerId] || 'OSM Feature';
       const allRows = Object.entries(p)
         .filter(([k, v]) => !OSM_SKIP_KEYS.has(k) && v !== null && v !== undefined && String(v).trim() !== '')
@@ -3202,20 +3222,28 @@ let _anaComputeCounties  = new Set(); // counties selected for computation
 // ---- Mode switch -----------------------------------------------------------
 function setAppMode(mode) {
   if (G_appMode === mode) return;
+  const prevMode = G_appMode;
   G_appMode = mode;
   const isAnalysis = mode === 'analysis';
+  const isDebug    = mode === 'debug';
 
   // Header mode buttons
   const btnI = document.getElementById('btn-mode-inspect');
   const btnA = document.getElementById('btn-mode-analysis');
-  if (btnI) { btnI.style.background = isAnalysis ? 'transparent' : '#1d4ed8'; btnI.style.color = isAnalysis ? '#6b7280' : '#fff'; }
+  const btnD = document.getElementById('btn-mode-debug');
+  if (btnI) { btnI.style.background = (!isAnalysis && !isDebug) ? '#1d4ed8' : 'transparent'; btnI.style.color = (!isAnalysis && !isDebug) ? '#fff' : '#6b7280'; }
   if (btnA) { btnA.style.background = isAnalysis ? '#7c3aed' : 'transparent'; btnA.style.color = isAnalysis ? '#fff' : '#6b7280'; }
+  if (btnD) { btnD.style.background = isDebug ? '#059669' : 'transparent'; btnD.style.color = isDebug ? '#fff' : '#6b7280'; }
 
   // Side panels
   const inspPanel = document.getElementById('panel');
   const anaPanel  = document.getElementById('analysis-panel');
   if (inspPanel) inspPanel.style.display = isAnalysis ? 'none' : 'block';
   if (anaPanel)  anaPanel.classList.toggle('hidden', !isAnalysis);
+
+  // Debug hint banner
+  const hint = document.getElementById('debug-hint');
+  if (hint) hint.classList.toggle('hidden', !isDebug);
 
   // Lazy-init analysis panel drag/resize on first show (can't init while hidden)
   if (isAnalysis && anaPanel && !anaPanel._piInited) {
@@ -3230,8 +3258,15 @@ function setAppMode(mode) {
     clearTimeout(_crashPollTimer);
     if (G_drawMode) cancelDraw();
     if (G_pegmanMode) cancelPegmanMode();
+    _clearDebugHighlight();
     _loadAnalysisCountyStatus();
+  } else if (isDebug) {
+    if (G_drawMode) cancelDraw();
+    if (G_pegmanMode) cancelPegmanMode();
+    // Debug mode reuses inspect-mode tile loading
+    if (G_dataReady) scheduleViewportLoad();
   } else {
+    // Returning to Inspect
     // Stop any running county download polls
     Object.keys(_anaCountyPollTimers).forEach(name => {
       clearInterval(_anaCountyPollTimers[name]);
@@ -3241,6 +3276,7 @@ function setAppMode(mode) {
     if (_anaComputePollTimer) { clearInterval(_anaComputePollTimer); _anaComputePollTimer = null; }
     // Clear facility overlay when returning to Inspect
     _clearFacilityOverlay();
+    _clearDebugHighlight();
     document.getElementById('rank-dash-panel')?.classList.remove('open');
     G_lastFacilityId = null;
     if (G_dataReady) scheduleViewportLoad();
@@ -3978,9 +4014,7 @@ function closeTopoPanel() {
   const panel = document.getElementById('topo-panel');
   if (panel) panel.classList.remove('open');
   if (_topoRetryTimer) { clearTimeout(_topoRetryTimer); _topoRetryTimer = null; }
-  // Remove approach highlight layer if present
-  if (map.getLayer('topo-highlight-layer')) map.removeLayer('topo-highlight-layer');
-  if (map.getSource('topo-highlight'))      map.removeSource('topo-highlight');
+  _clearDebugHighlight();
 }
 
 function _openTopologyPanel(nodeId, lon, lat) {
@@ -4029,7 +4063,11 @@ function _openTopologyPanel(nodeId, lon, lat) {
         if (!topo) return;
         loading.classList.add('hidden');
         _renderTopologyPanel(topo);
-        _renderApproachHighlight(topo.approaches || []);
+        if (G_appMode === 'debug') {
+          _renderDebugCell(topo);
+        } else {
+          _renderApproachHighlight(topo.approaches || []);
+        }
       })
       .catch(err => {
         loading.classList.add('hidden');
@@ -4217,5 +4255,237 @@ function _renderApproachHighlight(approaches) {
       'line-opacity': 0.75,
     },
   });
+}
+
+// =============================================================================
+// Debug Mode — Cell Visualization
+// =============================================================================
+
+// Config → cell fill color
+const _CFG_COLOR = {
+  UNDIVIDED:      '#14b8a6',
+  ROUNDABOUT:     '#f97316',
+  DIVIDED:        '#3b82f6',
+  CHANNELIZED_RT: '#eab308',
+};
+function _cfgColor(cfg) { return _CFG_COLOR[cfg] || '#14b8a6'; }
+
+// Project lon/lat along a compass bearing for dist_m metres
+function _projectPoint(lon, lat, bearingDeg, distM) {
+  const R  = 6371000;
+  const δ  = distM / R;
+  const θ  = bearingDeg * Math.PI / 180;
+  const φ1 = lat * Math.PI / 180;
+  const λ1 = lon * Math.PI / 180;
+  const φ2 = Math.asin(Math.sin(φ1) * Math.cos(δ) + Math.cos(φ1) * Math.sin(δ) * Math.cos(θ));
+  const λ2 = λ1 + Math.atan2(Math.sin(θ) * Math.sin(δ) * Math.cos(φ1), Math.cos(δ) - Math.sin(φ1) * Math.sin(φ2));
+  return [λ2 * 180 / Math.PI, φ2 * 180 / Math.PI];
+}
+
+// Clip a LineString to the near half closest to a given point
+function _clipNearHalf(coords, nucleusLon, nucleusLat) {
+  if (coords.length < 2) return coords;
+  // Determine which end is the nucleus
+  const distFirst = Math.hypot(coords[0][0] - nucleusLon, coords[0][1] - nucleusLat);
+  const distLast  = Math.hypot(coords[coords.length - 1][0] - nucleusLon, coords[coords.length - 1][1] - nucleusLat);
+  const fromStart = distFirst <= distLast;
+  const ordered   = fromStart ? coords : [...coords].reverse();
+  // Take coordinates up to ~half total arc length
+  let totalLen = 0;
+  const segs = [];
+  for (let i = 1; i < ordered.length; i++) {
+    const d = Math.hypot(ordered[i][0] - ordered[i-1][0], ordered[i][1] - ordered[i-1][1]);
+    totalLen += d;
+    segs.push(d);
+  }
+  const half = totalLen / 2;
+  let acc = 0;
+  const clipped = [ordered[0]];
+  for (let i = 0; i < segs.length; i++) {
+    acc += segs[i];
+    clipped.push(ordered[i + 1]);
+    if (acc >= half) break;
+  }
+  return clipped;
+}
+
+function _clearDebugHighlight() {
+  ['debug-cell-fill', 'debug-cell-outline', 'debug-approaches', 'debug-nucleus',
+   'debug-compound', 'debug-compound-lines', 'topo-highlight-layer'].forEach(id => {
+    if (map.getLayer(id)) map.removeLayer(id);
+  });
+  ['debug-cell', 'debug-approaches-src', 'debug-nucleus-src',
+   'debug-compound-src', 'topo-highlight'].forEach(id => {
+    if (map.getSource(id)) map.removeSource(id);
+  });
+}
+
+function _debugClickWay(e) {
+  // Find the nearest intersection_centroid within ~80px of the click
+  const px = e.point;
+  const pad = 80;
+  const nearby = map.queryRenderedFeatures(
+    [[px.x - pad, px.y - pad], [px.x + pad, px.y + pad]],
+    { layers: ['intersections-pt-layer'] }
+  ).filter(f => f.properties.type === 'intersection_centroid');
+
+  if (nearby.length === 0) {
+    // No centroid nearby — highlight the clicked way and show hint
+    const renderedId = String(e.features[0].properties.id ?? '');
+    const feat = OSM_FEATURE_MAP.get(renderedId);
+    if (feat && feat.geometry.type === 'LineString') {
+      _clearDebugHighlight();
+      map.addSource('topo-highlight', { type: 'geojson', data: { type: 'FeatureCollection', features: [feat] } });
+      map.addLayer({ id: 'topo-highlight-layer', type: 'line', source: 'topo-highlight',
+        paint: { 'line-color': '#facc15', 'line-width': 3, 'line-opacity': 0.8 } });
+    }
+    return;
+  }
+
+  // Sort by screen distance, pick closest
+  nearby.sort((a, b) => {
+    const pa = map.project(a.geometry.coordinates);
+    const pb = map.project(b.geometry.coordinates);
+    const da = Math.hypot(pa.x - px.x, pa.y - px.y);
+    const db = Math.hypot(pb.x - px.x, pb.y - px.y);
+    return da - db;
+  });
+  const best = nearby[0];
+  const coords = best.geometry.coordinates;
+  _openTopologyPanel(best.properties.id, coords[0], coords[1]);
+}
+
+function _renderDebugCell(topo) {
+  _clearDebugHighlight();
+
+  const nucleusLon = topo.lon;
+  const nucleusLat = topo.lat;
+  if (nucleusLon == null || nucleusLat == null) return;
+
+  const approaches = topo.approaches || [];
+  const cfg        = topo.configuration || 'UNDIVIDED';
+  const color      = _cfgColor(cfg);
+
+  // ── 1. Approach way geometries (near half, colored by highway class) ──────
+  const wayIds = new Set(approaches.map(a => String(a.way_id)));
+  const approachFeats = [];
+  OSM_FEATURE_MAP.forEach((feat, id) => {
+    if (!wayIds.has(id) || !feat.geometry || feat.geometry.type !== 'LineString') return;
+    const ap    = approaches.find(a => String(a.way_id) === id);
+    const hw    = ap?.highway || feat.properties?.type || 'road';
+    const clipped = _clipNearHalf(feat.geometry.coordinates, nucleusLon, nucleusLat);
+    approachFeats.push({
+      type: 'Feature',
+      geometry: { type: 'LineString', coordinates: clipped },
+      properties: { highway: hw, way_id: id },
+    });
+  });
+
+  // ── 2. Cell polygon: nucleus + approach midpoints sorted by bearing ────────
+  // Use actual clipped line endpoints as midpoints; fall back to projected bearing
+  const bearingMidpoints = approaches
+    .sort((a, b) => a.bearing - b.bearing)
+    .map(ap => {
+      const feat = OSM_FEATURE_MAP.get(String(ap.way_id));
+      if (feat?.geometry?.type === 'LineString') {
+        const clipped = _clipNearHalf(feat.geometry.coordinates, nucleusLon, nucleusLat);
+        return clipped[clipped.length - 1];     // far end of near half = cell boundary
+      }
+      return _projectPoint(nucleusLon, nucleusLat, ap.bearing, 60);
+    });
+
+  let cellCoords;
+  if (bearingMidpoints.length >= 3) {
+    cellCoords = [...bearingMidpoints, bearingMidpoints[0]];
+  } else if (bearingMidpoints.length === 2) {
+    // Two approaches: diamond shape around nucleus
+    const left  = _projectPoint(nucleusLon, nucleusLat, (approaches[0].bearing + 90) % 360, 20);
+    const right = _projectPoint(nucleusLon, nucleusLat, (approaches[0].bearing + 270) % 360, 20);
+    cellCoords = [bearingMidpoints[0], left, bearingMidpoints[1], right, bearingMidpoints[0]];
+  } else {
+    // 0–1 approaches: small circle placeholder
+    const pts = [0, 90, 180, 270].map(b => _projectPoint(nucleusLon, nucleusLat, b, 30));
+    cellCoords = [...pts, pts[0]];
+  }
+
+  // ── 3. Compound ring nodes (for ROUNDABOUT) ───────────────────────────────
+  const compoundFeats = [];
+  (topo.compound_nodes || []).forEach(nid => {
+    const feat = OSM_FEATURE_MAP.get(String(nid));
+    if (feat?.geometry?.type === 'Point') {
+      compoundFeats.push(feat);
+      // Line from nucleus to each compound node
+      compoundFeats.push({
+        type: 'Feature',
+        geometry: { type: 'LineString', coordinates: [[nucleusLon, nucleusLat], feat.geometry.coordinates] },
+        properties: {},
+      });
+    }
+  });
+
+  // ── Add sources and layers ─────────────────────────────────────────────────
+  map.addSource('debug-cell', {
+    type: 'geojson',
+    data: {
+      type: 'FeatureCollection',
+      features: [{
+        type: 'Feature',
+        geometry: { type: 'Polygon', coordinates: [cellCoords] },
+        properties: { cfg },
+      }],
+    },
+  });
+  map.addLayer({ id: 'debug-cell-fill', type: 'fill', source: 'debug-cell',
+    paint: { 'fill-color': color, 'fill-opacity': 0.12 } });
+  map.addLayer({ id: 'debug-cell-outline', type: 'line', source: 'debug-cell',
+    paint: { 'line-color': color, 'line-width': 2, 'line-dasharray': [4, 3], 'line-opacity': 0.8 } });
+
+  if (approachFeats.length > 0) {
+    map.addSource('debug-approaches-src', { type: 'geojson', data: { type: 'FeatureCollection', features: approachFeats } });
+    map.addLayer({ id: 'debug-approaches', type: 'line', source: 'debug-approaches-src',
+      paint: {
+        'line-color': ['match', ['get', 'highway'],
+          'motorway', '#ef4444', 'motorway_link', '#ef4444',
+          'trunk', '#f97316',    'trunk_link', '#f97316',
+          'primary', '#f59e0b',  'primary_link', '#f59e0b',
+          'secondary', '#84cc16', 'secondary_link', '#84cc16',
+          'roundabout', '#22d3ee',
+          '#94a3b8'],
+        'line-width': 4,
+        'line-opacity': 0.9,
+      },
+    });
+  }
+
+  // Nucleus marker
+  map.addSource('debug-nucleus-src', {
+    type: 'geojson',
+    data: { type: 'Feature', geometry: { type: 'Point', coordinates: [nucleusLon, nucleusLat] }, properties: {} },
+  });
+  map.addLayer({ id: 'debug-nucleus', type: 'circle', source: 'debug-nucleus-src',
+    paint: {
+      'circle-radius': 9,
+      'circle-color': color,
+      'circle-stroke-color': '#fff',
+      'circle-stroke-width': 2,
+      'circle-opacity': 0.95,
+    },
+  });
+
+  // Compound nodes + connector lines
+  if (compoundFeats.length > 0) {
+    map.addSource('debug-compound-src', { type: 'geojson', data: { type: 'FeatureCollection', features: compoundFeats } });
+    map.addLayer({ id: 'debug-compound', type: 'circle', source: 'debug-compound-src',
+      filter: ['==', ['geometry-type'], 'Point'],
+      paint: { 'circle-radius': 5, 'circle-color': color, 'circle-opacity': 0.7,
+               'circle-stroke-color': '#fff', 'circle-stroke-width': 1.5 },
+    });
+    // Connector lines rendered via a separate line layer on same source
+    map.addLayer({
+      id: 'debug-compound-lines', type: 'line', source: 'debug-compound-src',
+      filter: ['==', ['geometry-type'], 'LineString'],
+      paint: { 'line-color': color, 'line-width': 1.5, 'line-dasharray': [3, 3], 'line-opacity': 0.6 },
+    });
+  }
 }
 
