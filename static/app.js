@@ -1,13 +1,13 @@
 // =============================================================================
-// GIS-Track  ·  app.js  (v2 — dynamic CA crashes, draw/select, AI placeholder)
+// GIS-Track   -   app.js  (v2 - dynamic CA crashes, draw/select, AI placeholder)
 // =============================================================================
 // Architecture:
-//   • styledata + isStyleLoaded() — permanent style-switch handler
-//   • map.once('idle') in switchBasemap — fallback for inline satellite style
-//   • Mapillary layers are lazy-loaded: sources added only on first toggle ON
-//   • Google Street View shown in side panel on any map click
-//   • Dynamic crash loading for all California counties (cached per-county)
-//   • Draw tool: rectangle or polygon → select visible features → download GeoJSON
+//   * styledata + isStyleLoaded() - permanent style-switch handler
+//   * map.once('idle') in switchBasemap - fallback for inline satellite style
+//   * Mapillary layers are lazy-loaded: sources added only on first toggle ON
+//   * Google Street View shown in side panel on any map click
+//   * Dynamic crash loading for all California counties (cached per-county)
+//   * Draw tool: rectangle or polygon -> select visible features -> download GeoJSON
 // =============================================================================
 
 // ---- Constants ---------------------------------------------------------------
@@ -24,7 +24,7 @@ const BASEMAP_STYLES = {
         type: 'raster',
         tiles: ['https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'],
         tileSize: 256,
-        attribution: '© Esri, Maxar, Earthstar Geographics',
+        attribution: '(c) Esri, Maxar, Earthstar Geographics',
         maxzoom: 19,
       },
       'esri-labels': {
@@ -63,10 +63,12 @@ let G_googleMapsKey   = '';
 let G_hasGoogleMaps   = false;
 let G_googleMapsReady = false;
 
-// Accumulators — deduplicated feature stores
-const OSM_FEATURE_MAP   = new Map();   // String(id) → feature
-const CRASH_FEATURE_MAP = new Map();   // String(id) → feature
-const AADT_FEATURE_MAP  = new Map();   // Number(index) → feature
+// Accumulators - deduplicated feature stores
+const OSM_FEATURE_MAP   = new Map();   // String(id) -> feature
+const CRASH_FEATURE_MAP = new Map();   // String(id) -> feature
+const AADT_FEATURE_MAP  = new Map();   // Number(index) -> feature
+const OSM_TILE_FEATURES   = new Map(); // tileKey "x_y" -> Set<featureId>
+const CRASH_TILE_FEATURES = new Map(); // tileKey "x_y" -> Set<featureId>
 
 // AADT data (lazy-loaded on first toggle ON)
 let G_aadtData    = null;
@@ -88,20 +90,20 @@ let G_selectionData = null;    // last selection FeatureCollection
 let _lastClickTime  = 0;       // for dblclick debounce in poly mode
 
 // ---- Layer visibility --------------------------------------------------------
-// Mapillary-dependent layers start OFF — lazy-loaded on first toggle.
+// Mapillary-dependent layers start OFF - lazy-loaded on first toggle.
 
 const LAYER_VISIBILITY = {
-  signals:            true,
+  signals:            false,
   intersections:      false,
-  crossings:          true,
-  bus:                true,
-  bike:               true,
+  crossings:          false,
+  bus:                false,
+  bike:               false,
   roads:              false,
-  footway:            true,
+  footway:            false,
   calming:            false,
   streetlamp:         false,
-  heatmap:            true,
-  crashes:            true,
+  heatmap:            false,
+  crashes:            false,
   aadt:               false,
   'asset-regulatory': false,
   'asset-warning':    false,
@@ -111,7 +113,7 @@ const LAYER_VISIBILITY = {
   'rankings-best':    false,
 };
 
-// toggle key → MapLibre layer IDs it controls
+// toggle key -> MapLibre layer IDs it controls
 const LAYER_IDS = {
   signals:            ['signals-layer'],
   intersections:      ['intersections-pt-layer', 'intersections-rbt-layer'],
@@ -133,7 +135,7 @@ const LAYER_IDS = {
   'rankings-best':    ['rankings-best-layer',  'rankings-best-line',  'rankings-best-label'],
 };
 
-// source id → owned layer IDs (must remove layers before source)
+// source id -> owned layer IDs (must remove layers before source)
 const SOURCE_LAYERS = {
   osm:              ['signals-layer', 'intersections-pt-layer', 'intersections-rbt-layer',
                      'crossings-layer', 'bus-layer', 'bike-layer',
@@ -153,6 +155,40 @@ const MLY_ADDED = {
   'mly-signs-vt':   false,
   'mly-objects-vt': false,
 };
+
+// ---- Tile-cache helpers -------------------------------------------------------
+
+const _OSM_LAYER_KEYS = ['signals','intersections','crossings','bus','bike','roads','footway','calming','streetlamp'];
+
+function _lonToTileX(lon, z) { return Math.floor((lon + 180) / 360 * (1 << z)); }
+function _latToTileY(lat, z) {
+  const r = lat * Math.PI / 180;
+  return Math.floor((1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2 * (1 << z));
+}
+
+function _featureTileKey(f, z = 12) {
+  const g = f.geometry;
+  let lon, lat;
+  if (g.type === 'Point') {
+    [lon, lat] = g.coordinates;
+  } else if (g.type === 'LineString' && g.coordinates.length) {
+    [lon, lat] = g.coordinates[Math.floor(g.coordinates.length / 2)];
+  } else return null;
+  return `${_lonToTileX(lon, z)}_${_latToTileY(lat, z)}`;
+}
+
+function _viewportTileKeys(z, buf) {
+  const b = map.getBounds();
+  const x0 = _lonToTileX(b.getWest(),  z) - buf;
+  const x1 = _lonToTileX(b.getEast(),  z) + buf;
+  const y0 = _latToTileY(b.getNorth(), z) - buf;
+  const y1 = _latToTileY(b.getSouth(), z) + buf;
+  const keys = new Set();
+  for (let x = x0; x <= x1; x++)
+    for (let y = y0; y <= y1; y++)
+      keys.add(`${x}_${y}`);
+  return keys;
+}
 
 // ---- Map init ----------------------------------------------------------------
 
@@ -184,6 +220,7 @@ map.on('styledata', () => {
   if (!map.isStyleLoaded()) return;
   if (map.getSource('osm')) return;
   rebuildLayers();
+  if (typeof dbgSandbox !== 'undefined') dbgSandbox.rebuildAfterStyleLoad();
 });
 
 // ---- Initial bootstrap -------------------------------------------------------
@@ -230,29 +267,17 @@ async function loadData() {
     fetch('/api/googlemaps/config').then(r => r.json()),
   ]);
 
-  // Seed OSM with pre-fetched area files (fast initial load — optional, non-fatal)
-  try {
-    const [sacOsm, humOsm] = await Promise.all([
-      fetch('/api/osm/sacramento').then(r => { if (!r.ok) throw new Error(r.status); return r.json(); }),
-      fetch('/api/osm/humboldt').then(r => { if (!r.ok) throw new Error(r.status); return r.json(); }),
-    ]);
-    for (const f of [...(sacOsm.features || []), ...(humOsm.features || [])]) {
-      OSM_FEATURE_MAP.set(String(f.properties.id), f);
-    }
-    G_osmData = { type: 'FeatureCollection', features: [...OSM_FEATURE_MAP.values()] };
-  } catch (_) {
-    // Preload unavailable — viewport loading will populate OSM data on first pan
-    G_osmData = { type: 'FeatureCollection', features: [] };
-  }
+  // OSM data starts empty - populated by viewport loading on first pan/zoom
+  G_osmData = { type: 'FeatureCollection', features: [] };
 
-  // Crash data starts empty — dynamically loaded by loadCrashesForViewport()
+  // Crash data starts empty - dynamically loaded by loadCrashesForViewport()
   G_crashData = { type: 'FeatureCollection', features: [] };
 
   G_hasMly = config.has_mapillary;
   if (G_hasMly) {
     const { token } = await fetch('/api/mapillary/token').then(r => r.json());
     G_mlyToken = token;
-    setMlyStatus('Token ready — toggle layers to load', '');
+    setMlyStatus('Token ready - toggle layers to load', '');
   } else {
     setMlyStatus('Add MAPILLARY_TOKEN to .env', 'error');
   }
@@ -262,7 +287,7 @@ async function loadData() {
   if (G_hasGoogleMaps) {
     loadGoogleMapsAPI(G_googleMapsKey);
   }
-  // Pegman is always shown — iframe fallback works without API key
+  // Pegman is always shown - iframe fallback works without API key
 
   // Load county list for Statistics panel
   try {
@@ -289,38 +314,64 @@ function scheduleViewportLoad() {
 }
 
 async function loadOsmForViewport() {
-  // z12 tile cache — at map zoom < 12 the viewport spans too many z12 tiles
-  if (map.getZoom() < 12) return;
+  if (map.getZoom() < 12) {
+    // Zoom-out: evict all OSM data from cache
+    if (OSM_FEATURE_MAP.size > 0) {
+      OSM_FEATURE_MAP.clear();
+      OSM_TILE_FEATURES.clear();
+      G_osmData = { type: 'FeatureCollection', features: [] };
+      map.getSource('osm')?.setData(G_osmData);
+      updateStats();
+    }
+    return;
+  }
+  if (!_OSM_LAYER_KEYS.some(k => LAYER_VISIBILITY[k])) return;
+
   const b    = map.getBounds();
   const bbox = `${b.getWest()},${b.getSouth()},${b.getEast()},${b.getNorth()}`;
   const statusEl = document.getElementById('crash-load-status');
 
-  // Show loading — reuse the status bar
-  if (statusEl && !statusEl.textContent) statusEl.textContent = 'Loading infrastructure…';
+  if (statusEl && !statusEl.textContent) statusEl.textContent = 'Loading infrastructure...';
 
   let data;
   try {
     const resp = await fetch(`/api/osm/dynamic?bbox=${bbox}`);
-    if (!resp.ok) {
-      if (statusEl) statusEl.textContent = '';
-      return;
-    }
+    if (!resp.ok) { if (statusEl) statusEl.textContent = ''; return; }
     data = await resp.json();
   } catch (_) {
     if (statusEl) statusEl.textContent = '';
     return;
   }
-
-  if (statusEl && statusEl.textContent === 'Loading infrastructure…') statusEl.textContent = '';
-
+  if (statusEl && statusEl.textContent === 'Loading infrastructure...') statusEl.textContent = '';
   if (!data.features || !data.features.length) return;
 
+  // Add new features, tracking which z12 tile each belongs to
   let added = 0;
   for (const f of data.features) {
     const key = String(f.properties.id);
-    if (!OSM_FEATURE_MAP.has(key)) { OSM_FEATURE_MAP.set(key, f); added++; }
+    if (!OSM_FEATURE_MAP.has(key)) {
+      OSM_FEATURE_MAP.set(key, f);
+      const tk = _featureTileKey(f, 12);
+      if (tk) {
+        if (!OSM_TILE_FEATURES.has(tk)) OSM_TILE_FEATURES.set(tk, new Set());
+        OSM_TILE_FEATURES.get(tk).add(key);
+      }
+      added++;
+    }
   }
-  if (added === 0) return;
+
+  // Evict tiles that are no longer near the viewport
+  let evicted = 0;
+  const keep = _viewportTileKeys(12, 2);
+  for (const [tk, ids] of OSM_TILE_FEATURES) {
+    if (!keep.has(tk)) {
+      for (const id of ids) OSM_FEATURE_MAP.delete(id);
+      OSM_TILE_FEATURES.delete(tk);
+      evicted += ids.size;
+    }
+  }
+
+  if (added === 0 && evicted === 0) return;
 
   G_osmData = { type: 'FeatureCollection', features: [...OSM_FEATURE_MAP.values()] };
   if (map.getSource('osm')) {
@@ -331,10 +382,20 @@ async function loadOsmForViewport() {
 
 async function loadCrashesForViewport() {
   clearTimeout(_crashPollTimer);
-  if (map.getZoom() < 9) return;
+  if (map.getZoom() < 9) {
+    // Zoom-out: evict all crash data from cache
+    if (CRASH_FEATURE_MAP.size > 0) {
+      CRASH_FEATURE_MAP.clear();
+      CRASH_TILE_FEATURES.clear();
+      G_crashData = { type: 'FeatureCollection', features: [] };
+      map.getSource('crashes')?.setData(G_crashData);
+      updateStats();
+    }
+    return;
+  }
+  if (!LAYER_VISIBILITY['crashes'] && !LAYER_VISIBILITY['heatmap']) return;
 
   const b = map.getBounds();
-  // Skip if viewport doesn't overlap California at all
   if (b.getEast() < CA_BBOX.west || b.getWest() > CA_BBOX.east ||
       b.getNorth() < CA_BBOX.south || b.getSouth() > CA_BBOX.north) return;
 
@@ -348,13 +409,33 @@ async function loadCrashesForViewport() {
     data = await resp.json();
   } catch (_) { if (statusEl) statusEl.textContent = ''; return; }
 
-  // Add newly arrived features
+  // Add newly arrived features, tracking which z9 tile each belongs to
   let added = 0;
   for (const f of (data.features || [])) {
     const key = String(f.properties.id);
-    if (!CRASH_FEATURE_MAP.has(key)) { CRASH_FEATURE_MAP.set(key, f); added++; }
+    if (!CRASH_FEATURE_MAP.has(key)) {
+      CRASH_FEATURE_MAP.set(key, f);
+      const tk = _featureTileKey(f, 9);
+      if (tk) {
+        if (!CRASH_TILE_FEATURES.has(tk)) CRASH_TILE_FEATURES.set(tk, new Set());
+        CRASH_TILE_FEATURES.get(tk).add(key);
+      }
+      added++;
+    }
   }
-  if (added > 0) {
+
+  // Evict tiles no longer near the viewport
+  let evicted = 0;
+  const keep = _viewportTileKeys(9, 2);
+  for (const [tk, ids] of CRASH_TILE_FEATURES) {
+    if (!keep.has(tk)) {
+      for (const id of ids) CRASH_FEATURE_MAP.delete(id);
+      CRASH_TILE_FEATURES.delete(tk);
+      evicted += ids.size;
+    }
+  }
+
+  if (added > 0 || evicted > 0) {
     G_crashData = { type: 'FeatureCollection', features: [...CRASH_FEATURE_MAP.values()] };
     if (map.getSource('crashes')) {
       map.getSource('crashes').setData(G_crashData);
@@ -362,12 +443,11 @@ async function loadCrashesForViewport() {
     }
   }
 
-  // Backend is still fetching some counties — show status and poll
+  // Backend is still fetching some counties - show status and poll
   const pending = data.fetching || [];
   if (pending.length > 0) {
     const names = pending.map(n => n.replace(/_/g, ' ')).join(', ');
-    if (statusEl) statusEl.textContent = `Downloading crash data: ${names}…`;
-    // Poll every 25 s until those counties are cached
+    if (statusEl) statusEl.textContent = `Downloading crash data: ${names}...`;
     _crashPollTimer = setTimeout(() => loadCrashesForViewport(), 25000);
   } else {
     if (statusEl && statusEl.textContent.startsWith('Downloading crash')) {
@@ -380,10 +460,14 @@ function updateStats() {
   const signals   = G_osmData?.features.filter(f => f.properties.type === 'traffic_signals') ?? [];
   const crossings = G_osmData?.features.filter(f => f.properties.type === 'crossing') ?? [];
   const fatal     = G_crashData?.features.filter(f => f.properties.severity === 'fatal') ?? [];
-  document.getElementById('stat-signals').textContent       = signals.length.toLocaleString();
-  document.getElementById('stat-crossings').textContent     = crossings.length.toLocaleString();
-  document.getElementById('stat-crashes-total').textContent = (G_crashData?.features.length ?? 0).toLocaleString();
-  document.getElementById('stat-fatal').textContent         = fatal.length.toLocaleString();
+  const setText = (id, value) => {
+    const el = document.getElementById(id);
+    if (el) el.textContent = value;
+  };
+  setText('stat-signals', signals.length.toLocaleString());
+  setText('stat-crossings', crossings.length.toLocaleString());
+  setText('stat-crashes-total', (G_crashData?.features.length ?? 0).toLocaleString());
+  setText('stat-fatal', fatal.length.toLocaleString());
   // Refresh chart if panel is open and on a live scope
   _maybeRefreshStatsOnDataUpdate();
 }
@@ -445,8 +529,8 @@ function addOsmLayers() {
     },
   });
 
-  // Controlled intersections — stop signs, yield signs (point nodes)
-  // stop → red, give_way → orange, roundabout node → teal
+  // Controlled intersections - stop signs, yield signs (point nodes)
+  // stop -> red, give_way -> orange, roundabout node -> teal
   map.addLayer({
     id: 'intersections-pt-layer', type: 'circle', source: 'osm',
     minzoom: 12,
@@ -457,14 +541,15 @@ function addOsmLayers() {
         16, ['match', ['get', 'type'], 'intersection_centroid', 7, 9]
       ],
       'circle-color': ['match', ['get', 'type'],
-        'stop',                  '#f87171',
-        'give_way',              '#fb923c',
-        'intersection_centroid', '#14b8a6',
-        '#2dd4bf'
+        'traffic_signals',     '#facc15',
+        'stop',                '#f87171',
+        'give_way',            '#fb923c',
+        'intersection_centroid','#14b8a6',
+        '#2dd4bf'  // roundabout fallback
       ],
       'circle-stroke-width': 1.5,
       'circle-stroke-color': '#1a1d2e',
-      'circle-opacity': ['match', ['get', 'type'], 'intersection_centroid', 0.7, 0.9],
+      'circle-opacity': 0.85,
     },
   });
 
@@ -555,7 +640,7 @@ function addOsmLayers() {
     },
   });
 
-  // Sidewalks / footways / pedestrian paths — only at z14+ where OSM geometry is meaningful
+  // Sidewalks / footways / pedestrian paths - only at z14+ where OSM geometry is meaningful
   map.addLayer({
     id: 'footway-layer', type: 'line', source: 'osm',
     minzoom: 14,
@@ -642,12 +727,12 @@ function addAadtLayers() {
     id: 'aadt-layer', type: 'circle', source: 'aadt',
     paint: {
       'circle-radius': ['interpolate', ['linear'], ['zoom'], 7, 3, 13, 6, 16, 9],
-      // Color by AADT value: blue(low) → green → amber → red(high)
+      // Color by AADT value: blue(low) -> green -> amber -> red(high)
       'circle-color': [
         'step', ['to-number', ['get', 'aadt'], 0],
         '#60a5fa',         // < 5,000
-        5000,  '#34d399',  // 5,000–25,000
-        25000, '#f59e0b',  // 25,000–60,000
+        5000,  '#34d399',  // 5,000-25,000
+        25000, '#f59e0b',  // 25,000-60,000
         60000, '#ef4444',  // > 60,000
       ],
       'circle-stroke-width': 1,
@@ -982,7 +1067,7 @@ function _updatePolyPreview() {
 function finalizeSelection(ring) {
   const features = [];
 
-  // OSM features — respect per-layer visibility
+  // OSM features - respect per-layer visibility
   if (G_osmData) {
     for (const feat of G_osmData.features) {
       const type = feat.properties.type;
@@ -1010,7 +1095,7 @@ function finalizeSelection(ring) {
     }
   }
 
-  // Crash features — require 'crashes' or 'heatmap' visible
+  // Crash features - require 'crashes' or 'heatmap' visible
   if (G_crashData && (LAYER_VISIBILITY['crashes'] || LAYER_VISIBILITY['heatmap'])) {
     for (const feat of G_crashData.features) {
       if (feat.geometry.type !== 'Point') continue;
@@ -1096,7 +1181,7 @@ async function sendAiQuery() {
   if (!question) return;
 
   const respEl = document.getElementById('ai-response');
-  respEl.textContent = 'Thinking…';
+  respEl.textContent = 'Thinking...';
   respEl.classList.remove('hidden');
 
   const b = map.getBounds();
@@ -1139,22 +1224,22 @@ function loadGoogleMapsAPI(key) {
   window._onGoogleMapsLoaded = () => { G_googleMapsReady = true; };
   const s = document.createElement('script');
   s.src   = `https://maps.googleapis.com/maps/api/js?key=${key}&callback=_onGoogleMapsLoaded&v=weekly`;
-  s.defer = true;   // defer (not async) per API docs — ensures callback fires after DOM ready
+  s.defer = true;   // defer (not async) per API docs - ensures callback fires after DOM ready
   document.head.appendChild(s);
 }
 
 function setupPanelInteractions() {
   // Make always-visible panels draggable and resizable.
-  // #panel (inspect mode) — drag by the "Layer Controls" h2 heading
+  // #panel (inspect mode) - drag by the "Layer Controls" h2 heading
   const panelEl = document.getElementById('panel');
   const panelHandle = panelEl && panelEl.querySelector('h2');
   if (panelEl && panelHandle) {
     _initPanelInteractive(panelEl, panelHandle, { minW: 200, minH: 160 });
   }
 
-  // #analysis-panel — lazy-init on first switch to analysis mode (see setAppMode)
-  // #rank-dash-panel — initialized on first open (see openRankDash)
-  // #topo-panel — initialized on first open (see _openTopologyPanel)
+  // #analysis-panel - lazy-init on first switch to analysis mode (see setAppMode)
+  // #rank-dash-panel - initialized on first open (see openRankDash)
+  // #topo-panel - initialized on first open (see _openTopologyPanel)
 }
 
 function setupPegman() {
@@ -1214,14 +1299,14 @@ function cancelPegmanMode() {
   const btn = document.getElementById('pegman-btn');
   if (btn) { btn.classList.remove('active'); btn.title = 'Drag or click to place Street View'; }
   const hint = document.getElementById('sv-hint');
-  if (hint) hint.textContent = 'Drag 🟡 person to map for Street View';
+  if (hint) hint.textContent = 'Drag yellow person to map for Street View';
 }
 
 // ---------------------------------------------------------------------------
 // Panel drag + resize (shared utility for all floating panels)
 // ---------------------------------------------------------------------------
 
-// Single active operation shared across all panels — one mousemove/mouseup pair total.
+// Single active operation shared across all panels - one mousemove/mouseup pair total.
 let _piActiveOp = null;  // { type: 'drag'|'resize', panel?, offX?, offY?, sX?, sY?, sW?, sH?, onMove? }
 document.addEventListener('mousemove', e => {
   const op = _piActiveOp;
@@ -1287,11 +1372,11 @@ function showStreetView(lat, lng) {
   _initPanelInteractive(panel, document.getElementById('mly-header'), { minW: 280, minH: 280 });
   panoDiv.innerHTML         = '';
   placeholder.style.display = 'flex';
-  placeholder.textContent   = 'Loading Street View…';
+  placeholder.textContent   = 'Loading Street View...';
 
   if (!G_googleMapsReady) {
-    // API not yet loaded — wait up to 8 s then retry
-    placeholder.textContent = 'Waiting for Google Maps API…';
+    // API not yet loaded - wait up to 8 s then retry
+    placeholder.textContent = 'Waiting for Google Maps API...';
     const deadline = Date.now() + 8000;
     const poll = setInterval(() => {
       if (G_googleMapsReady) {
@@ -1299,7 +1384,7 @@ function showStreetView(lat, lng) {
         showStreetView(lat, lng);
       } else if (Date.now() > deadline) {
         clearInterval(poll);
-        placeholder.textContent = 'Google Maps API unavailable — check API key or network';
+        placeholder.textContent = 'Google Maps API unavailable - check API key or network';
       }
     }, 200);
     return;
@@ -1392,7 +1477,7 @@ async function _fetchCrashDetail(ids, years) {
 }
 
 function _partyCardHTML(p) {
-  const type     = p['PartyType'] || '—';
+  const type     = p['PartyType'] || '-';
   const atFault  = p['IsAtFault'];
   const age      = p['StatedAge'];
   const sex      = p['GenderDescription'];
@@ -1410,7 +1495,7 @@ function _partyCardHTML(p) {
   return `
     <div class="popup-card-title">Party ${_esc(String(p['PartyNumber'] || ''))}: ${_esc(type)}</div>
     ${atFault  ? `<div class="popup-row"><span class="popup-key">At Fault</span><span style="color:${atFault==='True'?'#f97316':'#34d399'}">${_esc(atFault)}</span></div>` : ''}
-    ${(age||sex) ? `<div class="popup-row"><span class="popup-key">Age / Sex</span><span>${_esc(String(age||'—'))} / ${_esc(String(sex||'—'))}</span></div>` : ''}
+    ${(age||sex) ? `<div class="popup-row"><span class="popup-key">Age / Sex</span><span>${_esc(String(age||'-'))} / ${_esc(String(sex||'-'))}</span></div>` : ''}
     ${sobriety ? `<div class="popup-row"><span class="popup-key">Sobriety</span><span style="font-size:0.7rem">${_esc(sobriety)}</span></div>` : ''}
     ${(make||yr) ? `<div class="popup-row"><span class="popup-key">Vehicle</span><span>${_esc(String(yr||''))} ${_esc(String(make||''))}</span></div>` : ''}
     ${move ? `<div class="popup-row"><span class="popup-key">Movement</span><span style="font-size:0.7rem">${_esc(move)}</span></div>` : ''}
@@ -1421,9 +1506,9 @@ function _partyCardHTML(p) {
 }
 
 function _victimCardHTML(v) {
-  const role     = v['InjuredPersonType'] || '—';
+  const role     = v['InjuredPersonType'] || '-';
   const deg      = String(v['ExtentOfInjuryCode'] ?? '');
-  const degLabel = INJURY_DEGREE[deg] || deg || '—';
+  const degLabel = INJURY_DEGREE[deg] || deg || '-';
   const degColor = INJURY_DEGREE_COLOR[deg] || '#9ca3af';
   const ejected  = v['Ejected'];
   const eq       = v['SafetyEquipmentDescription'];
@@ -1440,18 +1525,18 @@ function _victimCardHTML(v) {
     <div class="popup-row"><span class="popup-key">Injury</span><span style="color:${degColor};font-weight:600">${_esc(degLabel)}</span></div>
     ${ejected && ejected !== 'NotEjected' ? `<div class="popup-row"><span class="popup-key">Ejected</span><span style="color:#f97316">${_esc(ejected)}</span></div>` : ''}
     ${eq ? `<div class="popup-row"><span class="popup-key">Safety Equip</span><span style="font-size:0.7rem">${_esc(eq)}</span></div>` : ''}
-    ${(age||sex) ? `<div class="popup-row"><span class="popup-key">Age / Sex</span><span>${_esc(String(age||'—'))} / ${_esc(String(sex||'—'))}</span></div>` : ''}
+    ${(age||sex) ? `<div class="popup-row"><span class="popup-key">Age / Sex</span><span>${_esc(String(age||'-'))} / ${_esc(String(sex||'-'))}</span></div>` : ''}
     ${seat ? `<div class="popup-row"><span class="popup-key">Seat Position</span><span>${_esc(seat)}</span></div>` : ''}
     ${extra}
   `;
 }
 
-// ---- Popups (registered once — layer-click listeners survive setStyle) -------
+// ---- Popups (registered once - layer-click listeners survive setStyle) -------
 
 function setupPopups() {
   const popup = new maplibregl.Popup({ closeButton: true, closeOnClick: true, maxWidth: '320px' });
 
-  // OSM feature popups — shows all non-empty OSM tags
+  // OSM feature popups - shows all non-empty OSM tags
   const OSM_LABEL = {
     'signals-layer':   'Traffic Signal',
     'crossings-layer': 'Crosswalk (OSM)',
@@ -1476,24 +1561,38 @@ function setupPopups() {
     map.on('click', layerId, e => {
       if (G_drawActive) return;
 
-      // Debug mode: road/way clicks find the nearest intersection centroid and show its cell
-      if (G_appMode === 'debug' && layerId === 'roads-layer') {
-        _debugClickWay(e);
-        return;
-      }
-
-      // MapLibre may truncate properties in e.features — look up full feature from OSM_FEATURE_MAP
+      // MapLibre may truncate properties in e.features - look up full feature from OSM_FEATURE_MAP
       const renderedId = String(e.features[0].properties.id ?? '');
       const fullFeature = OSM_FEATURE_MAP.get(renderedId);
       const p = fullFeature ? fullFeature.properties : e.features[0].properties;
 
-      // Debug mode: for node clicks just open topology + cell, skip the popup
+      // Debug mode: open topology for nodes, show tags for everything else.
+      // Skip if click is on a consolidated intersection (handled by debug_sandbox.js).
       if (G_appMode === 'debug') {
+        if (map.getLayer('dbg-cons-intersections')) {
+          const consFeats = map.queryRenderedFeatures(e.point, {layers: ['dbg-cons-intersections']});
+          if (consFeats && consFeats.length > 0) return;  // let _onGlobalClick handle it
+        }
         if (layerId === 'intersections-pt-layer' || layerId === 'signals-layer') {
           const coords = fullFeature
             ? fullFeature.geometry.coordinates
             : [e.lngLat.lng, e.lngLat.lat];
           _openTopologyPanel(p.id, coords[0], coords[1]);
+        } else {
+          // Show popup for all other OSM elements (roads, footways, bus stops, etc.)
+          const label = OSM_LABEL_EXT[layerId] || 'OSM Feature';
+          const allRows = Object.entries(p)
+            .filter(([k, v]) => !OSM_SKIP_KEYS.has(k) && v !== null && v !== undefined && String(v).trim() !== '')
+            .sort(([a], [b]) => a.localeCompare(b))
+            .map(([k, v]) => `<div class="popup-row"><span class="popup-key">${_esc(k.replace(/_/g,' '))}</span><span style="font-size:0.72rem;word-break:break-all">${_esc(String(v))}</span></div>`)
+            .join('');
+          popup.setLngLat(e.lngLat).setHTML(`
+            <div class="popup-title">${label}</div>
+            <div class="popup-scroll">
+              ${allRows || '<div style="color:#6b7280;font-size:0.72rem">No additional tags</div>'}
+              <div class="popup-row" style="opacity:0.45;font-size:0.65rem;margin-top:4px"><span class="popup-key">OSM ID</span><span>${_esc(String(p.id))}</span></div>
+            </div>
+          `).addTo(map);
         }
         return;
       }
@@ -1519,7 +1618,7 @@ function setupPopups() {
           : [e.lngLat.lng, e.lngLat.lat];
         _openTopologyPanel(p.id, coords[0], coords[1]);
       }
-      // Click to select — Cmd/Ctrl+click appends, plain click replaces
+      // Click to select - Cmd/Ctrl+click appends, plain click replaces
       const selFeat = fullFeature || { type: 'Feature', geometry: e.features[0].geometry, properties: p };
       _applyClickSelection(selFeat, e.originalEvent.metaKey || e.originalEvent.ctrlKey);
     });
@@ -1527,7 +1626,7 @@ function setupPopups() {
     map.on('mouseleave', layerId, () => { map.getCanvas().style.cursor = ''; });
   });
 
-  // Crash point popup — scrollable, shows all overlapping crashes
+  // Crash point popup - scrollable, shows all overlapping crashes
   const SEVERITY_LABEL = {
     fatal:         'Fatal',
     severe_injury: 'Severe Injury',
@@ -1538,7 +1637,7 @@ function setupPopups() {
     fatal: '#dc2626', severe_injury: '#f97316', other_injury: '#fbbf24', pdo: '#9ca3af',
   };
 
-  // Keys shown prominently at top of crash popup — skipped in the "all fields" section below
+  // Keys shown prominently at top of crash popup - skipped in the "all fields" section below
   const CRASH_TOP_KEYS = new Set([
     'id', 'collision_id', 'severity', 'year', 'killed', 'injured', 'date',
     'crash_date_time', 'collision_type', 'collision_type_description',
@@ -1562,7 +1661,7 @@ function setupPopups() {
       const color   = SEVERITY_COLOR[sev] || '#9ca3af';
       const label   = SEVERITY_LABEL[sev] || sev;
       const typeStr = (p.collision_type || p.collision_type_description || 'unknown').replace(/_/g, ' ');
-      const dateStr = p.date || (p.year ? String(p.year) : '—');
+      const dateStr = p.date || (p.year ? String(p.year) : '-');
       const cond    = p.special_cond || p.special_condition || '';
       const extraRows = Object.entries(p)
         .filter(([k, v]) => !CRASH_TOP_KEYS.has(k) && v !== null && v !== undefined && String(v).trim() !== '')
@@ -1593,11 +1692,11 @@ function setupPopups() {
         <button class="ptab" data-tab="victims">Victims</button>
       </div>
       <div id="ptab-crash"   class="ptab-content popup-scroll">${crashRows}</div>
-      <div id="ptab-parties" class="ptab-content hidden popup-scroll"><div class="popup-loading">Loading…</div></div>
-      <div id="ptab-victims" class="ptab-content hidden popup-scroll"><div class="popup-loading">Loading…</div></div>
+      <div id="ptab-parties" class="ptab-content hidden popup-scroll"><div class="popup-loading">Loading...</div></div>
+      <div id="ptab-victims" class="ptab-content hidden popup-scroll"><div class="popup-loading">Loading...</div></div>
     `).addTo(map);
 
-    // Tab switching — delegate to popup content div (recreated each addTo call)
+    // Tab switching - delegate to popup content div (recreated each addTo call)
     const content = document.querySelector('.maplibregl-popup-content');
     if (content) {
       content.addEventListener('click', evt => {
@@ -1615,7 +1714,7 @@ function setupPopups() {
     const years = [...new Set(feats.slice(0, 8).map(f => String(f.properties.year || '')).filter(Boolean))];
     _fetchCrashDetail(ids, years);
 
-    // Click to select — Cmd/Ctrl+click appends, plain click replaces
+    // Click to select - Cmd/Ctrl+click appends, plain click replaces
     const append = e.originalEvent.metaKey || e.originalEvent.ctrlKey;
     if (!append || !G_selectionData) G_selectionData = { type: 'FeatureCollection', features: [] };
     const existingIds = new Set(G_selectionData.features.map(f => f.properties.id));
@@ -1635,10 +1734,10 @@ function setupPopups() {
     map.on('click', layerId, e => {
       const p     = e.features[0].properties;
       const parts = (p.value || '').split('--');
-      const cat   = parts[0] || '—';
-      const type  = (parts[1] || '—').replace(/-/g, ' ');
-      const icon  = cat === 'regulatory' ? '🛑' : cat === 'warning' ? '⚠️' : 'ℹ️';
-      const fmt   = ms => ms ? new Date(parseInt(ms)).toLocaleDateString('en-US', { year: 'numeric', month: 'short' }) : '—';
+      const cat   = parts[0] || '-';
+      const type  = (parts[1] || '-').replace(/-/g, ' ');
+      const icon  = cat === 'regulatory' ? 'STOP' : cat === 'warning' ? 'WARN' : 'INFO';
+      const fmt   = ms => ms ? new Date(parseInt(ms)).toLocaleDateString('en-US', { year: 'numeric', month: 'short' }) : '-';
       popup.setLngLat(e.lngLat).setHTML(`
         <div class="popup-title">${icon} ${type}</div>
         <div class="popup-row"><span class="popup-key">Category</span><span>${cat}</span></div>
@@ -1646,7 +1745,7 @@ function setupPopups() {
         <div class="popup-row"><span class="popup-key">Last seen</span><span>${fmt(p.last_seen_at)}</span></div>
         <div class="popup-row" style="font-size:0.68rem;margin-top:4px">
           <span class="popup-key">Value</span>
-          <span style="word-break:break-all">${p.value || '—'}</span>
+          <span style="word-break:break-all">${p.value || '-'}</span>
         </div>
       `).addTo(map);
     });
@@ -1657,14 +1756,14 @@ function setupPopups() {
   // Crosswalk markings
   map.on('click', 'asset-crosswalks-layer', e => {
     const p    = e.features[0].properties;
-    const type = (p.value || '').split('--').slice(1).join(' › ');
-    const fmt  = ms => ms ? new Date(parseInt(ms)).toLocaleDateString('en-US', { year: 'numeric', month: 'short' }) : '—';
+    const type = (p.value || '').split('--').slice(1).join(' > ');
+    const fmt  = ms => ms ? new Date(parseInt(ms)).toLocaleDateString('en-US', { year: 'numeric', month: 'short' }) : '-';
     popup.setLngLat(e.lngLat).setHTML(`
-      <div class="popup-title">🚶 ${type || 'Crosswalk'}</div>
+      <div class="popup-title">${type || 'Crosswalk'}</div>
       <div class="popup-row"><span class="popup-key">First detected</span><span>${fmt(p.first_seen_at)}</span></div>
       <div class="popup-row" style="font-size:0.68rem;margin-top:4px">
         <span class="popup-key">Value</span>
-        <span style="word-break:break-all">${p.value || '—'}</span>
+        <span style="word-break:break-all">${p.value || '-'}</span>
       </div>
     `).addTo(map);
   });
@@ -1683,8 +1782,8 @@ function setupPopups() {
     const src     = p.source || 'mainline';
     const route   = `CA-${p.route || '?'}${p.route_sfx || ''}`;
     const aadtRaw = parseInt(p.aadt || '0');
-    const aadtFmt = aadtRaw > 0 ? aadtRaw.toLocaleString() : '—';
-    const pm      = `${p.pm_pfx || ''}${p.pm != null ? Number(p.pm).toFixed(3) : '—'}${p.pm_sfx || ''}`;
+    const aadtFmt = aadtRaw > 0 ? aadtRaw.toLocaleString() : '-';
+    const pm      = `${p.pm_pfx || ''}${p.pm != null ? Number(p.pm).toFixed(3) : '-'}${p.pm_sfx || ''}`;
 
     // AADT color badge
     const color = aadtRaw >= 60000 ? '#ef4444'
@@ -1705,21 +1804,21 @@ function setupPopups() {
     }
     if (src === 'truck' && p.truck_aadt) {
       extraRows += `<div class="popup-row"><span class="popup-key">Truck AADT</span><span>${parseInt(p.truck_aadt).toLocaleString()}</span></div>`;
-      extraRows += `<div class="popup-row"><span class="popup-key">Truck %</span><span>${p.truck_pct || '—'}%</span></div>`;
+      extraRows += `<div class="popup-row"><span class="popup-key">Truck %</span><span>${p.truck_pct || '-'}%</span></div>`;
     }
 
     popup.setLngLat(e.lngLat).setHTML(`
-      <div class="popup-title">📊 Traffic Volume Station</div>
+      <div class="popup-title">Traffic Volume Station</div>
       <div class="popup-scroll">
         <div class="popup-row">
           <span class="popup-key">Route</span>
           <span style="font-weight:600">${_esc(route)}</span>
         </div>
-        <div class="popup-row"><span class="popup-key">County</span><span>${_esc(p.county || '—')}</span></div>
+        <div class="popup-row"><span class="popup-key">County</span><span>${_esc(p.county || '-')}</span></div>
         <div class="popup-row"><span class="popup-key">Postmile</span><span>${_esc(pm)}</span></div>
         <div class="popup-row">
           <span class="popup-key">Location</span>
-          <span style="font-size:0.7rem">${_esc(p.description || '—')}</span>
+          <span style="font-size:0.7rem">${_esc(p.description || '-')}</span>
         </div>
         <div class="popup-row" style="margin-top:6px">
           <span class="popup-key">AADT (2023)</span>
@@ -1728,7 +1827,7 @@ function setupPopups() {
         ${extraRows}
         <div class="popup-row" style="opacity:0.45;font-size:0.65rem;margin-top:6px">
           <span class="popup-key">Source</span>
-          <span>Caltrans 2023 · ${_esc(AADT_SOURCE_LABEL[src] || src)}</span>
+          <span>Caltrans 2023  -  ${_esc(AADT_SOURCE_LABEL[src] || src)}</span>
         </div>
       </div>
     `).addTo(map);
@@ -1755,7 +1854,7 @@ function toggleLayer(key) {
   if (key === 'aadt' && LAYER_VISIBILITY['aadt'] && !G_aadtData && !G_aadtLoading) {
     G_aadtLoading = true;
     const btn = document.getElementById('toggle-aadt');
-    if (btn) btn.textContent = '…';
+    if (btn) btn.textContent = '...';
     fetch('/api/aadt')
       .then(r => {
         if (!r.ok) throw new Error(`AADT fetch failed: ${r.status}`);
@@ -1797,6 +1896,12 @@ function toggleLayer(key) {
     }
   }
 
+  // Trigger data load if layer was just enabled but cache is empty
+  if (LAYER_VISIBILITY[key] && G_appMode !== 'analysis') {
+    if (_OSM_LAYER_KEYS.includes(key) && OSM_FEATURE_MAP.size === 0)   scheduleViewportLoad();
+    if ((key === 'crashes' || key === 'heatmap') && CRASH_FEATURE_MAP.size === 0) scheduleViewportLoad();
+  }
+
   _syncLayerVisibility(key);
   document.getElementById(`row-${key}`)?.classList.toggle('off',  !LAYER_VISIBILITY[key]);
   document.getElementById(`toggle-${key}`)?.classList.toggle('on', LAYER_VISIBILITY[key]);
@@ -1829,7 +1934,10 @@ function switchBasemap(mode) {
   G_currentBasemap = mode;
   map.setStyle(BASEMAP_STYLES[mode]);
   map.once('idle', () => {
-    if (G_dataReady && !map.getSource('osm')) rebuildLayers();
+    if (G_dataReady && !map.getSource('osm')) {
+      rebuildLayers();
+      if (typeof dbgSandbox !== 'undefined') dbgSandbox.rebuildAfterStyleLoad();
+    }
   });
   // Sync all basemap toggle buttons (panel + header)
   ['btn-basemap-map', 'hdr-basemap-map'].forEach(id =>
@@ -1848,7 +1956,7 @@ function switchBasemap(mode) {
 let _statChart     = null;
 let _statSource    = 'crashes';   // 'crashes' | 'osm'
 let _statChartType = 'bar';       // 'bar' | 'pie'
-let G_lastStatsData = null;       // { groups, total } — used for CSV export
+let G_lastStatsData = null;       // { groups, total } - used for CSV export
 
 const SEVERITY_COLORS = {
   'fatal':         '#dc2626',
@@ -1903,7 +2011,7 @@ async function refreshStats() {
   if (!body || body.classList.contains('hidden')) return;
 
   const totalEl = document.getElementById('stat-total');
-  totalEl.textContent = 'Computing…';
+  totalEl.textContent = 'Computing...';
 
   if (_statSource === 'osm') {
     const scope = _getStatScope();
@@ -1929,7 +2037,7 @@ async function refreshStats() {
     return;
   }
 
-  // county or city — call backend
+  // county or city - call backend
   let url;
   if (scope === 'county') {
     const cc = document.getElementById('stat-county-select').value;
@@ -1945,11 +2053,11 @@ async function refreshStats() {
     const data = await fetch(url).then(r => r.json());
     if (data.fetching) {
       _destroyChart();
-      totalEl.textContent = 'County not loaded yet — zoom in to load it first.';
+      totalEl.textContent = 'County not loaded yet - zoom in to load it first.';
       return;
     }
     G_lastStatsData = data.groups;
-    const label = `${(data.total || 0).toLocaleString()} crashes${data.display_name ? ' · ' + data.display_name : ''}`;
+    const label = `${(data.total || 0).toLocaleString()} crashes${data.display_name ? '  -  ' + data.display_name : ''}`;
     totalEl.textContent = label;
     _renderChart(data.groups);
   } catch (_) {
@@ -2107,12 +2215,12 @@ const _DATA_META = {
   basemap: {
     title: 'Basemap Tiles',
     rows: [
-      ['Map style',   'OpenFreeMap — liberty style'],
-      ['Attribution', '© OpenStreetMap contributors'],
+      ['Map style',   'OpenFreeMap - liberty style'],
+      ['Attribution', '(c) OpenStreetMap contributors'],
       ['License',     'Open Database License (ODbL) 1.0'],
       ['Satellite',   'Esri World Imagery'],
-      ['Sat. credit', '© Esri, Maxar, Earthstar Geographics'],
-      ['Usage',       'Display only — no routing or geocoding'],
+      ['Sat. credit', '(c) Esri, Maxar, Earthstar Geographics'],
+      ['Usage',       'Display only - no routing or geocoding'],
     ],
   },
   osm: {
@@ -2123,7 +2231,7 @@ const _DATA_META = {
       ['API',         'Overpass API (3-mirror fallback)'],
       ['Tile cache',  'Zoom-12 tiles, cached on first viewport visit'],
       ['Update lag',  'Hours to days behind real-world edits'],
-      ['Coverage',    'California — dynamic, viewport-based'],
+      ['Coverage',    'California - dynamic, viewport-based'],
       ['More info',   'openstreetmap.org/copyright'],
     ],
   },
@@ -2133,8 +2241,8 @@ const _DATA_META = {
       ['Source',    'California Highway Patrol (CHP)'],
       ['Dataset',   'Crash Cause Reporting System (CCRS)'],
       ['Portal',    'data.ca.gov (CKAN Datastore API)'],
-      ['License',   'California Open Data — Public Domain'],
-      ['Coverage',  'All 58 CA counties, years 2019–2024'],
+      ['License',   'California Open Data - Public Domain'],
+      ['Coverage',  'All 58 CA counties, years 2019-2024'],
       ['Refresh',   'API updated daily; app caches per county on first view'],
       ['Note',      'Geocoding accuracy varies; some records lack coordinates and are excluded'],
     ],
@@ -2154,10 +2262,10 @@ const _DATA_META = {
     title: 'Street View',
     rows: [
       ['Provider', 'Google Maps Platform'],
-      ['APIs',     'Maps JavaScript API — Street View Service'],
+      ['APIs',     'Maps JavaScript API - Street View Service'],
       ['Auth',     'Requires Google Maps API key'],
       ['Terms',    'Google Maps Platform Terms of Service'],
-      ['Note',     'Key usage subject to Google billing; not embedded — opens in side panel'],
+      ['Note',     'Key usage subject to Google billing; not embedded - opens in side panel'],
     ],
   },
 };
@@ -2197,15 +2305,15 @@ function addRankingsLayers() {
   map.addSource('facility-crashes', { type: 'geojson', data: EMPTY_FC });
 
   // Layer order (bottom to top):
-  // 1. buffer fill polygon      — translucent blue area around selected facility
-  // 2. buffer outline           — dashed blue border
-  // 3. ranking lines (worst/best) — red/green road segments
-  // 4. ranking circles (worst/best) — red/green intersection dots
-  // 5. fac-seg-hl               — amber highlight on the SELECTED segment (above rank lines)
-  // 6. fac-crashes-layer        — individual crash dots (above all ranking markers)
-  // 7. ranking labels           — rank numbers (top-most)
+  // 1. buffer fill polygon      - translucent blue area around selected facility
+  // 2. buffer outline           - dashed blue border
+  // 3. ranking lines (worst/best) - red/green road segments
+  // 4. ranking circles (worst/best) - red/green intersection dots
+  // 5. fac-seg-hl               - amber highlight on the SELECTED segment (above rank lines)
+  // 6. fac-crashes-layer        - individual crash dots (above all ranking markers)
+  // 7. ranking labels           - rank numbers (top-most)
 
-  // ── 1–2. Facility buffer (polygon) ───────────────────────────────────────
+  // -- 1-2. Facility buffer (polygon) ---------------------------------------
   map.addLayer({
     id: 'fac-buffer-fill', type: 'fill', source: 'facility-overlay',
     filter: ['==', ['geometry-type'], 'Polygon'],
@@ -2217,7 +2325,7 @@ function addRankingsLayers() {
     paint: { 'line-color': '#60a5fa', 'line-width': 1.5, 'line-dasharray': [4, 2] },
   });
 
-  // ── 3. Ranking lines (segments) ───────────────────────────────────────────
+  // -- 3. Ranking lines (segments) -------------------------------------------
   map.addLayer({
     id: 'rankings-worst-line', type: 'line', source: 'rankings-worst',
     minzoom: 6,
@@ -2241,7 +2349,7 @@ function addRankingsLayers() {
     },
   });
 
-  // ── 4. Ranking circles (intersections) ───────────────────────────────────
+  // -- 4. Ranking circles (intersections) -----------------------------------
   map.addLayer({
     id: 'rankings-worst-layer', type: 'circle', source: 'rankings-worst',
     minzoom: 6,
@@ -2269,7 +2377,7 @@ function addRankingsLayers() {
     },
   });
 
-  // ── 5. Selected segment highlight (above rank lines, below crash dots) ───
+  // -- 5. Selected segment highlight (above rank lines, below crash dots) ---
   map.addLayer({
     id: 'fac-seg-hl', type: 'line', source: 'facility-overlay',
     filter: ['==', ['geometry-type'], 'LineString'],
@@ -2277,7 +2385,7 @@ function addRankingsLayers() {
     paint: { 'line-color': '#fbbf24', 'line-width': 8, 'line-opacity': 0.9 },
   });
 
-  // ── 6. Crash dots for selected facility ──────────────────────────────────
+  // -- 6. Crash dots for selected facility ----------------------------------
   map.addLayer({
     id: 'fac-crashes-layer', type: 'circle', source: 'facility-crashes',
     paint: {
@@ -2289,7 +2397,7 @@ function addRankingsLayers() {
     },
   });
 
-  // ── 7. Rank number labels (top of stack) ─────────────────────────────────
+  // -- 7. Rank number labels (top of stack) ---------------------------------
   map.addLayer({
     id: 'rankings-worst-label', type: 'symbol', source: 'rankings-worst',
     minzoom: 8,
@@ -2369,33 +2477,67 @@ function setupRankingInteractions() {
   });
 }
 
-// facility_id → GeoJSON Feature (full props; MapLibre truncates tile properties)
+// facility_id -> GeoJSON Feature (full props; MapLibre truncates tile properties)
 const G_rankFacilityMap = new Map();
 
+function _rankIsJunction(p) {
+  return ['intersection', 'junction'].includes(p.facility_type || '');
+}
+
+function _rankTotal(p) {
+  return Number(p.total_5yr ?? p.crash_total ?? 0);
+}
+
+function _rankFatal(p) {
+  return Number(p.fatal_5yr ?? p.fatal ?? 0);
+}
+
+function _rankSevere(p) {
+  return Number(p.severe_5yr ?? p.severe_injury ?? 0);
+}
+
+function _rankOther(p) {
+  return Number(p.other_injury ?? 0);
+}
+
+function _rankPdo(p) {
+  if (p.pdo != null) return Number(p.pdo);
+  return Math.max(0, _rankTotal(p) - _rankFatal(p) - _rankSevere(p) - _rankOther(p));
+}
+
+function _rankFacilityLabel(p) {
+  if (p.name) return p.name;
+  const fid = p.facility_id || '';
+  if (!fid) return 'Facility';
+  if ((p.facility_type || '') === 'ramp') return 'Ramp ' + fid;
+  if (_rankIsJunction(p)) return 'Junction ' + fid;
+  return 'Segment ' + fid;
+}
+
 function _rankPopupHtml(p) {
-  const isInt  = (p.facility_type || '') === 'intersection';
-  const name   = p.name || (p.facility_id ? (isInt ? 'Intersection ' : 'Segment ') + '#' + p.facility_id.replace(/^[nw]/, '') : '—');
-  const county = (p.county || '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) || '—';
-  const ftype  = isInt ? 'Intersection' : 'Road Segment';
+  const isInt  = _rankIsJunction(p);
+  const name   = p.name || (p.facility_id ? (isInt ? 'Intersection ' : 'Segment ') + '#' + p.facility_id.replace(/^[nw]/, '') : '-');
+  const county = (p.county || '').replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase()) || '-';
+  const ftype  = isInt ? 'Junction' : ((p.facility_type || '') === 'ramp' ? 'Ramp' : 'Road Segment');
 
   // Control label for intersections; raw OSM type for segments
   const CTRL_LABELS = { traffic_signals: 'Signalized', stop: 'All-Way Stop', give_way: 'Yield',
                         mini_roundabout: 'Roundabout', uncontrolled: 'Uncontrolled' };
-  const ctrl   = isInt ? (CTRL_LABELS[p.road_type] || p.road_type || '—') : null;
-  const cls    = (p.road_class || '').replace(/\b\w/g, c => c.toUpperCase()) || '—';
-  const speed  = p.speed_mph  > 0  ? p.speed_mph + ' mph' : '—';
-  const lanes  = p.lanes      > 0  ? p.lanes + ' lanes'   : '—';
+  const ctrl   = isInt ? (CTRL_LABELS[p.road_type] || p.road_type || '-') : null;
+  const cls    = (p.road_class || '').replace(/\b\w/g, c => c.toUpperCase()) || '-';
+  const speed  = p.speed_mph  > 0  ? p.speed_mph + ' mph' : '-';
+  const lanes  = p.lanes      > 0  ? p.lanes + ' lanes'   : '-';
   const len_m  = p.length_m   > 0  ? (p.length_m / 1000).toFixed(2) + ' km' : null;
   const aadt   = p.aadt != null     ? Number(p.aadt).toLocaleString() + ' veh/day' : null;
   const turn   = p.turn_channelization || null;
   const median = p.median_type || null;
 
-  const epdo      = typeof p.epdo_score === 'number' ? p.epdo_score.toFixed(1) : '—';
-  const fatal     = p.fatal_5yr  ?? 0;
-  const sev       = p.severe_5yr ?? 0;
-  const tot       = p.total_5yr  ?? 0;
+  const epdo      = typeof p.epdo_score === 'number' ? p.epdo_score.toFixed(1) : '-';
+  const fatal     = _rankFatal(p);
+  const sev       = _rankSevere(p);
+  const tot       = _rankTotal(p);
   const oth       = Math.max(0, tot - fatal - sev);
-  const rate      = p.crash_rate_yr != null ? p.crash_rate_yr.toFixed(2) + '/yr' : '—';
+  const rate      = p.crash_rate_yr != null ? p.crash_rate_yr.toFixed(2) + '/yr' : '-';
   const epdoRate  = p.epdo_rate  != null ? p.epdo_rate.toFixed(3)  : null;
   const rateUnit  = isInt ? '/MEV' : '/MV-km';
 
@@ -2406,7 +2548,7 @@ function _rankPopupHtml(p) {
     : '';
 
   function row(label, val) {
-    if (val == null || val === '—' || val === '') return '';
+    if (val == null || val === '-' || val === '') return '';
     return `<tr>
       <td style="color:#6b7280;padding-right:10px;white-space:nowrap;vertical-align:top">${label}</td>
       <td style="color:#d1d5db">${val}</td>
@@ -2415,7 +2557,7 @@ function _rankPopupHtml(p) {
 
   return `<div style="font-size:0.72rem;line-height:1.6;font-family:inherit;min-width:200px">
     <div style="font-weight:700;color:#fff;margin-bottom:2px;font-size:0.8rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:240px">${name}</div>
-    <div style="color:#6b7280;margin-bottom:6px;font-size:0.63rem">${county} &nbsp;·&nbsp; ${ftype}</div>
+    <div style="color:#6b7280;margin-bottom:6px;font-size:0.63rem">${county} &nbsp; - &nbsp; ${ftype}</div>
     ${pctStr ? `<div style="margin-bottom:6px;font-size:0.68rem">${pctStr}</div>` : ''}
     <table style="width:100%;border-collapse:collapse;margin-bottom:7px">
       ${isInt ? row('Control', ctrl) : ''}
@@ -2438,7 +2580,7 @@ function _rankPopupHtml(p) {
         <div><span style="color:#9ca3af;font-weight:600">${tot}</span><br><span style="color:#4b5563;font-size:0.58rem">TOTAL</span></div>
       </div>
     </div>
-    <div style="margin-top:5px;font-size:0.62rem;color:#4b5563;text-align:center">Click to open full crash dashboard ›</div>
+    <div style="margin-top:5px;font-size:0.62rem;color:#4b5563;text-align:center">Click to open full crash dashboard ></div>
   </div>`;
 }
 
@@ -2506,7 +2648,7 @@ function _clearFacilityOverlay() {
 }
 
 // ---------------------------------------------------------------------------
-// Crash Dashboard Panel — party data helpers
+// Crash Dashboard Panel - party data helpers
 // ---------------------------------------------------------------------------
 
 async function _fetchPartyData(collisionIds) {
@@ -2646,7 +2788,7 @@ function _renderMovementPairs(partyData) {
     if (!p1 || !p2) continue;
     const m1 = _abbrevMovement(p1.MovementPrecCollDescription);
     const m2 = _abbrevMovement(p2.MovementPrecCollDescription);
-    const key = `${m1} × ${m2}`;
+    const key = `${m1} x ${m2}`;
     pairCounts[key] = (pairCounts[key] || 0) + 1;
   }
   const sorted = Object.entries(pairCounts).sort((a, b) => b[1] - a[1]).slice(0, 5);
@@ -2684,25 +2826,25 @@ async function _loadPartyDataForDash(facilityId, collisionIds) {
 }
 
 // ---------------------------------------------------------------------------
-// Crash Dashboard Panel — percentile chart
+// Crash Dashboard Panel - percentile chart
 // ---------------------------------------------------------------------------
 
 /**
  * Render an SVG CDF curve showing this facility's EPDO within its peer group.
- * x-axis = EPDO value, y-axis = cumulative percentile (0–100).
+ * x-axis = EPDO value, y-axis = cumulative percentile (0-100).
  * Facility position marked with a colored dot + crosshair lines.
  *
- * @param {number} epdoScore  — EPDO value of this facility
- * @param {number} pct        — percentile rank within peer group (0-100)
- * @param {object} gs         — group stats: {n, mean, p50, p75, p90, p95, max, cdf}
+ * @param {number} epdoScore  - EPDO value of this facility
+ * @param {number} pct        - percentile rank within peer group (0-100)
+ * @param {object} gs         - group stats: {n, mean, p50, p75, p90, p95, max, cdf}
  */
 function _renderPercentileChart(epdoScore, pct, gs) {
-  // gs.cdf: 21 EPDO values at percentiles 0, 5, …, 100 (index i → EPDO at pct i*5).
+  // gs.cdf: 21 EPDO values at percentiles 0, 5, ..., 100 (index i -> EPDO at pct i*5).
   // SVG coordinate system: y increases downward; yScale inverts percentile to SVG y.
-  //   Total SVG: W×H with PAD margins on all sides.
+  //   Total SVG: WxH with PAD margins on all sides.
   //   Plot area: x in [PAD_L, PAD_L+PW], y in [PAD_T, PAD_T+PH]
-  //   x maps EPDO value 0 → xMax into plot width.
-  //   y maps percentile 100 → 0 (top=100%, bottom=0%).
+  //   x maps EPDO value 0 -> xMax into plot width.
+  //   y maps percentile 100 -> 0 (top=100%, bottom=0%).
 
   const W = 260, H = 120;
   const PAD_L = 28, PAD_R = 10, PAD_T = 14, PAD_B = 22;
@@ -2710,11 +2852,11 @@ function _renderPercentileChart(epdoScore, pct, gs) {
   const PH = H - PAD_T - PAD_B;
 
   // Use CDF data if available, else fall back to the 4-percentile-point sketch
-  const cdf = gs.cdf;  // array length 21: index i → EPDO at percentile i*5
+  const cdf = gs.cdf;  // array length 21: index i -> EPDO at percentile i*5
   const xMax = (cdf && cdf.length === 21) ? (cdf[20] * 1.05 || 1) : ((gs.p95 || 1) * 1.2);
 
   const xScale = v => PAD_L + Math.min(PW, Math.max(0, v / xMax * PW));
-  const yScale = p => PAD_T + PH - (p / 100 * PH);  // percentile → SVG y (inverted)
+  const yScale = p => PAD_T + PH - (p / 100 * PH);  // percentile -> SVG y (inverted)
 
   // --- Background bands (horizontal, by percentile zone) ---
   const BAND_ZONES = [
@@ -2762,7 +2904,7 @@ function _renderPercentileChart(epdoScore, pct, gs) {
     <line x1="${PAD_L}" y1="${PAD_T}" x2="${PAD_L}" y2="${PAD_T + PH}" stroke="#4b5563" stroke-width="0.6"/>
     <text x="${PAD_L}" y="${PAD_T + PH + 9}" text-anchor="middle" font-size="6" fill="#6b7280">0</text>
     <text x="${PAD_L + PW}" y="${PAD_T + PH + 9}" text-anchor="end" font-size="6" fill="#6b7280">${xMax.toFixed(0)}</text>
-    <text x="${PAD_L + PW / 2}" y="${H - 2}" text-anchor="middle" font-size="7.5" fill="#6b7280">EPDO →</text>
+    <text x="${PAD_L + PW / 2}" y="${H - 2}" text-anchor="middle" font-size="7.5" fill="#6b7280">EPDO -></text>
     <text x="6" y="${PAD_T + PH / 2}" text-anchor="middle" font-size="7.5" fill="#6b7280" transform="rotate(-90,6,${PAD_T + PH / 2})">%ile</text>`;
 
   // --- Facility position: dot + crosshair lines ---
@@ -2783,13 +2925,13 @@ function _renderPercentileChart(epdoScore, pct, gs) {
   const dotHtml = `<circle cx="${dotX.toFixed(1)}" cy="${dotY.toFixed(1)}" r="3.5"
     fill="${dotColor}" stroke="#111827" stroke-width="1"/>`;
 
-  // Label: "EPDO X.X · P{nn}" positioned above-right of dot, shifting left if near edge
+  // Label: "EPDO X.X  -  P{nn}" positioned above-right of dot, shifting left if near edge
   const labelX = dotX > PAD_L + PW - 40 ? dotX - 3 : dotX + 3;
   const labelAnchor = dotX > PAD_L + PW - 40 ? 'end' : 'start';
   const labelY = dotY < PAD_T + 12 ? dotY + 10 : dotY - 5;
   const labelHtml = `<text x="${labelX.toFixed(1)}" y="${labelY.toFixed(1)}"
     text-anchor="${labelAnchor}" font-size="5.5" fill="${dotColor}" font-weight="bold">
-    EPDO ${typeof epdoScore === 'number' ? epdoScore.toFixed(1) : epdoScore} · P${Math.round(pct)}
+    EPDO ${typeof epdoScore === 'number' ? epdoScore.toFixed(1) : epdoScore}  -  P${Math.round(pct)}
   </text>`;
 
   return `<div style="padding:4px 0 6px">
@@ -2803,9 +2945,9 @@ function _renderPercentileChart(epdoScore, pct, gs) {
       ${labelHtml}
     </svg>
     <div style="font-size:0.58rem;color:#4b5563;line-height:1.7;margin-top:1px">
-      Peer group — n=<span style="color:#9ca3af">${gs.n.toLocaleString()}</span>
-      &nbsp;·&nbsp; Mean: <span style="color:#9ca3af">${gs.mean}</span>
-      &nbsp;·&nbsp; Median (P50): <span style="color:#9ca3af">${gs.p50}</span>
+      Peer group - n=<span style="color:#9ca3af">${gs.n.toLocaleString()}</span>
+      &nbsp; - &nbsp; Mean: <span style="color:#9ca3af">${gs.mean}</span>
+      &nbsp; - &nbsp; Median (P50): <span style="color:#9ca3af">${gs.p50}</span>
     </div>
   </div>`;
 }
@@ -2822,6 +2964,12 @@ function openRankDash(facilityId) {
   _renderFacilityOverlay(feat);
 
   const p     = feat.properties ?? {};
+  if (_rankIsJunction(p) && feat.geometry?.type === 'Point') {
+    const [jLon, jLat] = feat.geometry.coordinates || [];
+    if (Number.isFinite(jLon) && Number.isFinite(jLat)) {
+      _openTopologyPanel(0, jLon, jLat);
+    }
+  }
   const dists = typeof p.crash_dists === 'string'
     ? JSON.parse(p.crash_dists)
     : (p.crash_dists ?? {});
@@ -2829,10 +2977,10 @@ function openRankDash(facilityId) {
   const collisionIds = typeof p.collision_ids === 'string'
     ? JSON.parse(p.collision_ids || '[]')
     : (p.collision_ids || []);
-  const total = p.total_5yr || 0;
-  const fatal = p.fatal_5yr || 0;
-  const sev   = p.severe_5yr || 0;
-  const pdo   = Math.max(0, total - fatal - sev);
+  const total = _rankTotal(p);
+  const fatal = _rankFatal(p);
+  const sev   = _rankSevere(p);
+  const pdo   = _rankPdo(p);
 
   const epdo_pct  = p.epdo_percentile != null ? Math.round(p.epdo_percentile) : null;
   const epdo_band = p.epdo_band || '';
@@ -2842,7 +2990,7 @@ function openRankDash(facilityId) {
       </span>`
     : '';
 
-  const title = p.name || p.facility_id || 'Facility';
+  const title = _rankFacilityLabel(p);
   document.getElementById('rank-dash-title').textContent = title;
 
   // Crash overlay legend
@@ -2853,55 +3001,60 @@ function openRankDash(facilityId) {
     <span style="color:#6b7280">&#9679;</span> PDO &nbsp;&mdash; shown on map
   </div>`;
 
-  const isInt_d  = (p.facility_type || '') === 'intersection';
+  const isInt_d  = _rankIsJunction(p);
   const aadt_d   = p.aadt != null ? Number(p.aadt) : null;
   const len_km_d = p.length_m > 0 ? (p.length_m / 1000) : null;
 
-  // ── Summary grid ──────────────────────────────────────────────────
+  // -- Summary grid --------------------------------------------------
   let html = crashOverlayNote + `<div class="dash-summary-grid">
-    <div class="dash-sg-cell"><span class="dk">County</span><span class="dv">${p.county || '—'}</span></div>
-    <div class="dash-sg-cell"><span class="dk">Road Class</span><span class="dv">${p.road_class || '—'}</span></div>
-    <div class="dash-sg-cell"><span class="dk">Type</span><span class="dv">${p.control_type || p.road_type || '—'}</span></div>
-    <div class="dash-sg-cell"><span class="dk">Speed</span><span class="dv">${p.speed_mph ? p.speed_mph + ' mph' : '—'}</span></div>
+    <div class="dash-sg-cell"><span class="dk">County</span><span class="dv">${p.county || '-'}</span></div>
+    <div class="dash-sg-cell"><span class="dk">Road Class</span><span class="dv">${p.road_class || '-'}</span></div>
+    <div class="dash-sg-cell"><span class="dk">Type</span><span class="dv">${p.facility_type || '-'}</span></div>
+    <div class="dash-sg-cell"><span class="dk">Subtype</span><span class="dv">${p.subtype || p.road_type || '-'}</span></div>
+    ${p.geometric_configuration ? `<div class="dash-sg-cell"><span class="dk">Geometry</span><span class="dv">${p.geometric_configuration}</span></div>` : ''}
+    ${p.traffic_control_type ? `<div class="dash-sg-cell"><span class="dk">Control</span><span class="dv">${p.traffic_control_type}</span></div>` : ''}
+    ${p.structural_grade ? `<div class="dash-sg-cell"><span class="dk">Grade</span><span class="dv">${p.structural_grade}</span></div>` : ''}
+    <div class="dash-sg-cell"><span class="dk">Speed</span><span class="dv">${p.speed_mph ? p.speed_mph + ' mph' : '-'}</span></div>
     ${p.lanes    ? `<div class="dash-sg-cell"><span class="dk">Lanes</span><span class="dv">${p.lanes}</span></div>` : ''}
     ${p.length_m ? `<div class="dash-sg-cell"><span class="dk">Length</span><span class="dv">${(p.length_m/1000).toFixed(3)} km</span></div>` : ''}
     ${aadt_d     ? `<div class="dash-sg-cell"><span class="dk">AADT</span><span class="dv">${aadt_d.toLocaleString()} veh/day</span></div>` : ''}
+    ${p.peer_rank ? `<div class="dash-sg-cell"><span class="dk">Peer Rank</span><span class="dv">#${p.peer_rank} / ${p.peer_size || '-'}</span></div>` : ''}
   </div>`;
 
-  // ── Score + rank strip ─────────────────────────────────────────────
-  const epdo      = typeof p.epdo_score === 'number' ? p.epdo_score.toFixed(1) : '—';
-  const rate      = typeof p.crash_rate_yr === 'number' ? p.crash_rate_yr.toFixed(2) : '—';
+  // -- Score + rank strip ---------------------------------------------
+  const epdo      = typeof p.epdo_score === 'number' ? p.epdo_score.toFixed(1) : '-';
+  const rate      = typeof p.crash_rate_yr === 'number' ? p.crash_rate_yr.toFixed(2) : '-';
   const epdoRate  = p.epdo_rate != null ? Number(p.epdo_rate).toFixed(3) : null;
   const rateUnit  = isInt_d ? '/MEV' : '/MV-km';
   html += `<div class="dash-score-strip">
     <div class="dash-score-cell"><div class="dash-score-val" style="color:#ef4444">${epdo}</div><div class="dash-score-lbl">EPDO score</div></div>
     <div class="dash-score-cell"><div class="dash-score-val">${total}</div><div class="dash-score-lbl">crashes / 5yr</div></div>
     <div class="dash-score-cell"><div class="dash-score-val">${rate}</div><div class="dash-score-lbl">crashes / yr</div></div>
-    <div class="dash-score-cell"><div class="dash-score-val">${epdoRate ? epdoRate + rateUnit : '—'}</div><div class="dash-score-lbl">EPDO rate</div></div>
-    <div class="dash-score-cell"><div class="dash-score-val">${rankBadge || '—'}</div><div class="dash-score-lbl">rank</div></div>
+    <div class="dash-score-cell"><div class="dash-score-val">${epdoRate ? epdoRate + rateUnit : '-'}</div><div class="dash-score-lbl">EPDO rate</div></div>
+    <div class="dash-score-cell"><div class="dash-score-val">${rankBadge || '-'}</div><div class="dash-score-lbl">rank</div></div>
   </div>`;
 
-  // ── Calculation transparency ───────────────────────────────────────
+  // -- Calculation transparency ---------------------------------------
   const weights = typeof p.epdo_weights === 'string' ? JSON.parse(p.epdo_weights || '{}') : (p.epdo_weights || {});
   const yw      = p.year_window || 5;
-  const wFatal  = weights.fatal        ?? '—';
-  const wSev    = weights.severe_injury ?? '—';
-  const wPdo    = weights.pdo           ?? '—';
+  const wFatal  = weights.fatal        ?? '-';
+  const wSev    = weights.severe_injury ?? '-';
+  const wPdo    = weights.pdo           ?? '-';
   // EPDO formula string
-  const epdoFormula = `(${fatal}×${wFatal}) + (${sev}×${wSev}) + (${pdo}×${wPdo}) = ${epdo}`;
+  const epdoFormula = `(${fatal}x${wFatal}) + (${sev}x${wSev}) + (${pdo}x${wPdo}) = ${epdo}`;
   // VMT / MEV
   let vmtLine = '';
   if (aadt_d && !isInt_d && len_km_d) {
-    vmtLine = `<div><span style="color:#6b7280">VMT (${yw}yr):</span> <span style="color:#d1d5db">${aadt_d.toLocaleString()} × ${len_km_d.toFixed(3)} km × ${yw} yr = ${(aadt_d * len_km_d * yw).toLocaleString(undefined,{maximumFractionDigits:0})} veh-km</span></div>`;
+    vmtLine = `<div><span style="color:#6b7280">VMT (${yw}yr):</span> <span style="color:#d1d5db">${aadt_d.toLocaleString()} x ${len_km_d.toFixed(3)} km x ${yw} yr = ${(aadt_d * len_km_d * yw).toLocaleString(undefined,{maximumFractionDigits:0})} veh-km</span></div>`;
   } else if (aadt_d && isInt_d) {
     const mevVal = (aadt_d * yw / 1_000_000).toFixed(4);
-    vmtLine = `<div><span style="color:#6b7280">MEV (${yw}yr):</span> <span style="color:#d1d5db">${aadt_d.toLocaleString()} × ${yw} yr / 1M = ${mevVal} MEV</span></div>`;
+    vmtLine = `<div><span style="color:#6b7280">MEV (${yw}yr):</span> <span style="color:#d1d5db">${aadt_d.toLocaleString()} x ${yw} yr / 1M = ${mevVal} MEV</span></div>`;
   }
   const rateExplain = epdoRate
     ? `<div><span style="color:#6b7280">EPDO rate:</span> <span style="color:#d1d5db">${epdo} / ${isInt_d ? (aadt_d * yw / 1_000_000).toFixed(4) + ' MEV' : (aadt_d * len_km_d * yw / 1_000_000).toFixed(4) + ' M veh-km'} = <strong style="color:#fbbf24">${epdoRate}${rateUnit}</strong></span></div>`
-    : `<div style="color:#4b5563;font-style:italic">EPDO rate unavailable — no AADT assigned to this facility</div>`;
+    : `<div style="color:#4b5563;font-style:italic">EPDO rate unavailable - no AADT assigned to this facility</div>`;
 
-  // ── Percentile chart ──────────────────────────────────────────────
+  // -- Percentile chart ----------------------------------------------
   const gs = typeof p.group_stats === 'string' ? JSON.parse(p.group_stats || '{}') : (p.group_stats || {});
   if (gs.n && epdo_pct != null) {
     html += `<div class="dash-chart-title">EPDO Percentile in Peer Group (n=${gs.n.toLocaleString()})</div>
@@ -2911,29 +3064,29 @@ function openRankDash(facilityId) {
   html += `<div class="dash-chart-title">Calculation Details</div>
   <div style="font-size:0.62rem;line-height:1.8;background:#0f1117;border:1px solid #1f2937;border-radius:4px;padding:7px 9px">
     <div><span style="color:#6b7280">Analysis window:</span> <span style="color:#d1d5db">${yw} years</span></div>
-    <div><span style="color:#6b7280">EPDO weights:</span> <span style="color:#d1d5db">fatal×${wFatal} · injury×${wSev} · PDO×${wPdo}</span></div>
+    <div><span style="color:#6b7280">EPDO weights:</span> <span style="color:#d1d5db">fatalx${wFatal}  -  injuryx${wSev}  -  PDOx${wPdo}</span></div>
     <div><span style="color:#6b7280">EPDO formula:</span> <span style="color:#d1d5db">${epdoFormula}</span></div>
     ${vmtLine}
     ${rateExplain}
   </div>`;
 
-  // ── Severity ───────────────────────────────────────────────────────
+  // -- Severity -------------------------------------------------------
   html += `<div class="dash-chart-title">Crash Severity</div>
     ${_dashBar('Fatal',   fatal, total, '#ef4444', true)}
     ${_dashBar('Severe',  sev,   total, '#f97316', true)}
     ${_dashBar('PDO',     pdo,   total, '#6b7280',  true)}`;
 
   if (total > 0) {
-    // ── Conflict type + Direction rose (two-column) ─────────────────
+    // -- Conflict type + Direction rose (two-column) -----------------
     html += `<div class="dash-chart-title">Conflict Type &amp; Travel Direction</div>
     <div class="dash-conflict-dir">
       <div>${_renderConflictBars(ctDist)}</div>
-      <div id="rank-dash-dir-rose"><div class="dash-party-loading">Loading direction…</div></div>
+      <div id="rank-dash-dir-rose"><div class="dash-party-loading">Loading direction...</div></div>
     </div>
     <div class="dash-chart-title">Top Movement Conflicts</div>
-    <div id="rank-dash-mvmt"><div class="dash-party-loading">Loading party data…</div></div>`;
+    <div id="rank-dash-mvmt"><div class="dash-party-loading">Loading party data...</div></div>`;
 
-    // ── Collision type ─────────────────────────────────────────────
+    // -- Collision type ---------------------------------------------
     const ctypes = dists.collision_type || {};
     if (Object.keys(ctypes).length) {
       html += `<div class="dash-chart-title">Collision Type</div>`;
@@ -2943,7 +3096,7 @@ function openRankDash(facilityId) {
       });
     }
 
-    // ── Motor vehicle involved ─────────────────────────────────────
+    // -- Motor vehicle involved -------------------------------------
     const mveh = dists.mveh || {};
     if (Object.keys(mveh).length) {
       html += `<div class="dash-chart-title">Involved Party</div>`;
@@ -2953,7 +3106,7 @@ function openRankDash(facilityId) {
       });
     }
 
-    // ── Vulnerable users ───────────────────────────────────────────
+    // -- Vulnerable users -------------------------------------------
     const ped = dists.ped || 0;
     const cyc = dists.cyc || 0;
     const imp = dists.imp || 0;
@@ -2964,13 +3117,13 @@ function openRankDash(facilityId) {
       ${imp > 0 ? _dashBar('Impaired', imp, total, '#f59e0b', true) : ''}`;
     }
 
-    // ── Time of day histogram ──────────────────────────────────────
+    // -- Time of day histogram --------------------------------------
     const hourDist = dists.hour || {};
     if (Object.keys(hourDist).length) {
       html += `<div class="dash-chart-title">Time of Day</div>${_dashHourChart(hourDist)}`;
     }
 
-    // ── Day of week ────────────────────────────────────────────────
+    // -- Day of week ------------------------------------------------
     const dayDist = dists.day || {};
     if (Object.keys(dayDist).length) {
       html += `<div class="dash-chart-title">Day of Week</div>`;
@@ -2984,7 +3137,7 @@ function openRankDash(facilityId) {
       });
     }
 
-    // ── Lighting ───────────────────────────────────────────────────
+    // -- Lighting ---------------------------------------------------
     const lighting = dists.lighting || {};
     if (Object.keys(lighting).length) {
       html += `<div class="dash-chart-title">Lighting Conditions</div>`;
@@ -2994,7 +3147,7 @@ function openRankDash(facilityId) {
       });
     }
 
-    // ── Weather ────────────────────────────────────────────────────
+    // -- Weather ----------------------------------------------------
     const weather = dists.weather || {};
     if (Object.keys(weather).length) {
       html += `<div class="dash-chart-title">Weather</div>`;
@@ -3004,7 +3157,7 @@ function openRankDash(facilityId) {
       });
     }
 
-    // ── Road condition ─────────────────────────────────────────────
+    // -- Road condition ---------------------------------------------
     const roadCond = dists.road_cond || {};
     if (Object.keys(roadCond).length) {
       html += `<div class="dash-chart-title">Road Condition</div>`;
@@ -3014,7 +3167,7 @@ function openRankDash(facilityId) {
       });
     }
 
-    // ── Primary Collision Factor ───────────────────────────────────
+    // -- Primary Collision Factor -----------------------------------
     const pcf = dists.pcf || {};
     if (Object.keys(pcf).length) {
       html += `<div class="dash-chart-title">Primary Collision Factor (CVC)</div>`;
@@ -3039,7 +3192,7 @@ function openRankDash(facilityId) {
 
 function _dashBar(label, count, total, color, showPct = false) {
   const pct = total > 0 ? Math.round(count / total * 100) : 0;
-  const pctLabel = showPct && total > 0 ? `<span style="color:#4b5563;font-size:0.58rem;margin-left:2px">${pct}%</span>` : '';
+  const pctLabel = showPct && total > 0 ? `<span style="color:#4b5563;font-size:0.58rem;margin-left:4px">(${pct}%)</span>` : '';
   return `<div class="dash-bar-row">
     <span class="dash-bar-label" title="${label}">${label}</span>
     <div class="dash-bar-bg"><div class="dash-bar-fill" style="width:${pct}%;background:${color}"></div></div>
@@ -3059,7 +3212,7 @@ function _dashHourChart(hourDist) {
     const pct = Math.round(v / max * 100);
     const period = h < 6 ? 0 : h < 12 ? 1 : h < 18 ? 2 : 3;
     periodTotals[period] += v;
-    bars += `<div title="${h}:00 — ${v} crashes" style="
+    bars += `<div title="${h}:00 - ${v} crashes" style="
       flex:1;height:${Math.max(2, pct)}%;background:${periodColors[period]};
       opacity:0.85;border-radius:1px 1px 0 0;align-self:flex-end"></div>`;
   }
@@ -3079,7 +3232,7 @@ function _renderFacilityOverlay(feat) {
   const geom  = feat.geometry;
   if (!geom) return;
 
-  // ── Buffer / geometry overlay ─────────────────────────────────────────────
+  // -- Buffer / geometry overlay ---------------------------------------------
   let overlayFeatures = [];
   const isNode = geom.type === 'Point';
 
@@ -3096,7 +3249,7 @@ function _renderFacilityOverlay(feat) {
     type: 'FeatureCollection', features: overlayFeatures,
   });
 
-  // ── Crash points ──────────────────────────────────────────────────────────
+  // -- Crash points ----------------------------------------------------------
   let crashCoords = [];
   try {
     const raw = p.crash_coords;
@@ -3159,10 +3312,10 @@ function _renderCountyGrid() {
     .map(([name, info]) => {
       const label   = name.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
       const cls     = _countyChipClass(info);
-      const crashSt = info.crash_ready ? '✓ crash' : '– crash';
+      const crashSt = info.crash_ready ? 'OK crash' : '- crash';
       const osmSt   = info.osm_tile_total > 0
         ? `OSM ${info.osm_tile_cached}/${info.osm_tile_total}`
-        : 'OSM –';
+        : 'OSM -';
       const title = `${label}: ${crashSt} | ${osmSt}`;
       return `<div class="county-chip ${cls}" id="chip-${name}" title="${title}"
                    onclick="_loadCountyData('${name}')">${label}</div>`;
@@ -3181,19 +3334,19 @@ async function _loadCountyData(countyName) {
   map.flyTo({ center: [(w + e) / 2, (s + n) / 2], zoom: 9, duration: 1200 });
 
   try {
-    // Start crash + OSM downloads in parallel (each returns immediately, runs in background)
+    // Start crash + high-speed PBF OSM downloads in parallel.
     await Promise.all([
       fetch(`/api/data/county/${countyName}/fetch_crash`, { method: 'POST' }),
-      fetch(`/api/data/county/${countyName}/fetch_osm`,   { method: 'POST' }),
+      fetch(`/api/data/county/${countyName}/fetch_osm_pbf`, { method: 'POST' }),
     ]);
 
-    // Poll until analysis_ready (crash done AND ≥95% OSM tiles)
+    // Poll only this county; full statewide status is expensive while PBF is busy.
     const poll = setInterval(async () => {
       try {
-        const r = await fetch('/api/data/county_status');
+        const r = await fetch(`/api/data/county/${countyName}/status`);
         if (!r.ok) return;
         const d = await r.json();
-        _countyStatusData = d;
+        _countyStatusData = { ...(_countyStatusData || {}), ...d };
         _renderCountyGrid();  // update all chips (shows tile progress)
         if (d[countyName]?.analysis_ready) {
           clearInterval(poll);
@@ -3204,797 +3357,6 @@ async function _loadCountyData(countyName) {
     chip.classList.remove('loading');
     chip.classList.add('uncached');
   }
-}
-
-// ============================================================================
-//  ANALYSIS MODE
-// ============================================================================
-
-// ---- State -----------------------------------------------------------------
-let _anaCountyData       = null;   // { county_name: { crash_ready, osm_pct, ... } }
-let _anaCountyPollTimers = {};     // { county_name: intervalId } — per-county download polls
-let _anaComputePollTimer = null;
-const _dlPrevState = {};           // { county_name: { oTiles, cRecords, ts } } for speed calc
-let _anaHandoffShown     = false;
-let _anaBinsData         = null;   // cached result of /api/rankings/bins
-let _anaActiveBinKey     = null;   // currently selected bin key
-let _anaBinTab           = 'int';  // 'int' | 'seg'
-let _anaComputeCounties  = new Set(); // counties selected for computation
-
-// ---- Mode switch -----------------------------------------------------------
-function setAppMode(mode) {
-  if (G_appMode === mode) return;
-  const prevMode = G_appMode;
-  G_appMode = mode;
-  const isAnalysis = mode === 'analysis';
-  const isDebug    = mode === 'debug';
-
-  // Header mode buttons
-  const btnI = document.getElementById('btn-mode-inspect');
-  const btnA = document.getElementById('btn-mode-analysis');
-  const btnD = document.getElementById('btn-mode-debug');
-  if (btnI) { btnI.style.background = (!isAnalysis && !isDebug) ? '#1d4ed8' : 'transparent'; btnI.style.color = (!isAnalysis && !isDebug) ? '#fff' : '#6b7280'; }
-  if (btnA) { btnA.style.background = isAnalysis ? '#7c3aed' : 'transparent'; btnA.style.color = isAnalysis ? '#fff' : '#6b7280'; }
-  if (btnD) { btnD.style.background = isDebug ? '#059669' : 'transparent'; btnD.style.color = isDebug ? '#fff' : '#6b7280'; }
-
-  // Side panels
-  const inspPanel = document.getElementById('panel');
-  const anaPanel  = document.getElementById('analysis-panel');
-  if (inspPanel) inspPanel.style.display = isAnalysis ? 'none' : 'block';
-  if (anaPanel)  anaPanel.classList.toggle('hidden', !isAnalysis);
-
-  // Debug hint banner
-  const hint = document.getElementById('debug-hint');
-  if (hint) hint.classList.toggle('hidden', !isDebug);
-
-  // Lazy-init analysis panel drag/resize on first show (can't init while hidden)
-  if (isAnalysis && anaPanel && !anaPanel._piInited) {
-    requestAnimationFrame(() => {
-      _initPanelInteractive(anaPanel, document.getElementById('analysis-drag-bar'),
-        { minW: 220, minH: 200 });
-    });
-  }
-
-  if (isAnalysis) {
-    clearTimeout(_viewportTimer);
-    clearTimeout(_crashPollTimer);
-    if (G_drawMode) cancelDraw();
-    if (G_pegmanMode) cancelPegmanMode();
-    _clearDebugHighlight();
-    _loadAnalysisCountyStatus();
-  } else if (isDebug) {
-    if (G_drawMode) cancelDraw();
-    if (G_pegmanMode) cancelPegmanMode();
-    // Debug mode reuses inspect-mode tile loading
-    if (G_dataReady) scheduleViewportLoad();
-  } else {
-    // Returning to Inspect
-    // Stop any running county download polls
-    Object.keys(_anaCountyPollTimers).forEach(name => {
-      clearInterval(_anaCountyPollTimers[name]);
-      delete _anaCountyPollTimers[name];
-    });
-    // Stop rankings compute poll if running
-    if (_anaComputePollTimer) { clearInterval(_anaComputePollTimer); _anaComputePollTimer = null; }
-    // Clear facility overlay when returning to Inspect
-    _clearFacilityOverlay();
-    _clearDebugHighlight();
-    document.getElementById('rank-dash-panel')?.classList.remove('open');
-    G_lastFacilityId = null;
-    if (G_dataReady) scheduleViewportLoad();
-  }
-}
-
-// ---- County grid -----------------------------------------------------------
-async function _loadAnalysisCountyStatus() {
-  try {
-    const resp = await fetch('/api/data/county_status');
-    if (!resp.ok) return;
-    _anaCountyData = await resp.json();
-
-    // First open: show handoff banner if cached data exists from Inspect session
-    if (!_anaHandoffShown) {
-      _anaHandoffShown = true;
-      const hasData = Object.values(_anaCountyData).some(i => i.crash_ready || i.osm_pct >= 20);
-      if (hasData) {
-        const readyCt = Object.values(_anaCountyData).filter(i => i.analysis_ready).length;
-        const partCt  = Object.values(_anaCountyData).filter(i => !i.analysis_ready && (i.crash_ready || i.osm_pct >= 20)).length;
-        const parts = [];
-        if (readyCt)  parts.push(`${readyCt} ready`);
-        if (partCt)   parts.push(`${partCt} partial`);
-        const banner = document.getElementById('ana-handoff-banner');
-        const msg    = document.getElementById('ana-handoff-msg');
-        if (banner && msg) {
-          msg.textContent = `\u2191 Session data carried over \u2014 ${parts.join(', ')} from Inspect mode.`;
-          banner.classList.remove('hidden');
-        }
-      }
-    }
-
-    _renderAnaCountyGrid();
-    // Seed compute-county selection with any county that has crash data
-    if (_anaComputeCounties.size === 0) {
-      Object.entries(_anaCountyData).forEach(([name, info]) => {
-        if (info.crash_ready) _anaComputeCounties.add(name);
-      });
-    }
-    _renderAnaComputeCountyPicker();
-    _updateAnaComputeBtn();
-  } catch (_) {}
-}
-
-// ── Download speed helpers ────────────────────────────────────────────────
-
-function _fmtNum(n) {
-  if (n >= 1_000_000) return (n / 1_000_000).toFixed(1) + 'M';
-  if (n >= 1_000)     return (n / 1_000).toFixed(1) + 'k';
-  return String(n);
-}
-
-function _fmtSpeed(perSec, unit) {
-  if (perSec <= 0) return '';
-  if (perSec >= 1) return `${perSec.toFixed(1)} ${unit}/s`;
-  return `${(perSec * 60).toFixed(0)} ${unit}/min`;
-}
-
-// Return {oSpeed, cSpeed} tiles/s and records/s from previous snapshot; update snapshot.
-function _dlComputeSpeeds(name, info) {
-  const prev = _dlPrevState[name];
-  const now  = Date.now();
-  let oSpeed = 0, cSpeed = 0;
-  if (prev && prev.ts) {
-    const dt = (now - prev.ts) / 1000;
-    if (dt >= 0.5) {
-      const dTiles = (info.osm_tile_cached || 0) - (prev.oTiles || 0);
-      const dRec   = (info.crash_records_fetched || 0) - (prev.cRecords || 0);
-      oSpeed = dTiles >= 0 ? dTiles / dt : 0;
-      cSpeed = dRec   >= 0 ? dRec   / dt : 0;
-    }
-  }
-  _dlPrevState[name] = {
-    oTiles:   info.osm_tile_cached        || 0,
-    cRecords: info.crash_records_fetched  || 0,
-    ts: now,
-  };
-  return { oSpeed, cSpeed };
-}
-
-function _renderActiveDownloads() {
-  const wrap = document.getElementById('ana-active-downloads');
-  if (!wrap || !_anaCountyData) return;
-
-  const active = Object.entries(_anaCountyData)
-    .filter(([, info]) => info.fetching_crash || info.fetching_osm);
-
-  if (active.length === 0) {
-    if (wrap.classList.contains('has-items')) {
-      wrap.classList.remove('has-items');
-      wrap.innerHTML = '';
-    }
-    return;
-  }
-
-  wrap.classList.add('has-items');
-  wrap.innerHTML = active.map(([name, info]) => {
-    const label  = name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-    const osmPct = Math.min(info.osm_pct || 0, 100);
-
-    const { oSpeed, cSpeed } = _dlComputeSpeeds(name, info);
-
-    // ── OSM row ──
-    const osmSpeedStr = info.fetching_osm ? _fmtSpeed(oSpeed, 't') : '';
-    const remaining   = Math.max(0, (info.osm_tile_total || 0) - (info.osm_tile_cached || 0));
-    let osmStatus;
-    if (info.osm_pct >= 95 && !info.fetching_osm) {
-      osmStatus = '<span style="color:#4ade80">✓ done</span>';
-    } else if (info.fetching_osm) {
-      const parts = [`${osmPct.toFixed(0)}%`];
-      if (remaining > 0) parts.push(`${remaining} left`);
-      if (osmSpeedStr)   parts.push(`<span class="ana-dl-speed">${osmSpeedStr}</span>`);
-      osmStatus = parts.join(' · ');
-    } else {
-      osmStatus = `${osmPct.toFixed(0)}%`;
-    }
-    const osmBarClass = osmPct >= 95 ? 'ana-dl-bar-fill ana-dl-bar-done' : 'ana-dl-bar-fill ana-dl-bar-osm';
-
-    // ── Crash row ──
-    const cRec  = info.crash_records_fetched || 0;
-    const cYear = info.crash_current_year    || 0;
-    // Crash bar: year-index out of 6 gives rough estimate
-    const crashBarPct = info.crash_ready ? 100
-      : (cYear >= 2019 ? Math.round((cYear - 2018) / 6 * 100) : (cRec > 0 ? 15 : 0));
-    const crashSpeedStr = info.fetching_crash ? _fmtSpeed(cSpeed, 'rec') : '';
-    let crashStatus;
-    if (info.crash_ready) {
-      crashStatus = '<span style="color:#4ade80">✓ done</span>';
-    } else if (info.fetching_crash) {
-      const parts = [];
-      if (cRec > 0)       parts.push(`${_fmtNum(cRec)} rec`);
-      if (cYear >= 2019)  parts.push(`yr ${cYear}`);
-      if (crashSpeedStr)  parts.push(`<span class="ana-dl-speed">${crashSpeedStr}</span>`);
-      crashStatus = parts.length ? parts.join(' · ') : 'fetching\u2026';
-    } else {
-      crashStatus = '\u2014';
-    }
-    const crashBarClass = info.crash_ready ? 'ana-dl-bar-fill ana-dl-bar-done' : 'ana-dl-bar-fill ana-dl-bar-crash';
-
-    // ETA hint (tiles remaining / speed)
-    let etaStr = '';
-    if (info.fetching_osm && oSpeed > 0.1 && remaining > 0) {
-      const secs = remaining / oSpeed;
-      etaStr = secs < 60  ? `~${Math.round(secs)}s`
-             : secs < 3600 ? `~${Math.round(secs/60)}m`
-             : `~${(secs/3600).toFixed(1)}h`;
-    }
-
-    return `<div class="ana-dl-card">
-  <div class="ana-dl-title">
-    <span class="ana-dl-name">${label}</span>
-    <span class="ana-dl-eta">${etaStr}</span>
-  </div>
-  <div class="ana-dl-row">
-    <span class="ana-dl-tag ana-dl-tag-osm">OSM</span>
-    <div class="ana-dl-bar-wrap"><div class="${osmBarClass}" style="width:${osmPct}%"></div></div>
-    <span class="ana-dl-status">${osmStatus}</span>
-  </div>
-  <div class="ana-dl-row">
-    <span class="ana-dl-tag ana-dl-tag-crash">CRS</span>
-    <div class="ana-dl-bar-wrap"><div class="${crashBarClass}" style="width:${crashBarPct}%"></div></div>
-    <span class="ana-dl-status">${crashStatus}</span>
-  </div>
-</div>`;
-  }).join('');
-}
-
-function _renderAnaCountyGrid() {
-  const grid = document.getElementById('ana-county-grid');
-  if (!grid || !_anaCountyData) return;
-
-  // Sort: analysis_ready first, then partial, then rest — alphabetical within group
-  const entries = Object.entries(_anaCountyData).sort(([an, ai], [bn, bi]) => {
-    const aScore = ai.analysis_ready ? 2 : (ai.crash_ready || ai.osm_pct > 0 ? 1 : 0);
-    const bScore = bi.analysis_ready ? 2 : (bi.crash_ready || bi.osm_pct > 0 ? 1 : 0);
-    return bScore - aScore || an.localeCompare(bn);
-  });
-
-  grid.innerHTML = entries.map(([name, info]) => {
-    const label     = name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-    const chipClass = _countyChipClass(info);
-    const remaining = Math.max(0, (info.osm_tile_total || 0) - (info.osm_tile_cached || 0));
-    let titleText;
-    if (chipClass === 'ready')   titleText = `${label}: analysis-ready (crash \u2713, OSM ${info.osm_pct}%)`;
-    else if (chipClass === 'loading') titleText = `${label}: downloading\u2026 OSM ${info.osm_pct}% (${remaining} tiles left)`;
-    else if (chipClass === 'partial') titleText = `${label}: partial \u2014 crash ${info.crash_ready ? '\u2713' : '\u2717'}, OSM ${info.osm_pct}% \u2014 click to complete`;
-    else                         titleText = `${label}: no data \u2014 click to download`;
-
-    // Ready counties are not clickable (nothing to do)
-    const clickAttr = info.analysis_ready
-      ? ''
-      : `onclick="_anaClickCounty('${name}')"`;
-
-    return `<span class="county-chip ${chipClass}" id="ana-chip-${name}"
-               title="${titleText}" ${clickAttr}>${label}</span>`;
-  }).join('');
-}
-
-async function _anaClickCounty(name) {
-  if (!_anaCountyData) return;
-  const info = _anaCountyData[name];
-  if (!info || info.analysis_ready) return;
-
-  // Update chip to loading state immediately
-  const chip = document.getElementById(`ana-chip-${name}`);
-  if (chip) { chip.className = 'county-chip loading'; chip.onclick = null; }
-
-  try {
-    await Promise.all([
-      fetch(`/api/data/county/${name}/fetch_crash`, { method: 'POST' }).catch(() => {}),
-      fetch(`/api/data/county/${name}/fetch_osm`,   { method: 'POST' }).catch(() => {}),
-    ]);
-  } catch (_) {}
-
-  // Show download card immediately without waiting for first poll
-  if (_anaCountyData[name]) {
-    _anaCountyData[name].fetching_crash = true;
-    _anaCountyData[name].fetching_osm = true;
-  }
-  _renderActiveDownloads();
-
-  // Poll until this county is ready
-  if (_anaCountyPollTimers[name]) clearInterval(_anaCountyPollTimers[name]);
-  _anaCountyPollTimers[name] = setInterval(() => _pollAnaCounty(name), 2000);
-}
-
-async function _pollAnaCounty(name) {
-  try {
-    const resp = await fetch('/api/data/county_status');
-    if (!resp.ok) return;
-    const fresh = await resp.json();
-    // Only re-render if this county's state actually changed
-    const prev = _anaCountyData?.[name];
-    const next = fresh[name];
-    const changed = !prev
-      || prev.analysis_ready !== next?.analysis_ready
-      || prev.osm_pct       !== next?.osm_pct
-      || prev.crash_ready   !== next?.crash_ready
-      || prev.fetching_crash !== next?.fetching_crash
-      || prev.fetching_osm  !== next?.fetching_osm;
-    _anaCountyData = fresh;
-    if (changed) { _renderAnaCountyGrid(); _updateAnaComputeBtn(); }
-    _renderActiveDownloads();
-
-    const info = _anaCountyData[name];
-    const stillActive = info && (info.fetching_crash || info.fetching_osm);
-    if (!info || info.analysis_ready || !stillActive) {
-      clearInterval(_anaCountyPollTimers[name]);
-      delete _anaCountyPollTimers[name];
-      _renderActiveDownloads(); // clear card now that download finished
-    }
-  } catch (_) {}
-}
-
-function _updateAnaComputeBtn() {
-  const btn = document.getElementById('ana-compute-btn');
-  if (!btn || !_anaCountyData) return;
-  const hasSelection = [..._anaComputeCounties].some(n => _anaCountyData[n]?.crash_ready);
-  btn.disabled = !hasSelection;
-  btn.title = hasSelection ? '' : 'Select at least one county with crash data above';
-}
-
-// ---- Compute rankings ------------------------------------------------------
-async function anaComputeRankings() {
-  const btn = document.getElementById('ana-compute-btn');
-  if (btn) { btn.disabled = true; btn.textContent = '\u23f3 Computing\u2026'; }
-  _anaShowProgress(0, 'Starting rankings computation\u2026');
-
-  const wF = parseFloat(document.getElementById('ana-w-fatal')?.value)  || 10;
-  const wI = parseFloat(document.getElementById('ana-w-injury')?.value) || 2;
-  const wP = parseFloat(document.getElementById('ana-w-pdo')?.value)    || 0.2;
-
-  const allowIncomplete = document.getElementById('ana-allow-incomplete')?.checked;
-  const minOsm = allowIncomplete ? 0 : 80;
-
-  // Build selected county list (only those with crash data)
-  const countyList = [..._anaComputeCounties].filter(n => _anaCountyData?.[n]?.crash_ready).join(',');
-
-  const params = new URLSearchParams({ weights: `${wF},${wI},${wP}`, min_osm_pct: minOsm });
-  if (countyList) params.set('counties', countyList);
-
-  try {
-    const resp = await fetch(`/api/rankings/compute?${params}`, { method: 'POST' });
-    if (resp.status === 409) { _anaSetProgress(0, 'Already running \u2014 polling\u2026'); }
-    else if (!resp.ok) { const e = await resp.json().catch(() => ({})); throw new Error(e.detail || resp.statusText); }
-    if (_anaComputePollTimer) clearInterval(_anaComputePollTimer);
-    _anaComputePollTimer = setInterval(_pollAnaCompute, 1500);
-  } catch (e) {
-    if (btn) { btn.disabled = false; btn.textContent = '\u25b6 Compute Rankings'; }
-    _anaSetProgress(0, `Error: ${e.message}`);
-  }
-}
-
-async function _pollAnaCompute() {
-  try {
-    const resp = await fetch('/api/rankings/status');
-    if (!resp.ok) return;
-    const data = await resp.json();
-    _anaSetProgress(data.progress ?? 0, data.message || '');
-
-    if (data.status === 'done') {
-      clearInterval(_anaComputePollTimer);
-      _anaComputePollTimer = null;
-      _anaSetProgress(100, 'Done! Loading available bins\u2026');
-      const btn = document.getElementById('ana-compute-btn');
-      if (btn) { btn.disabled = false; btn.textContent = '\u2713 Recompute'; }
-      await _anaLoadBins();
-    } else if (data.status === 'error') {
-      clearInterval(_anaComputePollTimer);
-      _anaComputePollTimer = null;
-      _anaSetProgress(0, `Error: ${data.message}`);
-      const btn = document.getElementById('ana-compute-btn');
-      if (btn) { btn.disabled = false; btn.textContent = '\u25b6 Compute Rankings'; }
-    }
-  } catch (_) {}
-}
-
-function _anaShowProgress(pct, msg) {
-  document.getElementById('ana-progress-wrap')?.classList.remove('hidden');
-  _anaSetProgress(pct, msg);
-}
-
-function _anaSetProgress(pct, msg) {
-  const bar = document.getElementById('ana-progress-bar');
-  const msgEl = document.getElementById('ana-progress-msg');
-  if (bar)   bar.style.width = Math.min(100, pct) + '%';
-  if (msgEl) msgEl.textContent = msg;
-}
-
-// ---- Bin browser -----------------------------------------------------------
-async function _anaLoadBins() {
-  try {
-    const resp = await fetch('/api/rankings/bins');
-    if (!resp.ok) return;
-    _anaBinsData = await resp.json();
-    _anaRenderBinChips();
-
-    const section = document.getElementById('ana-bins-section');
-    if (section) section.style.display = 'block';
-
-    // Update meta label
-    const meta = document.getElementById('ana-bins-meta');
-    if (meta && _anaBinsData) {
-      const total  = Object.keys(_anaBinsData.bins || {}).length;
-      const avail  = Object.values(_anaBinsData.bins || {}).filter(b => b.has_data).length;
-      meta.textContent = `${avail}/${total} bins with data`;
-    }
-  } catch (_) {}
-}
-
-function _anaSetBinTab(tab) {
-  _anaBinTab = tab;
-  document.getElementById('ana-tab-int')?.classList.toggle('active', tab === 'int');
-  document.getElementById('ana-tab-seg')?.classList.toggle('active', tab === 'seg');
-  document.getElementById('ana-bins-int')?.classList.toggle('hidden', tab !== 'int');
-  document.getElementById('ana-bins-seg')?.classList.toggle('hidden', tab !== 'seg');
-}
-
-// ---- Bin tree constants & state --------------------------------------------
-
-// Taxonomy: defines tree level order and human-readable value labels per facility type.
-// To add a new bin dimension: add one entry to the relevant array here — no other
-// tree-building logic needs to change.
-const BIN_TAXONOMY = {
-  seg: [
-    { key: 'road_class',  labels: { highway: 'Highway', arterial: 'Arterial', collector: 'Collector', local: 'Local' } },
-    { key: 'speed_bin',   labels: {} },   // raw value used as label (e.g. "<=25mph")
-    { key: 'lane_bin',    labels: { '1-2': '1-2 lanes', '3-4': '3-4 lanes', '5+': '5+ lanes' } },
-  ],
-  int: [
-    { key: 'control_type', labels: { signal: 'Signal', stop: 'All-Way Stop', give_way: 'Yield', uncontrolled: 'Uncontrolled' } },
-    { key: 'road_class',   labels: { highway: 'Highway', arterial: 'Arterial', collector: 'Collector', local: 'Local' } },
-    { key: 'speed_bin',    labels: {} },
-    { key: 'leg_bin',      labels: { 'T-int': '3-leg', '4-leg': '4-leg', multi: '5+-leg' } },
-  ],
-};
-
-// Tracks which tree node paths are expanded.  Path format: "seg|highway" or "int|stop|arterial".
-// Default on load: first-level nodes are expanded (seeded in _anaRenderBinChips).
-const _binTreeExpanded = new Set();
-
-function _anaBinLabel(key) {
-  // Convert bin_key to human-readable label (still used by anaLoadRanking bin-label display)
-  // int|signal|arterial|26-40mph|4-leg  →  Signal · Arterial · 26-40mph · 4-leg
-  // seg|arterial|26-40mph|1-2           →  Arterial · 26-40mph · 1-2 lanes
-  const prefix = key.split('|')[0];
-  const tax    = BIN_TAXONOMY[prefix] || [];
-  return key.split('|').slice(1).map((val, i) => {
-    const lvl = tax[i];
-    return (lvl?.labels?.[val]) || val;
-  }).join(' \u00b7 ');
-}
-
-// ---- Tree builder -----------------------------------------------------------
-
-/**
- * Build a nested tree from a flat bins dict.
- * Returns: { [val]: { _count, _hasData, _children: { ... }, _leaf?: {key,info} } }
- * _leaf is set only at the deepest level (the actual bin).
- */
-function _buildBinTree(bins, prefix) {
-  const taxonomy = BIN_TAXONOMY[prefix] || [];
-  const root = {};
-
-  for (const [binKey, info] of Object.entries(bins)) {
-    if (!binKey.startsWith(prefix + '|')) continue;
-    const parts = binKey.split('|').slice(1);   // e.g. ['local','<=25mph','1-2']
-    let node = root;
-    for (let i = 0; i < parts.length; i++) {
-      const val = parts[i];
-      if (!node[val]) node[val] = { _count: 0, _hasData: false, _children: {} };
-      node[val]._count   += info.count || 0;
-      node[val]._hasData  = node[val]._hasData || !!info.has_data;
-      if (i === parts.length - 1) {
-        node[val]._leaf = { key: binKey, info };
-      }
-      node = node[val]._children;
-    }
-  }
-  return root;
-}
-
-// ---- Tree renderer ----------------------------------------------------------
-
-/**
- * Recursively render tree nodes into HTML.
- * @param {object} node     — current level { val: {_count,_hasData,_children,_leaf?} }
- * @param {Array}  taxonomy — BIN_TAXONOMY level definitions (for labels)
- * @param {number} depth    — current depth (0 = first level)
- * @param {string} path     — parent path, e.g. "seg|highway"
- */
-function _renderBinTree(node, taxonomy, depth, path) {
-  const indent = depth * 12;
-  let html = '';
-
-  // Sort entries: has_data nodes first, then by count desc
-  const entries = Object.entries(node).sort(([,a],[,b]) => {
-    if (a._hasData !== b._hasData) return a._hasData ? -1 : 1;
-    return (b._count || 0) - (a._count || 0);
-  });
-
-  for (const [val, meta] of entries) {
-    const levelDef  = taxonomy[depth] || {};
-    const label     = levelDef.labels?.[val] || val;
-    const nodePath  = path ? `${path}|${val}` : val;
-    const isLeaf    = !!meta._leaf;
-    const countStr  = meta._count ? meta._count.toLocaleString() : '0';
-
-    if (isLeaf) {
-      // Leaf: clickable bin
-      const isActive = meta._leaf.key === _anaActiveBinKey;
-      const cls      = meta._hasData
-        ? `available${isActive ? ' selected' : ''}`
-        : 'sparse';
-      const onclick  = meta._hasData
-        ? `onclick="anaLoadRanking('${meta._leaf.key}')"`
-        : '';
-      html += `<div class="bin-tree-leaf ${cls}" style="padding-left:${indent}px" ${onclick} title="${meta._leaf.key}">
-        <span class="bin-tree-bullet" style="color:${meta._hasData ? '#7c3aed' : '#374151'}">&#9679;</span>
-        <span class="bin-tree-label">${label}</span>
-        <span class="bin-tree-count">${countStr}</span>
-      </div>`;
-    } else {
-      // Parent: collapsible
-      const isExpanded = _binTreeExpanded.has(nodePath);
-      const arrow      = isExpanded ? '&#9660;' : '&#9654;';
-      const dataClass  = meta._hasData ? 'has-data' : 'no-data';
-      html += `<div class="bin-tree-node">
-        <div class="bin-tree-row ${dataClass}" style="padding-left:${indent}px"
-             onclick="_toggleBinNode('${nodePath}')">
-          <span class="bin-tree-arrow">${arrow}</span>
-          <span class="bin-tree-label">${label}</span>
-          <span class="bin-tree-count">${countStr}</span>
-        </div>`;
-      if (isExpanded) {
-        html += _renderBinTree(meta._children, taxonomy, depth + 1, nodePath);
-      }
-      html += `</div>`;
-    }
-  }
-  return html;
-}
-
-function _toggleBinNode(path) {
-  if (_binTreeExpanded.has(path)) {
-    _binTreeExpanded.delete(path);
-  } else {
-    _binTreeExpanded.add(path);
-  }
-  _anaRenderBinChips();
-}
-
-// ---- Main render entry point ------------------------------------------------
-
-function _anaRenderBinChips() {
-  if (!_anaBinsData?.bins) return;
-
-  const intEl = document.getElementById('ana-bins-int');
-  const segEl = document.getElementById('ana-bins-seg');
-  if (!intEl || !segEl) return;
-
-  const bins = _anaBinsData.bins;
-
-  // Seed first-level expansions on very first render
-  if (_binTreeExpanded.size === 0) {
-    for (const key of Object.keys(bins)) {
-      const prefix = key.split('|')[0];
-      const firstVal = key.split('|')[1];
-      if (firstVal) _binTreeExpanded.add(`${prefix}|${firstVal}`);
-    }
-  }
-
-  // Build and render segment tree
-  const segTree = _buildBinTree(bins, 'seg');
-  segEl.innerHTML = Object.keys(segTree).length
-    ? _renderBinTree(segTree, BIN_TAXONOMY.seg, 0, 'seg')
-    : '<div style="font-size:0.65rem;color:#4b5563">No segment bins computed yet.</div>';
-
-  // Build and render intersection tree
-  const intTree = _buildBinTree(bins, 'int');
-  intEl.innerHTML = Object.keys(intTree).length
-    ? _renderBinTree(intTree, BIN_TAXONOMY.int, 0, 'int')
-    : '<div style="font-size:0.65rem;color:#4b5563">No intersection bins computed yet.</div>';
-}
-
-// ---- Load a specific bin's rankings ----------------------------------------
-async function anaLoadRanking(binKey) {
-  if (!binKey) return;
-  _anaActiveBinKey = binKey;
-
-  // Re-render chips so selected state updates
-  _anaRenderBinChips();
-
-  // Switch to correct tab
-  const tab = binKey.startsWith('int|') ? 'int' : 'seg';
-  if (_anaBinTab !== tab) _anaSetBinTab(tab);
-
-  // Show loading state
-  const wrap = document.getElementById('ana-rank-results-wrap');
-  const results = document.getElementById('ana-rank-results');
-  const binLabel = document.getElementById('ana-bin-label');
-  if (wrap) wrap.classList.remove('hidden');
-  if (results) results.innerHTML = '<div style="font-size:0.65rem;color:#6b7280;padding:8px 0">Loading\u2026</div>';
-  if (binLabel) binLabel.textContent = binKey;
-
-  try {
-    const resp = await fetch(`/api/rankings/bin/${encodeURIComponent(binKey)}`);
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      if (results) results.innerHTML = `<div style="font-size:0.65rem;color:#f87171;padding:8px 0">${err.detail || 'Error loading rankings.'}</div>`;
-      return;
-    }
-    const data = await resp.json();
-
-    if (data.insufficient_data) {
-      if (results) results.innerHTML = '<div style="font-size:0.65rem;color:#6b7280;padding:8px 0">Not enough facilities (&lt;20) for this bin.</div>';
-      return;
-    }
-
-    // Render on map
-    const facilities = data.top_by_epdo || [];
-    _renderRankingsMap(facilities);
-    if (typeof LAYER_VISIBILITY !== 'undefined') {
-      LAYER_VISIBILITY['rankings-worst'] = true;
-      if (typeof _syncLayerVisibility === 'function') {
-        _syncLayerVisibility('rankings-worst');
-      }
-    }
-
-    // Fly to bounding box of shown facilities
-    if (facilities.length) {
-      const lngs = facilities.map(f => f.geometry?.coordinates?.[0]).filter(Number.isFinite);
-      const lats = facilities.map(f => f.geometry?.coordinates?.[1]).filter(Number.isFinite);
-      if (lngs.length) {
-        map.fitBounds(
-          [[Math.min(...lngs), Math.min(...lats)], [Math.max(...lngs), Math.max(...lats)]],
-          { padding: 60, maxZoom: 13, duration: 900 }
-        );
-      }
-    }
-
-    // Render table
-    _anaRenderRankTable(facilities, data.group_stats || {});
-
-    // Update bin label with count
-    if (binLabel && data.facility_count) {
-      binLabel.textContent = `${binKey}  \u00b7  ${data.facility_count} facilities`;
-    }
-
-    // Scroll the results into view within the analysis panel
-    setTimeout(() => {
-      document.getElementById('ana-rank-results-wrap')?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    }, 200);
-  } catch (err) {
-    if (results) results.innerHTML = `<div style="font-size:0.65rem;color:#f87171;padding:8px 0">Error: ${err.message}</div>`;
-  }
-}
-
-const _BAND_COLORS  = { critical: '#ef4444', high_priority: '#f97316', elevated: '#facc15',
-                        above_median: '#9ca3af', below_median: '#4b5563' };
-const _BAND_SHORT   = { critical: 'Critical', high_priority: 'High', elevated: 'Elevated',
-                        above_median: 'Above Median', below_median: 'Below Median' };
-const _BAND_LABELS  = { critical: 'Critical (top 5%)', high_priority: 'High Priority (top 10%)',
-                        elevated: 'Elevated (top 25%)', above_median: 'Above Median',
-                        below_median: 'Below Median' };
-const _DBAND_BG     = { critical: '#7f1d1d', high_priority: '#431407', elevated: '#422006',
-                        above_median: '#1f2937', below_median: '#111827' };
-const _DBAND_FG     = { critical: '#fca5a5', high_priority: '#fed7aa', elevated: '#fde68a',
-                        above_median: '#9ca3af', below_median: '#6b7280' };
-
-function _anaRenderRankTable(facilities, groupStats) {
-  const el = document.getElementById('ana-rank-results');
-  if (!el) return;
-
-  // Group stats summary bar
-  let statsHtml = '';
-  if (groupStats && groupStats.n) {
-    const gs = groupStats;
-    statsHtml = `<div style="font-size:0.6rem;color:#6b7280;background:#0f1117;border:1px solid #1f2937;border-radius:4px;padding:6px 8px;margin-bottom:8px;line-height:1.8">
-      <span style="color:#9ca3af;font-weight:600">Peer group (n=${gs.n.toLocaleString()})</span> &nbsp;·&nbsp;
-      Mean <span style="color:#d1d5db">${gs.mean}</span> &nbsp;·&nbsp;
-      P50 <span style="color:#d1d5db">${gs.p50}</span> &nbsp;·&nbsp;
-      P75 <span style="color:#facc15">${gs.p75}</span> &nbsp;·&nbsp;
-      P90 <span style="color:#f97316">${gs.p90}</span> &nbsp;·&nbsp;
-      P95 <span style="color:#ef4444">${gs.p95}</span>
-    </div>`;
-  }
-
-  function rowHtml(feat) {
-    if (!feat) return '';
-    const p    = feat.properties ?? {};
-    const name = p.name || (p.facility_id ? p.facility_id.replace(/^[nw]/, '#') : '—');
-    const epdo = typeof p.epdo_score === 'number' ? p.epdo_score.toFixed(1) : '—';
-    const f    = p.fatal_5yr ?? 0;
-    const s    = p.severe_5yr ?? 0;
-    const fid  = p.facility_id || '';
-    const pct  = p.epdo_percentile != null ? Math.round(p.epdo_percentile) : null;
-    const band = p.epdo_band || '';
-    const pctLabel = pct != null
-      ? `<span style="color:${_BAND_COLORS[band] || '#9ca3af'};font-size:0.58rem">P${pct} ${_BAND_SHORT[band] || ''}</span>`
-      : '';
-    return `<div class="ana-rank-row" onclick="openRankDash('${fid}')" title="Click to open crash dashboard">
-      ${name}<br>
-      <span class="ana-rank-epdo worst">EPDO ${epdo}</span>
-      <span style="color:#6b7280;font-size:0.58rem"> ${f}K ${s}S &nbsp;</span>${pctLabel}
-    </div>`;
-  }
-
-  el.innerHTML = statsHtml + `<div>
-    <div class="ana-rank-col-hdr" style="color:#9ca3af">Top ${facilities.length} by EPDO Score</div>
-    ${facilities.map(f => rowHtml(f)).join('')}
-  </div>`;
-}
-
-// ---- Compute county picker --------------------------------------------------
-function _renderAnaComputeCountyPicker() {
-  const el = document.getElementById('ana-compute-county-list');
-  if (!el || !_anaCountyData) return;
-
-  // Only counties that have crash data are eligible
-  const eligible = Object.entries(_anaCountyData)
-    .filter(([, info]) => info.crash_ready)
-    .sort(([an, ai], [bn, bi]) => {
-      // Sort: analysis_ready first, then by osm_pct desc, then alpha
-      if (ai.analysis_ready !== bi.analysis_ready) return ai.analysis_ready ? -1 : 1;
-      return (bi.osm_pct - ai.osm_pct) || an.localeCompare(bn);
-    });
-
-  if (!eligible.length) {
-    el.innerHTML = '<div style="font-size:0.62rem;color:#6b7280">No counties with crash data yet. Download crash data above first.</div>';
-    const cntEl = document.getElementById('ana-compute-county-count');
-    if (cntEl) cntEl.textContent = '0 selected';
-    return;
-  }
-
-  el.innerHTML = eligible.map(([name, info]) => {
-    const label   = name.replace(/_/g, ' ').replace(/\b\w/g, c => c.toUpperCase());
-    const checked = _anaComputeCounties.has(name) ? 'checked' : '';
-    const osmTxt  = info.analysis_ready
-      ? '<span style="color:#4ade80">ready</span>'
-      : `<span style="color:#f59e0b">${info.osm_pct.toFixed(0)}% OSM</span>`;
-    return `<label class="ana-compute-county-row">
-      <input type="checkbox" ${checked} onchange="_anaToggleComputeCounty('${name}',this.checked)">
-      <span class="ana-compute-county-name">${label}</span>
-      ${osmTxt}
-    </label>`;
-  }).join('');
-
-  _updateAnaComputeCountyCount();
-}
-
-function _anaToggleComputeCounty(name, checked) {
-  if (checked) _anaComputeCounties.add(name);
-  else _anaComputeCounties.delete(name);
-  _updateAnaComputeCountyCount();
-  _updateAnaComputeBtn();
-}
-
-function _updateAnaComputeCountyCount() {
-  const el = document.getElementById('ana-compute-county-count');
-  if (el) el.textContent = `${_anaComputeCounties.size} selected`;
-}
-
-function _anaComputeSelectAll() {
-  if (!_anaCountyData) return;
-  Object.entries(_anaCountyData).forEach(([name, info]) => {
-    if (info.crash_ready) _anaComputeCounties.add(name);
-  });
-  _renderAnaComputeCountyPicker();
-  _updateAnaComputeBtn();
-}
-
-function _anaComputeClearAll() {
-  _anaComputeCounties.clear();
-  _renderAnaComputeCountyPicker();
-  _updateAnaComputeBtn();
 }
 
 // =============================================================================
@@ -4066,7 +3428,12 @@ function _openTopologyPanel(nodeId, lon, lat) {
         loading.classList.add('hidden');
         _renderTopologyPanel(topo);
         if (G_appMode === 'debug') {
-          _renderDebugCell(topo);
+          // Compute tile coords for label storage
+          const tLon = topo.lon != null ? topo.lon : lon;
+          const tLat = topo.lat != null ? topo.lat : lat;
+          topo._tile_x = Math.floor((tLon + 180) / 360 * 4096);
+          topo._tile_y = Math.floor((1 - Math.log(Math.tan(tLat * Math.PI / 180) + 1 / Math.cos(tLat * Math.PI / 180)) / Math.PI) / 2 * 4096);
+          topo.node_id = topo.node_id || nodeId;
         } else {
           _renderApproachHighlight(topo.approaches || []);
         }
@@ -4083,6 +3450,7 @@ function _openTopologyPanel(nodeId, lon, lat) {
 function _renderTopologyPanel(topo) {
   const badge  = document.getElementById('topo-config-badge');
   const stats  = document.getElementById('topo-stats');
+  const tap    = document.getElementById('topo-approaches');
   const cfg    = topo.configuration || 'UNDIVIDED';
   const cfgLabel = { UNDIVIDED: 'Undivided', DIVIDED: 'Divided', ROUNDABOUT: 'Roundabout', CHANNELIZED_RT: 'Channelized RT' }[cfg] || cfg;
 
@@ -4099,16 +3467,60 @@ function _renderTopologyPanel(topo) {
 
   stats.innerHTML = `
     <div class="topo-stat-row"><span>Approaches</span><span class="topo-stat-val">${approaches.length}</span></div>
-    <div class="topo-stat-row"><span>Conflict points</span><span class="topo-stat-val">${topo.conflict_points ?? '—'}</span></div>
+    <div class="topo-stat-row"><span>Conflict points</span><span class="topo-stat-val">${topo.conflict_points ?? '-'}</span></div>
     <div class="topo-stat-row"><span>Turn restrictions</span><span class="topo-stat-val">${restrs.length}</span></div>
     ${compound.length ? `<div class="topo-stat-row"><span>Compound nodes</span><span class="topo-stat-val">${compound.length}</span></div>` : ''}
     ${rbtNote}
   `;
 
+  if (tap) {
+    if (approaches.length === 0) {
+      tap.innerHTML = '';
+    } else {
+      const _bearingDir = (b) => {
+        if (b == null) return '-';
+        const dirs = ['N','NE','E','SE','S','SW','W','NW'];
+        return dirs[Math.round(((b % 360) + 360) % 360 / 45) % 8];
+      };
+      const _est = (val, isEst) => isEst ? `<span class="tap-est">${val}</span>` : `${val}`;
+      const _turn = (lst) => {
+        if (!lst || lst.length === 0) return '';
+        return lst.map(slot => slot.length ? slot.map(t => t[0].toUpperCase()).join('') : ' - ').join('|');
+      };
+      const sorted = approaches.slice().sort((a, b) => (a.bearing || 0) - (b.bearing || 0));
+      const rows = sorted.map(ap => {
+        const dir   = _bearingDir(ap.bearing);
+        const name  = (ap.name || ap.highway || '').substring(0, 16);
+        const lanes = _est(ap.lanes ?? '-', !!ap.lanes_estimated);
+        const speed = _est(ap.speed_mph ?? '-', !!ap.speed_estimated);
+        const len   = (ap.approach_length_m != null) ? `${Math.round(ap.approach_length_m)}m` : '-';
+        const turn  = _turn(ap.turn_lanes_list || []);
+        return `<tr>
+          <td>${dir}</td>
+          <td class="tap-name" title="${(ap.name || '').replace(/"/g,'&quot;')}">${name}</td>
+          <td>${lanes}</td>
+          <td>${speed}</td>
+          <td>${len}</td>
+          <td>${turn}</td>
+        </tr>`;
+      }).join('');
+      const hasEst = sorted.some(a => a.speed_estimated || a.lanes_estimated);
+      tap.innerHTML = `
+        <table>
+          <thead><tr>
+            <th>Dir</th><th>Road</th><th>Ln</th><th>mph</th><th>Len</th><th>Turn</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+        ${hasEst ? '<div class="tap-foot">* = estimated from highway class default</div>' : ''}
+      `;
+    }
+  }
+
   _renderTopologySVG(topo);
 }
 
-// Highway class → stroke color
+// Highway class -> stroke color
 const _HW_COLOR = {
   motorway: '#ef4444', motorway_link: '#ef4444',
   trunk: '#f97316',    trunk_link: '#f97316',
@@ -4155,9 +3567,9 @@ function _renderTopologySVG(topo) {
   // Approach spokes
   const endpts = {};
   approaches.forEach(ap => {
-    const θ = (ap.bearing * Math.PI) / 180;
-    const ex = R * Math.sin(θ);
-    const ey = -R * Math.cos(θ);
+    const theta = (ap.bearing * Math.PI) / 180;
+    const ex = R * Math.sin(theta);
+    const ey = -R * Math.cos(theta);
     endpts[ap.way_id] = [ex, ey];
 
     const sw = Math.max(1.5, 1 + (ap.lanes || 1) * 1.2);
@@ -4186,8 +3598,8 @@ function _renderTopologySVG(topo) {
     }
 
     // Label
-    const lx = (R + 16) * Math.sin(θ);
-    const ly = -(R + 16) * Math.cos(θ);
+    const lx = (R + 16) * Math.sin(theta);
+    const ly = -(R + 16) * Math.cos(theta);
     const name = (ap.name || ap.highway || '').substring(0, 14);
     if (name) {
       const anchor = Math.abs(lx) < 10 ? 'middle' : lx > 0 ? 'start' : 'end';
@@ -4216,7 +3628,7 @@ function _renderTopologySVG(topo) {
       'stroke-dasharray': isNo ? '4 3' : 'none',
       opacity: 0.8,
     }));
-    // No-turn symbol: ⊘ at midpoint of arc
+    // No-turn symbol: no-turn at midpoint of arc
     if (isNo) {
       const mx = (fromPt[0] + toPt[0]) * 0.3;
       const my = (fromPt[1] + toPt[1]) * 0.3;
@@ -4260,10 +3672,10 @@ function _renderApproachHighlight(approaches) {
 }
 
 // =============================================================================
-// Debug Mode — Cell Visualization
+// Debug Mode - Cell Visualization
 // =============================================================================
 
-// Config → cell fill color
+// Config -> cell fill color
 const _CFG_COLOR = {
   UNDIVIDED:      '#14b8a6',
   ROUNDABOUT:     '#f97316',
@@ -4275,13 +3687,13 @@ function _cfgColor(cfg) { return _CFG_COLOR[cfg] || '#14b8a6'; }
 // Project lon/lat along a compass bearing for dist_m metres
 function _projectPoint(lon, lat, bearingDeg, distM) {
   const R  = 6371000;
-  const δ  = distM / R;
-  const θ  = bearingDeg * Math.PI / 180;
-  const φ1 = lat * Math.PI / 180;
-  const λ1 = lon * Math.PI / 180;
-  const φ2 = Math.asin(Math.sin(φ1) * Math.cos(δ) + Math.cos(φ1) * Math.sin(δ) * Math.cos(θ));
-  const λ2 = λ1 + Math.atan2(Math.sin(θ) * Math.sin(δ) * Math.cos(φ1), Math.cos(δ) - Math.sin(φ1) * Math.sin(φ2));
-  return [λ2 * 180 / Math.PI, φ2 * 180 / Math.PI];
+  const angularDistance = distM / R;
+  const bearing = bearingDeg * Math.PI / 180;
+  const lat1 = lat * Math.PI / 180;
+  const lon1 = lon * Math.PI / 180;
+  const lat2 = Math.asin(Math.sin(lat1) * Math.cos(angularDistance) + Math.cos(lat1) * Math.sin(angularDistance) * Math.cos(bearing));
+  const lon2 = lon1 + Math.atan2(Math.sin(bearing) * Math.sin(angularDistance) * Math.cos(lat1), Math.cos(angularDistance) - Math.sin(lat1) * Math.sin(lat2));
+  return [lon2 * 180 / Math.PI, lat2 * 180 / Math.PI];
 }
 
 // Clip a LineString starting from the end nearest to nucleus, capped at maxDistM metres.
@@ -4326,153 +3738,11 @@ function _clearDebugHighlight() {
   });
 }
 
-function _debugClickWay(e) {
-  // Find the nearest intersection_centroid within ~80px of the click
-  const px = e.point;
-  const pad = 80;
-  const nearby = map.queryRenderedFeatures(
-    [[px.x - pad, px.y - pad], [px.x + pad, px.y + pad]],
-    { layers: ['intersections-pt-layer'] }
-  ).filter(f => f.properties.type === 'intersection_centroid');
-
-  if (nearby.length === 0) {
-    // No centroid nearby — highlight the clicked way and show hint
-    const renderedId = String(e.features[0].properties.id ?? '');
-    const feat = OSM_FEATURE_MAP.get(renderedId);
-    if (feat && feat.geometry.type === 'LineString') {
-      _clearDebugHighlight();
-      map.addSource('topo-highlight', { type: 'geojson', data: { type: 'FeatureCollection', features: [feat] } });
-      map.addLayer({ id: 'topo-highlight-layer', type: 'line', source: 'topo-highlight',
-        paint: { 'line-color': '#facc15', 'line-width': 3, 'line-opacity': 0.8 } });
-    }
-    return;
-  }
-
-  // Sort by screen distance, pick closest
-  nearby.sort((a, b) => {
-    const pa = map.project(a.geometry.coordinates);
-    const pb = map.project(b.geometry.coordinates);
-    const da = Math.hypot(pa.x - px.x, pa.y - px.y);
-    const db = Math.hypot(pb.x - px.x, pb.y - px.y);
-    return da - db;
-  });
-  const best = nearby[0];
-  const coords = best.geometry.coordinates;
-  _openTopologyPanel(best.properties.id, coords[0], coords[1]);
+function closeDebugInfoPanel() {
+  document.getElementById('debug-info-panel')?.classList.remove('open');
 }
 
-const _ARM_DIST_M = 100;   // how far each approach arm extends from nucleus
+// -- End of debug section ----------------------------------------------------
 
-function _renderDebugCell(topo) {
-  _clearDebugHighlight();
-
-  const nucleusLon = topo.lon;
-  const nucleusLat = topo.lat;
-  if (nucleusLon == null || nucleusLat == null) return;
-
-  const approaches = topo.approaches || [];
-  const cfg        = topo.configuration || 'UNDIVIDED';
-  const color      = _cfgColor(cfg);
-
-  // ── 1. Approach arm geometry: actual road coords capped at _ARM_DIST_M ────
-  const approachFeats = [];
-  // Also build cell polygon vertices (one per approach, at arm tip)
-  const armTips = [];
-
-  const sortedApproaches = [...approaches].sort((a, b) => a.bearing - b.bearing);
-  sortedApproaches.forEach(ap => {
-    const feat = OSM_FEATURE_MAP.get(String(ap.way_id));
-    let armCoords;
-    if (feat?.geometry?.type === 'LineString') {
-      armCoords = _clipToMaxDist(feat.geometry.coordinates, nucleusLon, nucleusLat, _ARM_DIST_M);
-    } else {
-      // No geometry cached — just draw a straight line along bearing
-      armCoords = [[nucleusLon, nucleusLat], _projectPoint(nucleusLon, nucleusLat, ap.bearing, _ARM_DIST_M)];
-    }
-    approachFeats.push({
-      type: 'Feature',
-      geometry: { type: 'LineString', coordinates: armCoords },
-      properties: { highway: ap.highway || 'road' },
-    });
-    armTips.push(armCoords[armCoords.length - 1]);
-  });
-
-  // ── 2. Cell polygon: connect arm tips in bearing order ────────────────────
-  let cellCoords;
-  if (armTips.length >= 3) {
-    cellCoords = [...armTips, armTips[0]];
-  } else if (armTips.length === 2) {
-    // Two-arm stub: add lateral flanking points to form a lozenge
-    const perp1 = _projectPoint(nucleusLon, nucleusLat, (approaches[0].bearing + 90)  % 360, _ARM_DIST_M * 0.3);
-    const perp2 = _projectPoint(nucleusLon, nucleusLat, (approaches[0].bearing + 270) % 360, _ARM_DIST_M * 0.3);
-    cellCoords = [armTips[0], perp1, armTips[1], perp2, armTips[0]];
-  } else {
-    const pts = [0, 90, 180, 270].map(b => _projectPoint(nucleusLon, nucleusLat, b, _ARM_DIST_M * 0.5));
-    cellCoords = [...pts, pts[0]];
-  }
-
-  // ── 3. Compound ring nodes ────────────────────────────────────────────────
-  const compoundFeats = [];
-  (topo.compound_nodes || []).forEach(nid => {
-    const feat = OSM_FEATURE_MAP.get(String(nid));
-    if (feat?.geometry?.type === 'Point') {
-      compoundFeats.push(feat);
-      compoundFeats.push({
-        type: 'Feature',
-        geometry: { type: 'LineString', coordinates: [[nucleusLon, nucleusLat], feat.geometry.coordinates] },
-        properties: {},
-      });
-    }
-  });
-
-  // ── Add sources and layers ─────────────────────────────────────────────────
-  map.addSource('debug-cell', {
-    type: 'geojson',
-    data: { type: 'FeatureCollection', features: [{
-      type: 'Feature',
-      geometry: { type: 'Polygon', coordinates: [cellCoords] },
-      properties: { cfg },
-    }]},
-  });
-  map.addLayer({ id: 'debug-cell-fill', type: 'fill', source: 'debug-cell',
-    paint: { 'fill-color': color, 'fill-opacity': 0.12 } });
-  map.addLayer({ id: 'debug-cell-outline', type: 'line', source: 'debug-cell',
-    paint: { 'line-color': color, 'line-width': 2, 'line-dasharray': [4, 3], 'line-opacity': 0.8 } });
-
-  if (approachFeats.length > 0) {
-    map.addSource('debug-approaches-src', { type: 'geojson', data: { type: 'FeatureCollection', features: approachFeats } });
-    map.addLayer({ id: 'debug-approaches', type: 'line', source: 'debug-approaches-src',
-      paint: {
-        'line-color': ['match', ['get', 'highway'],
-          'motorway', '#ef4444', 'motorway_link', '#ef4444',
-          'trunk', '#f97316',    'trunk_link', '#f97316',
-          'primary', '#f59e0b',  'primary_link', '#f59e0b',
-          'secondary', '#84cc16', 'secondary_link', '#84cc16',
-          'roundabout', '#22d3ee',
-          '#94a3b8'],
-        'line-width': 4, 'line-opacity': 0.9,
-      },
-    });
-  }
-
-  map.addSource('debug-nucleus-src', {
-    type: 'geojson',
-    data: { type: 'Feature', geometry: { type: 'Point', coordinates: [nucleusLon, nucleusLat] }, properties: {} },
-  });
-  map.addLayer({ id: 'debug-nucleus', type: 'circle', source: 'debug-nucleus-src',
-    paint: { 'circle-radius': 9, 'circle-color': color, 'circle-stroke-color': '#fff', 'circle-stroke-width': 2, 'circle-opacity': 0.95 },
-  });
-
-  if (compoundFeats.length > 0) {
-    map.addSource('debug-compound-src', { type: 'geojson', data: { type: 'FeatureCollection', features: compoundFeats } });
-    map.addLayer({ id: 'debug-compound', type: 'circle', source: 'debug-compound-src',
-      filter: ['==', ['geometry-type'], 'Point'],
-      paint: { 'circle-radius': 5, 'circle-color': color, 'circle-opacity': 0.7, 'circle-stroke-color': '#fff', 'circle-stroke-width': 1.5 },
-    });
-    map.addLayer({ id: 'debug-compound-lines', type: 'line', source: 'debug-compound-src',
-      filter: ['==', ['geometry-type'], 'LineString'],
-      paint: { 'line-color': color, 'line-width': 1.5, 'line-dasharray': [3, 3], 'line-opacity': 0.6 },
-    });
-  }
-}
+// (debug cell visualization removed - replaced by consolidated intersections in debug_sandbox.js)
 

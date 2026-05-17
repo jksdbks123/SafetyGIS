@@ -3,3 +3,8 @@ uvicorn[standard]
 requests
 pandas
 python-dotenv
+networkx
+shapely
+osmnx
+geopandas
+osmium
